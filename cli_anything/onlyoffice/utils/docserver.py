@@ -29,8 +29,8 @@ _thread_lock_map_mu: threading.Lock = threading.Lock()
 # Import document libraries with advanced formatting
 try:
     from docx import Document
-    from docx.shared import Inches, Pt, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches, Pt, RGBColor, Mm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
     from docx.enum.section import WD_ORIENT
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
@@ -372,6 +372,20 @@ class DocumentServerClient:
             with self._file_lock(output_path):
                 backup = self._snapshot_backup(output_path)
                 doc = Document()
+                # Page layout: A4, 1" margins all sides
+                section = doc.sections[0]
+                section.page_width = Mm(210)
+                section.page_height = Mm(297)
+                section.top_margin = Pt(72)     # 1 inch = 72pt
+                section.bottom_margin = Pt(72)
+                section.left_margin = Pt(72)
+                section.right_margin = Pt(72)
+                # Normal style: Calibri 11pt, double spacing, 0pt space-after
+                normal = doc.styles["Normal"]
+                normal.font.name = "Calibri"
+                normal.font.size = Pt(11)
+                normal.paragraph_format.line_spacing_rule = WD_LINE_SPACING.DOUBLE
+                normal.paragraph_format.space_after = Pt(0)
                 if title:
                     heading = doc.add_heading(title, 0)
                     heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1481,6 +1495,7 @@ class DocumentServerClient:
                 wb = Workbook()
                 ws = wb.active
                 ws.title = sheet_name
+                ws.page_setup.paperSize = 9  # A4
                 self._safe_save(wb, output_path)
             return {
                 "success": True,
@@ -1555,6 +1570,13 @@ class DocumentServerClient:
                             except (ValueError, TypeError):
                                 pass
                             ws.cell(row=row_idx, column=col_idx, value=value)
+                # Auto-fit column widths based on content (min 12, max 50 chars)
+                for col in ws.columns:
+                    max_len = max((len(str(cell.value or "")) for cell in col), default=8)
+                    col_letter = openpyxl.utils.get_column_letter(col[0].column)
+                    ws.column_dimensions[col_letter].width = max(12, min(max_len + 2, 50))
+                # A4 paper size for printing
+                ws.page_setup.paperSize = 9  # 9 = A4
                 self._safe_save(wb, output_path)
             return {
                 "success": True,

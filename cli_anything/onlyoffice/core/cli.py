@@ -906,9 +906,11 @@ def cmd_status(json_output=False):
         shacl_available = True
     except ImportError:
         shacl_available = False
+    import sys
     result = {
         "success": True,
         "version": "4.0.0",
+        "python": sys.executable,
         "document_server": {
             "healthy": doc_server.check_health() if doc_server else False
         },
