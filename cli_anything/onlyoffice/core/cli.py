@@ -1043,7 +1043,7 @@ def cmd_help(json_output=False):
                 "rdf-create <file> [--base <uri>] [--format turtle|xml|n3|json-ld] [--prefix <p>=<uri>]": "Create empty RDF graph with prefixes",
                 "rdf-read <file> [--limit <n>]": "Read/parse RDF file and show triples",
                 "rdf-add <file> <subject> <predicate> <object> [--type uri|literal|bnode] [--lang <l>] [--datatype <dt>]": "Add a triple",
-                "rdf-remove <file> [--subject <s>] [--predicate <p>] [--object <o>]": "Remove triples (None = wildcard)",
+                "rdf-remove <file> [--subject <s>] [--predicate <p>] [--object <o>] [--type uri|literal|bnode]": "Remove triples (None = wildcard)",
                 "rdf-query <file> <sparql> [--limit <n>]": "Execute SPARQL query",
                 "rdf-export <file> <output> [--format turtle|xml|n3|nt|json-ld|trig]": "Convert/export to different format",
                 "rdf-merge <file_a> <file_b> [--output <file>] [--format turtle]": "Merge two RDF graphs",
@@ -2579,12 +2579,13 @@ def main():
 
     elif args.command == "rdf-remove":
         if not args.args:
-            print_result({"success": False, "error": "Usage: rdf-remove <file> [--subject <s>] [--predicate <p>] [--object <o>] [--format <f>]"}, json_output)
+            print_result({"success": False, "error": "Usage: rdf-remove <file> [--subject <s>] [--predicate <p>] [--object <o>] [--type uri|literal|bnode] [--format <f>]"}, json_output)
         else:
             subject = None
             predicate = None
             object_val = None
-            fmt = "turtle"
+            object_type = "uri"
+            fmt = None
             i = 1
             while i < len(args.args):
                 if args.args[i] == "--subject" and i + 1 < len(args.args):
@@ -2593,12 +2594,14 @@ def main():
                     predicate = args.args[i + 1]; i += 2
                 elif args.args[i] == "--object" and i + 1 < len(args.args):
                     object_val = args.args[i + 1]; i += 2
+                elif args.args[i] == "--type" and i + 1 < len(args.args):
+                    object_type = args.args[i + 1]; i += 2
                 elif args.args[i] == "--format" and i + 1 < len(args.args):
                     fmt = args.args[i + 1]; i += 2
                 else:
                     i += 1
             result = doc_server.rdf_remove(args.args[0], subject=subject, predicate=predicate,
-                                            object_val=object_val, format=fmt)
+                                            object_val=object_val, object_type=object_type, format=fmt)
             print_result(result, json_output)
 
     elif args.command == "rdf-query":

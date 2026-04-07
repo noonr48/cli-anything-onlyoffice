@@ -4559,21 +4559,42 @@ class DocumentServerClient:
 
     # ==================== RDF OPERATIONS ====================
 
+    _RDF_FORMAT_MAP = {
+        ".ttl": "turtle", ".n3": "n3", ".nt": "nt",
+        ".nq": "nquads", ".jsonld": "json-ld", ".json": "json-ld",
+        ".rdf": "xml", ".xml": "xml", ".trig": "trig",
+    }
+
+    def _rdf_format_from_path(self, file_path: str) -> str:
+        """Infer RDF serialisation format from file extension. Defaults to turtle."""
+        return self._RDF_FORMAT_MAP.get(Path(file_path).suffix.lower(), "turtle")
+
+    def _rdf_safe_save(self, data: str, file_path: str):
+        """Atomic write of a serialised RDF string via temp-file + os.replace."""
+        target = Path(file_path)
+        fd, tmp_path = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(data)
+            os.replace(tmp_path, str(target))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def _get_rdf_graph(self, file_path: str = None):
-        """Load or create an RDF graph."""
+        """Load or create an RDF graph. Returns (graph, error_string)."""
         try:
             from rdflib import Graph
         except ImportError:
             return None, "rdflib not installed. pip install rdflib"
         g = Graph()
-        if file_path and os.path.exists(file_path):
-            ext = Path(file_path).suffix.lower()
-            fmt_map = {
-                ".ttl": "turtle", ".n3": "n3", ".nt": "nt",
-                ".nq": "nquads", ".jsonld": "json-ld", ".json": "json-ld",
-                ".rdf": "xml", ".xml": "xml", ".trig": "trig",
-            }
-            fmt = fmt_map.get(ext, "turtle")
+        if file_path:
+            if not os.path.exists(file_path):
+                return None, f"File not found: {file_path}"
+            fmt = self._rdf_format_from_path(file_path)
             g.parse(file_path, format=fmt)
         return g, None
 
@@ -4584,20 +4605,22 @@ class DocumentServerClient:
         """Create a new empty RDF graph file."""
         try:
             from rdflib import Graph, Namespace
-            g = Graph()
-            if base_uri:
-                g.bind("base", Namespace(base_uri))
-            if prefixes:
-                for prefix, uri in prefixes.items():
-                    g.bind(prefix, Namespace(uri))
-            # Standard prefixes
             from rdflib.namespace import RDF, RDFS, OWL, XSD, FOAF, DCTERMS, SKOS
-            for ns_prefix, ns in [("rdf", RDF), ("rdfs", RDFS), ("owl", OWL),
-                                   ("xsd", XSD), ("foaf", FOAF), ("dcterms", DCTERMS), ("skos", SKOS)]:
-                g.bind(ns_prefix, ns)
-            data = g.serialize(format=format)
-            with open(file_path, "w") as f:
-                f.write(data)
+            with self._file_lock(file_path):
+                self._snapshot_backup(file_path)
+                g = Graph()
+                if base_uri:
+                    g.bind("base", Namespace(base_uri))
+                if prefixes:
+                    for prefix, uri in prefixes.items():
+                        g.bind(prefix, Namespace(uri))
+                for ns_prefix, ns in [
+                    ("rdf", RDF), ("rdfs", RDFS), ("owl", OWL),
+                    ("xsd", XSD), ("foaf", FOAF), ("dcterms", DCTERMS), ("skos", SKOS),
+                ]:
+                    g.bind(ns_prefix, ns)
+                data = g.serialize(format=format)
+                self._rdf_safe_save(data, file_path)
             return {
                 "success": True, "file": file_path,
                 "format": format, "triples": len(g),
@@ -4617,8 +4640,10 @@ class DocumentServerClient:
             if err:
                 return {"success": False, "error": err}
             triples = []
+            truncated = False
             for i, (s, p, o) in enumerate(g):
                 if i >= limit:
+                    truncated = True
                     break
                 triples.append({
                     "subject": str(s), "predicate": str(p), "object": str(o),
@@ -4632,7 +4657,7 @@ class DocumentServerClient:
                 "unique_predicates": len(predicates),
                 "prefixes": {p: str(n) for p, n in g.namespaces()},
                 "triples": triples,
-                "truncated": len(g) > limit,
+                "truncated": truncated,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -4640,34 +4665,37 @@ class DocumentServerClient:
     def rdf_add(
         self, file_path: str, subject: str, predicate: str, object_val: str,
         object_type: str = "uri", lang: str = None, datatype: str = None,
-        format: str = "turtle",
+        format: str = None,
     ) -> Dict[str, Any]:
         """Add a triple to an RDF graph. object_type: uri|literal|bnode"""
         try:
-            from rdflib import Graph, URIRef, Literal, BNode, Namespace
-            from rdflib.namespace import XSD
-            g, err = self._get_rdf_graph(file_path)
-            if err:
-                return {"success": False, "error": err}
-            s = URIRef(subject)
-            p = URIRef(predicate)
-            if object_type == "literal":
-                dt = URIRef(datatype) if datatype else None
-                o = Literal(object_val, lang=lang, datatype=dt)
-            elif object_type == "bnode":
-                o = BNode(object_val)
-            else:
-                o = URIRef(object_val)
-            before = len(g)
-            g.add((s, p, o))
-            data = g.serialize(format=format)
-            with open(file_path, "w") as f:
-                f.write(data)
+            from rdflib import URIRef, Literal, BNode
+            if lang and datatype:
+                return {"success": False, "error": "Cannot specify both --lang and --datatype for a literal"}
+            with self._file_lock(file_path):
+                self._snapshot_backup(file_path)
+                g, err = self._get_rdf_graph(file_path)
+                if err:
+                    return {"success": False, "error": err}
+                fmt = format or self._rdf_format_from_path(file_path)
+                s = URIRef(subject)
+                p = URIRef(predicate)
+                if object_type == "literal":
+                    dt = URIRef(datatype) if datatype else None
+                    o = Literal(object_val, lang=lang, datatype=dt)
+                elif object_type == "bnode":
+                    o = BNode(object_val)
+                else:
+                    o = URIRef(object_val)
+                before = len(g)
+                g.add((s, p, o))
+                data = g.serialize(format=fmt)
+                self._rdf_safe_save(data, file_path)
             return {
                 "success": True, "file": file_path,
                 "triple": {"subject": str(s), "predicate": str(p), "object": str(o)},
                 "triples_before": before, "triples_after": len(g),
-                "format": format,
+                "format": fmt,
             }
         except ImportError:
             return {"success": False, "error": "rdflib not installed"}
@@ -4676,26 +4704,36 @@ class DocumentServerClient:
 
     def rdf_remove(
         self, file_path: str, subject: str = None, predicate: str = None,
-        object_val: str = None, format: str = "turtle",
+        object_val: str = None, object_type: str = "uri", format: str = None,
     ) -> Dict[str, Any]:
-        """Remove triples matching a pattern. None values act as wildcards."""
+        """Remove triples matching a pattern. None values act as wildcards.
+        object_type: uri|literal|bnode — controls how object_val is interpreted."""
         try:
-            from rdflib import URIRef
-            g, err = self._get_rdf_graph(file_path)
-            if err:
-                return {"success": False, "error": err}
-            s = URIRef(subject) if subject else None
-            p = URIRef(predicate) if predicate else None
-            o = URIRef(object_val) if object_val else None
-            before = len(g)
-            g.remove((s, p, o))
-            data = g.serialize(format=format)
-            with open(file_path, "w") as f:
-                f.write(data)
+            from rdflib import URIRef, Literal, BNode
+            with self._file_lock(file_path):
+                self._snapshot_backup(file_path)
+                g, err = self._get_rdf_graph(file_path)
+                if err:
+                    return {"success": False, "error": err}
+                fmt = format or self._rdf_format_from_path(file_path)
+                s = URIRef(subject) if subject else None
+                p = URIRef(predicate) if predicate else None
+                if object_val is None:
+                    o = None
+                elif object_type == "literal":
+                    o = Literal(object_val)
+                elif object_type == "bnode":
+                    o = BNode(object_val)
+                else:
+                    o = URIRef(object_val)
+                before = len(g)
+                g.remove((s, p, o))
+                data = g.serialize(format=fmt)
+                self._rdf_safe_save(data, file_path)
             return {
                 "success": True, "file": file_path,
                 "triples_before": before, "triples_after": len(g),
-                "removed": before - len(g), "format": format,
+                "removed": before - len(g), "format": fmt,
             }
         except ImportError:
             return {"success": False, "error": "rdflib not installed"}
@@ -4705,25 +4743,57 @@ class DocumentServerClient:
     def rdf_query(
         self, file_path: str, sparql: str, limit: int = 100
     ) -> Dict[str, Any]:
-        """Execute a SPARQL query against an RDF graph."""
+        """Execute a SPARQL query against an RDF graph.
+        Handles SELECT, ASK, CONSTRUCT, and DESCRIBE query types correctly."""
         try:
             g, err = self._get_rdf_graph(file_path)
             if err:
                 return {"success": False, "error": err}
             results = g.query(sparql)
-            rows = []
+            qtype = results.type  # "SELECT" | "ASK" | "CONSTRUCT" | "DESCRIBE"
+
+            if qtype == "ASK":
+                return {
+                    "success": True, "file": file_path,
+                    "query_type": "ASK",
+                    "result": bool(results),
+                }
+
+            if qtype in ("CONSTRUCT", "DESCRIBE"):
+                triples = []
+                truncated = False
+                for i, (s, p, o) in enumerate(results.graph):
+                    if i >= limit:
+                        truncated = True
+                        break
+                    triples.append({"subject": str(s), "predicate": str(p), "object": str(o)})
+                return {
+                    "success": True, "file": file_path,
+                    "query_type": qtype,
+                    "triples": triples,
+                    "result_count": len(triples),
+                    "truncated": truncated,
+                }
+
+            # SELECT
             variables = [str(v) for v in results.vars] if results.vars else []
+            rows = []
+            truncated = False
             for i, row in enumerate(results):
                 if i >= limit:
+                    truncated = True
                     break
-                rows.append({str(v): str(row[v]) if row[v] else None for v in results.vars})
+                rows.append({
+                    str(v): str(row[v]) if row[v] is not None else None
+                    for v in results.vars
+                })
             return {
                 "success": True, "file": file_path,
-                "query": sparql,
+                "query_type": "SELECT",
                 "variables": variables,
-                "result_count": len(list(results)) if hasattr(results, '__len__') else len(rows),
+                "result_count": len(rows),
                 "rows": rows,
-                "truncated": len(rows) >= limit,
+                "truncated": truncated,
             }
         except ImportError:
             return {"success": False, "error": "rdflib not installed"}
@@ -4740,8 +4810,7 @@ class DocumentServerClient:
             if err:
                 return {"success": False, "error": err}
             data = g.serialize(format=output_format)
-            with open(output_path, "w") as f:
-                f.write(data)
+            self._rdf_safe_save(data, output_path)
             return {
                 "success": True, "source": file_path,
                 "output": output_path, "format": output_format,
@@ -4755,26 +4824,35 @@ class DocumentServerClient:
 
     def rdf_merge(
         self, file_path: str, other_path: str, output_path: str = None,
-        format: str = "turtle",
+        format: str = None,
     ) -> Dict[str, Any]:
         """Merge two RDF graphs. Result goes to output_path or overwrites file_path."""
         try:
-            g1, err = self._get_rdf_graph(file_path)
-            if err:
-                return {"success": False, "error": err}
-            g2, err = self._get_rdf_graph(other_path)
-            if err:
-                return {"success": False, "error": err}
-            before = len(g1)
-            g1 += g2
+            abs_a = str(Path(file_path).resolve())
+            abs_b = str(Path(other_path).resolve())
+            if abs_a == abs_b:
+                return {
+                    "success": False,
+                    "error": "Cannot merge a file with itself — use rdf-export to copy",
+                }
             target = output_path or file_path
-            data = g1.serialize(format=format)
-            with open(target, "w") as f:
-                f.write(data)
+            with self._file_lock(target):
+                self._snapshot_backup(target)
+                g1, err = self._get_rdf_graph(file_path)
+                if err:
+                    return {"success": False, "error": err}
+                g2, err = self._get_rdf_graph(other_path)
+                if err:
+                    return {"success": False, "error": err}
+                fmt = format or self._rdf_format_from_path(target)
+                before = len(g1)
+                g1 += g2
+                data = g1.serialize(format=fmt)
+                self._rdf_safe_save(data, target)
             return {
                 "success": True, "file": target,
                 "graph_a_triples": before, "graph_b_triples": len(g2),
-                "merged_triples": len(g1), "format": format,
+                "merged_triples": len(g1), "format": fmt,
             }
         except ImportError:
             return {"success": False, "error": "rdflib not installed"}
@@ -4784,6 +4862,8 @@ class DocumentServerClient:
     def rdf_stats(self, file_path: str) -> Dict[str, Any]:
         """Get detailed statistics about an RDF graph."""
         try:
+            from rdflib import Literal as RDFLiteral
+            from rdflib.namespace import RDF
             g, err = self._get_rdf_graph(file_path)
             if err:
                 return {"success": False, "error": err}
@@ -4792,18 +4872,16 @@ class DocumentServerClient:
             objects_uri = set()
             objects_literal = set()
             for o in g.objects():
-                from rdflib import Literal as RDFLiteral
                 if isinstance(o, RDFLiteral):
                     objects_literal.add(str(o))
                 else:
                     objects_uri.add(str(o))
-            # Class instances
-            from rdflib.namespace import RDF
+            # Class instances via rdf:type
             classes = set()
             for s, p, o in g.triples((None, RDF.type, None)):
                 classes.add(str(o))
             # Predicate frequency
-            pred_freq = {}
+            pred_freq: Dict[str, int] = {}
             for s, p, o in g:
                 ps = str(p)
                 pred_freq[ps] = pred_freq.get(ps, 0) + 1
@@ -4827,25 +4905,30 @@ class DocumentServerClient:
 
     def rdf_namespace(
         self, file_path: str, prefix: str = None, uri: str = None,
-        format: str = "turtle",
+        format: str = None,
     ) -> Dict[str, Any]:
         """Add a namespace prefix or list all prefixes. If prefix+uri given, adds. Otherwise lists."""
         try:
             from rdflib import Namespace
-            g, err = self._get_rdf_graph(file_path)
-            if err:
-                return {"success": False, "error": err}
             if prefix and uri:
-                g.bind(prefix, Namespace(uri))
-                data = g.serialize(format=format)
-                with open(file_path, "w") as f:
-                    f.write(data)
+                with self._file_lock(file_path):
+                    self._snapshot_backup(file_path)
+                    g, err = self._get_rdf_graph(file_path)
+                    if err:
+                        return {"success": False, "error": err}
+                    fmt = format or self._rdf_format_from_path(file_path)
+                    g.bind(prefix, Namespace(uri))
+                    data = g.serialize(format=fmt)
+                    self._rdf_safe_save(data, file_path)
                 return {
                     "success": True, "file": file_path,
                     "action": "added", "prefix": prefix, "uri": uri,
                     "all_prefixes": {p: str(n) for p, n in g.namespaces()},
                 }
             else:
+                g, err = self._get_rdf_graph(file_path)
+                if err:
+                    return {"success": False, "error": err}
                 return {
                     "success": True, "file": file_path,
                     "prefixes": {p: str(n) for p, n in g.namespaces()},
@@ -4860,6 +4943,7 @@ class DocumentServerClient:
         """Validate an RDF graph against SHACL shapes."""
         try:
             from pyshacl import validate as shacl_validate
+            from rdflib import URIRef
             g, err = self._get_rdf_graph(file_path)
             if err:
                 return {"success": False, "error": err}
@@ -4869,10 +4953,36 @@ class DocumentServerClient:
             conforms, results_graph, results_text = shacl_validate(
                 g, shacl_graph=sg, inference="rdfs"
             )
+            # Parse structured violations from results_graph
+            violations = []
+            try:
+                SH = "http://www.w3.org/ns/shacl#"
+                for result_node in results_graph.objects(None, URIRef(f"{SH}result")):
+                    v: Dict[str, Any] = {}
+                    fn = next(results_graph.objects(result_node, URIRef(f"{SH}focusNode")), None)
+                    if fn:
+                        v["focusNode"] = str(fn)
+                    rp = next(results_graph.objects(result_node, URIRef(f"{SH}resultPath")), None)
+                    if rp:
+                        v["resultPath"] = str(rp)
+                    rm = next(results_graph.objects(result_node, URIRef(f"{SH}resultMessage")), None)
+                    if rm:
+                        v["message"] = str(rm)
+                    rs = next(results_graph.objects(result_node, URIRef(f"{SH}resultSeverity")), None)
+                    if rs:
+                        v["severity"] = str(rs).split("#")[-1]
+                    sc = next(results_graph.objects(result_node, URIRef(f"{SH}sourceConstraintComponent")), None)
+                    if sc:
+                        v["constraint"] = str(sc).split("#")[-1]
+                    violations.append(v)
+            except Exception:
+                pass  # violation parsing is best-effort
             return {
                 "success": True, "file": file_path,
                 "shapes_file": shapes_path,
                 "conforms": conforms,
+                "violation_count": len(violations),
+                "violations": violations,
                 "results_text": results_text[:5000],
             }
         except ImportError:
