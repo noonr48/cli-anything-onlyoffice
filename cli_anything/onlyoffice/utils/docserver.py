@@ -3304,6 +3304,8 @@ class DocumentServerClient:
             with self._file_lock(output_path):
                 backup = self._snapshot_backup(output_path)
                 prs = Presentation()
+                prs.slide_width = Inches(13.333)   # 16:9 widescreen
+                prs.slide_height = Inches(7.5)
                 slide_layout = prs.slide_layouts[0]  # Title slide
                 slide = prs.slides.add_slide(slide_layout)
                 if title:
