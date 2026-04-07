@@ -909,7 +909,7 @@ def cmd_status(json_output=False):
     import sys
     result = {
         "success": True,
-        "version": "4.0.0",
+        "version": "4.0.1",
         "python": sys.executable,
         "document_server": {
             "healthy": doc_server.check_health() if doc_server else False
@@ -958,7 +958,7 @@ def cmd_help(json_output=False):
 
     result = {
         "success": True,
-        "version": "4.0.0",
+        "version": "4.0.1",
         "categories": {
             "DOCUMENTS (.docx)": {
                 "doc-create <file> <title> <content>": "Create new .docx document",

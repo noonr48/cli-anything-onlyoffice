@@ -68,10 +68,10 @@ utils/docserver.py     ← Backend engine (4,859 lines)
 
 ### Production-Safety Features
 
-Every write operation goes through three safeguards:
+Every write operation goes through four safeguards:
 
 - **Atomic saves** — writes to a temp file, then `os.replace()`. No partial writes.
-- **Cross-process file locking** — `fcntl.flock(LOCK_EX)` prevents concurrent corruption.
+- **Two-layer file locking** — `threading.Lock` (per-path, intra-process) + `fcntl.flock(LOCK_EX)` (cross-process). Both layers are required: `fcntl.flock` is per-process on Linux and does not serialise threads within the same process.
 - **Automatic backup snapshots** — pre-save copy written to `~/.cli-anything/backups/` before every mutation.
 
 ---
@@ -89,6 +89,20 @@ All responses have `{"success": true, ...}` or `{"success": false, "error": "...
 ## Mode 1 — Documents (.docx)
 
 **25 commands** — full lifecycle from creation to APA references.
+
+### Document Defaults
+
+Every document created with `doc-create` is pre-configured for academic/APA use:
+
+| Setting | Value |
+|---------|-------|
+| Page size | A4 (210 × 297 mm) |
+| Margins | 1.0" all sides (top, bottom, left, right) |
+| Font | Calibri 11pt |
+| Line spacing | Double (APA 7th edition) |
+| Space after paragraph | 0pt |
+
+These defaults apply to all body paragraphs including those added via `doc-append`. Use `doc-layout` to override page size or margins on an existing file.
 
 ### Core CRUD
 
@@ -340,6 +354,12 @@ cli-anything-onlyoffice doc-build-references /tmp/essay.docx --json
 ## Mode 2 — Spreadsheets (.xlsx)
 
 **32 commands** — cell-level access, sheets, stats, CSV I/O, charts.
+
+### Spreadsheet Defaults
+
+Every sheet written with `xlsx-write` automatically:
+- **Auto-fits column widths** to content (min 12 chars, max 50 chars)
+- **Sets A4 paper size** (paperSize=9) for printing
 
 ### Core CRUD
 
@@ -731,7 +751,7 @@ cli-anything-onlyoffice chart-progress /tmp/grades.xlsx A B "Student Grades" \
 **10 commands** — full slide lifecycle.
 
 #### `pptx-create <file> <title> [subtitle]`
-Create a new presentation with a title slide.
+Create a new presentation with a title slide. Slide size is **16:9 widescreen (13.333" × 7.5")** — the modern standard for PowerPoint and OnlyOffice.
 
 ```bash
 cli-anything-onlyoffice pptx-create /tmp/lecture.pptx "Biology 101" "Introduction to Cell Structure" --json
@@ -1044,18 +1064,21 @@ cli-anything-onlyoffice status --json
 {
   "success": true,
   "version": "4.0.0",
+  "python": "/path/to/.venv/bin/python3",
   "python_docx": true,
   "openpyxl": true,
   "python_pptx": true,
   "rdflib": true,
   "rdflib_version": "7.6.0",
-  "pyshacl": false,
+  "pyshacl": true,
   "capabilities": {
     "docx_create": true, "xlsx_charts": true,
-    "rdf_create": true, "rdf_validate": false
+    "rdf_create": true, "rdf_validate": true
   }
 }
 ```
+
+The `python` field shows which interpreter is running. If it doesn't point inside your `.venv`, you are using the wrong Python and imports will fail.
 
 #### `help`
 Machine-readable command reference (JSON mode recommended for agents).
@@ -1224,11 +1247,12 @@ result = cli_anything_run(tool="onlyoffice", args=[
 
 1. **Always use `--json`** — machine-readable, structured, parseable.
 2. **Check `success` first** — every response has `{"success": true/false}`.
-3. **Run `status --json`** on first run to confirm all capabilities are available.
+3. **Run `status --json`** on first run to confirm all capabilities are available. Check the `python` field to verify the venv interpreter is active.
 4. **Run `help --json`** to get the full command reference programmatically.
 5. **Backups are automatic** — every write is snapshotted. Use `backup-restore --latest` on error.
-6. **Atomic writes** — no partial file corruption, safe to run concurrently.
+6. **Atomic writes** — no partial file corruption, safe to run concurrently from multiple threads or processes.
 7. **RDF for knowledge** — use the RDF mode to build structured knowledge graphs that can be queried with SPARQL, exported to any format, and validated against SHACL shapes.
+8. **Always invoke via the venv binary** — never `cd .venv && python3`. Use the full path: `.venv/bin/cli-anything-onlyoffice` or `.venv/bin/python3 -m cli_anything.onlyoffice.core.cli`. Running system `python3` will fail with `ModuleNotFoundError`.
 
 ---
 
@@ -1264,6 +1288,7 @@ agent-harness/
 
 | Version | Changes |
 |---------|---------|
+| **4.0.1** | Bug fixes: two-layer file locking (threading.Lock + fcntl.flock) fixes concurrent write loss under thread load; docx defaults corrected to A4/1" margins/Calibri 11pt/double spacing; xlsx auto-fits column widths and sets A4 paper size; pptx defaults to 16:9 (13.333"×7.5"); status exposes active Python interpreter path |
 | **4.0.0** | Added RDF mode (10 commands), 42 new CRUD/sheet/cell commands across all modes, atomic saves, file locking, auto-backups, full JSON output, SHACL validation support |
 | 3.0.0 | Chart creation (bar, line, pie, scatter), statistical tests (t-test, chi-square, correlation), research analysis pack |
 | 2.0.0 | Presentation support, formula safety auditing |
