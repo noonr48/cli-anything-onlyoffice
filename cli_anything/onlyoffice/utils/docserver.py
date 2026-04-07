@@ -1100,8 +1100,18 @@ class DocumentServerClient:
                 section = doc.sections[0]
                 if orientation.lower() == "landscape":
                     section.orientation = WD_ORIENT.LANDSCAPE
+                    # python-docx does NOT auto-swap dimensions — must do it explicitly
+                    if section.page_width < section.page_height:
+                        section.page_width, section.page_height = (
+                            section.page_height, section.page_width
+                        )
                 else:
                     section.orientation = WD_ORIENT.PORTRAIT
+                    # Ensure portrait has height > width
+                    if section.page_width > section.page_height:
+                        section.page_width, section.page_height = (
+                            section.page_height, section.page_width
+                        )
                 if margins:
                     for side, value in margins.items():
                         if hasattr(section, f"{side}_margin"):
@@ -3654,10 +3664,11 @@ class DocumentServerClient:
         try:
             doc = Document(file_path)
             results = []
+            # Define query once — used in both paragraph and table search
+            query = search_text if case_sensitive else search_text.lower()
             for i, para in enumerate(doc.paragraphs):
                 text = para.text
                 target = text if case_sensitive else text.lower()
-                query = search_text if case_sensitive else search_text.lower()
                 start = 0
                 while True:
                     idx = target.find(query, start)
