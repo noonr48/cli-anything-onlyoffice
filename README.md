@@ -8,15 +8,32 @@ Part of the [SLOANE OS](https://github.com/sloane-os) agent stack. Agents call t
 
 ---
 
-## Quick Start
+## Installation
 
 ```bash
+git clone https://github.com/noonr48/cli-anything-onlyoffice.git
+cd cli-anything-onlyoffice
+
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
 pip install -e .
-# or with optional SHACL validation
+# or with optional SHACL validation support
 pip install -e ".[shacl]"
 
 # Verify
 cli-anything-onlyoffice status --json
+```
+
+To re-activate in a future shell session:
+```bash
+source /path/to/cli-anything-onlyoffice/.venv/bin/activate
+cli-anything-onlyoffice status --json
+```
+
+When calling from SLOANE OS or another agent, invoke via the venv binary directly so you don't depend on the shell's active environment:
+```bash
+/path/to/cli-anything-onlyoffice/.venv/bin/cli-anything-onlyoffice status --json
 ```
 
 ### Dependencies
