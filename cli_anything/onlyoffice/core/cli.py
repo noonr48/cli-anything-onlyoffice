@@ -998,7 +998,7 @@ def cmd_help(json_output=False):
                 "xlsx-delete-cols <file> <start_col> [count] [--sheet <name>]": "Delete columns (1-indexed)",
                 "xlsx-sort <file> <column> [--sheet <name>] [--desc] [--numeric]": "Sort by column (preserves header)",
                 "xlsx-filter <file> <column> <op> <value> [--sheet <name>]": "Filter rows (op: eq|ne|gt|lt|ge|le|contains|startswith|endswith)",
-                "xlsx-calc <file> <column> <op> [--sheet <name>] [--include-formulas]": "Column statistics (sum|avg|min|max|all)",
+                "xlsx-calc <file> <column> <op> [--sheet <name>] [--include-formulas] [--strict-formulas]": "Column statistics (sum|avg|min|max|all)",
                 "xlsx-formula <file> <cell> <formula> [--sheet <name>]": "Add formula to cell",
                 "xlsx-formula-audit <file> [--sheet <name>]": "Audit formula complexity/risk",
                 "xlsx-freq <file> <column> [--sheet <name>] [--valid <csv>]": "Frequency + percentage table",

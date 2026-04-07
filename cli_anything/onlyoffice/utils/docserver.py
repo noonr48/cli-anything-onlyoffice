@@ -15,10 +15,16 @@ import tempfile
 import fcntl
 import re
 import hashlib
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, List
 from contextlib import contextmanager
+
+# Module-level per-path thread locks — serialises same-process threads before
+# flock takes over for cross-process serialisation.
+_thread_lock_map: dict[str, threading.Lock] = {}
+_thread_lock_map_mu: threading.Lock = threading.Lock()
 
 # Import document libraries with advanced formatting
 try:
@@ -103,36 +109,50 @@ class DocumentServerClient:
 
     @contextmanager
     def _file_lock(self, file_path: str):
-        """Cross-process file lock using a sidecar lock file with timeout."""
-        lock_path = f"{file_path}.lock"
-        lock_file = open(lock_path, "w")
-        deadline = __import__('time').monotonic() + self._lock_timeout_seconds
-        acquired = False
-        try:
-            while True:
-                try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except BlockingIOError:
-                    if __import__('time').monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"Could not acquire lock on {file_path} within "
-                            f"{self._lock_timeout_seconds}s"
-                        )
-                    __import__('time').sleep(0.1)
-            yield
-        finally:
-            if acquired:
-                try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                except Exception:
-                    pass
-            lock_file.close()
+        """Two-layer file lock: threading.Lock (intra-process) + fcntl.flock (cross-process).
+
+        fcntl.flock is per-process on Linux — threads within the same process bypass it.
+        The threading.Lock layer serialises concurrent threads before flock serialises
+        concurrent processes.
+        """
+        import time
+        abs_path = str(Path(file_path).resolve())
+        # Retrieve or create the per-path thread lock
+        with _thread_lock_map_mu:
+            if abs_path not in _thread_lock_map:
+                _thread_lock_map[abs_path] = threading.Lock()
+            tlock = _thread_lock_map[abs_path]
+
+        with tlock:  # serialise threads within this process
+            lock_path = f"{file_path}.lock"
+            lock_file = open(lock_path, "w")
+            deadline = time.monotonic() + self._lock_timeout_seconds
+            acquired = False
             try:
-                os.unlink(lock_path)
-            except OSError:
-                pass
+                while True:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"Could not acquire lock on {file_path} within "
+                                f"{self._lock_timeout_seconds}s"
+                            )
+                        time.sleep(0.05)
+                yield
+            finally:
+                if acquired:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+                lock_file.close()
+                try:
+                    os.unlink(lock_path)
+                except OSError:
+                    pass
 
     def _get_sheet(self, wb, sheet_name: str):
         """Get a worksheet with a friendly error if not found."""
