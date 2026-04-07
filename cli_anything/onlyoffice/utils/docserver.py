@@ -3416,16 +3416,18 @@ class DocumentServerClient:
                 if bullets.strip():
                     tf = slide.placeholders[1].text_frame
                     tf.clear()
-                    for i, bullet in enumerate(bullets.split("\n")):
+                    bullet_count = 0
+                    for bullet in bullets.split("\n"):
                         bullet = bullet.strip()
                         if not bullet:
                             continue
-                        if i == 0:
+                        if bullet_count == 0:
                             p = tf.paragraphs[0]
                         else:
                             p = tf.add_paragraph()
                         p.text = bullet
                         p.level = 0
+                        bullet_count += 1
 
                 self._safe_save(prs, file_path)
             return {
