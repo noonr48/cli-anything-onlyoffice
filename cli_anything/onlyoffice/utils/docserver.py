@@ -1599,11 +1599,13 @@ class DocumentServerClient:
             return {"success": False, "error": "openpyxl not installed"}
         try:
             wb = load_workbook(file_path, read_only=True)
-            sheets_to_read = (
-                [sheet_name]
-                if sheet_name and sheet_name in wb.sheetnames
-                else wb.sheetnames
-            )
+            if sheet_name and sheet_name not in wb.sheetnames:
+                wb.close()
+                return {
+                    "success": False,
+                    "error": f"Sheet '{sheet_name}' not found. Available: {list(wb.sheetnames)}",
+                }
+            sheets_to_read = [sheet_name] if sheet_name else list(wb.sheetnames)
             result = {
                 "success": True,
                 "file": file_path,
@@ -4103,6 +4105,12 @@ class DocumentServerClient:
         operator: eq|ne|gt|lt|ge|le|contains|startswith|endswith"""
         if not OPENPYXL_AVAILABLE:
             return {"success": False, "error": "openpyxl not installed"}
+        valid_operators = {"eq", "ne", "gt", "lt", "ge", "le", "contains", "startswith", "endswith"}
+        if operator not in valid_operators:
+            return {
+                "success": False,
+                "error": f"Unknown operator '{operator}'. Valid: {' | '.join(sorted(valid_operators))}",
+            }
         try:
             wb = load_workbook(file_path, read_only=True)
             ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
