@@ -1,563 +1,214 @@
 ---
 name: onlyoffice
-version: 3.0.0
+version: 4.0.1
 author: SLOANE OS
-description: Full programmatic control over Documents (.docx), Spreadsheets (.xlsx), and Presentations (.pptx)
-tags: [productivity, documents, office, onlyoffice, charts, spreadsheets]
+description: 90-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), and RDF Knowledge Graphs
+tags: [productivity, documents, office, onlyoffice, charts, spreadsheets, rdf, apa]
 ---
 
-# CLI-Anything OnlyOffice v3.0
+# CLI-Anything OnlyOffice v4.0.1
 
-A comprehensive command-line interface for creating, reading, and editing Office documents programmatically. Supports full document manipulation, spreadsheet operations with charts, and presentation building.
+Programmatic control over Office documents designed for AI agents. Full JSON output. Production-safe with atomic writes, two-layer file locking, and automatic backups.
 
-## Installation
-
-```bash
-pip install -e /home/benbi/cli-anything/onlyoffice/agent-harness
-```
-
-Verify:
-```bash
-which cli-anything-onlyoffice
-cli-anything-onlyoffice status --json
-```
-
-## Quick Reference
-
-| Document Type | Library | Commands |
-|--------------|---------|----------|
-| Documents (.docx) | python-docx | 8 commands |
-| Spreadsheets (.xlsx) | openpyxl | 11 commands (+ charts) |
-| Presentations (.pptx) | python-pptx | 6 commands |
-
----
-
-## DOCUMENTS (.docx)
-
-### open <file> [mode]
-Open a file in OnlyOffice GUI or web viewer.
+## ⚠️ CRITICAL: How to Call This Tool
 
 ```bash
-# Open in desktop GUI
-cli-anything-onlyoffice open /tmp/grades.xlsx gui --json
+# Via SLOANE skill router (preferred for subject agents):
+cli_anything_run --app onlyoffice <command> [args] --json
 
-# Open in web viewer (requires Document Server setup)
-cli-anything-onlyoffice open /tmp/grades.xlsx web --json
+# Direct binary (Claude Code / shell):
+/home/benbi/AI_Library/cli-anything-onlyoffice/.venv/bin/cli-anything-onlyoffice <command> [args] --json
 ```
 
-**JSON Output:**
-```json
-{
-  "success": true,
-  "file": "/tmp/grades.xlsx",
-  "mode": "gui",
-  "message": "Opened in OnlyOffice Desktop Editors"
-}
-```
+**NEVER do any of these — they will fail:**
+- `which onlyoffice-cli` — wrong name
+- `pip install python-pptx` / `pip3 install` — already in venv, don't touch system python
+- `python3 -c "import pptx"` — wrong interpreter, use venv python
+- Installing anything — the tool is already installed
 
-### watch <file> [mode]
-Watch a file for changes and auto-open in GUI for real-time viewing.
-
+Verify the tool is working:
 ```bash
-# Watch file and auto-open GUI (Ctrl+C to stop)
-cli-anything-onlyoffice watch /tmp/essay.docx gui --json
+cli_anything_run --app onlyoffice status --json
 ```
-
-**Use Case:** Perfect for real-time feedback as the agent works on documents. The GUI will show changes as they happen!
-
-### doc-create <file> <title> <content> [--open]
-Create a new .docx document. Add `--open` to auto-launch GUI.
-
-```bash
-cli-anything-onlyoffice doc-create essay.docx "My Essay" "Introduction..." --open --json
-```
-
-### xlsx-write <file> <headers> <data> [--open]
-Write data to spreadsheet. Add `--open` to auto-launch GUI.
-
-```bash
-cli-anything-onlyoffice xlsx-write grades.xlsx "Student,Grade" "Alice,85" --open --json
-```
-
-**JSON Output:**
-```json
-{
-  "success": true,
-  "file": "essay.docx",
-  "title": "My Essay",
-  "size": 8192
-}
-```
-
-### doc-read <file>
-Read and extract all content from a .docx document.
-
-```bash
-cli-anything-onlyoffice doc-read essay.docx --json
-```
-
-**JSON Output:**
-```json
-{
-  "success": true,
-  "file": "essay.docx",
-  "paragraphs": ["Introduction...", "Body paragraph..."],
-  "paragraph_count": 5,
-  "full_text": "Introduction...\n\nBody paragraph..."
-}
-```
-
-### doc-append <file> <content>
-Append text to a .docx document.
-
-```bash
-cli-anything-onlyoffice doc-append essay.docx "New paragraph about findings..." --json
-```
-
-### doc-replace <file> <search> <replace>
-Find and replace text in a .docx document.
-
-```bash
-cli-anything-onlyoffice doc-replace essay.docx "draft" "final" --json
-```
+Check the `python` field in the response — it must point to `.venv/bin/python3`.
 
 ---
 
-## SPREADSHEETS (.xlsx)
+## Document Defaults (doc-create)
 
-### xlsx-create <file> [sheet]
-Create a new .xlsx spreadsheet.
+| Setting | Value |
+|---------|-------|
+| Page size | A4 (210 × 297 mm) |
+| Margins | 1.0" all sides |
+| Font | Calibri 11pt |
+| Line spacing | Double (APA 7th) |
+| Space after | 0pt |
 
-```bash
-cli-anything-onlyoffice xlsx-create grades.xlsx "Grades" --json
-```
+## Spreadsheet Defaults (xlsx-write)
+- Column widths auto-fit to content
+- A4 paper size set on all sheets
 
-### xlsx-write <file> <headers> <data>
-Write headers and data rows to a spreadsheet. Values starting with '=' are formulas.
-
-```bash
-cli-anything-onlyoffice xlsx-write grades.xlsx "Student,Assignment1,Assignment2,Total" \
-  "Alice,85,90,=B2+C2;Bob,78,82,=B3+C3" --json
-```
-
-**JSON Output:**
-```json
-{
-  "success": true,
-  "file": "grades.xlsx",
-  "rows_written": 2,
-  "columns": 4
-}
-```
-
-### xlsx-read <file> [sheet]
-Read all data from a spreadsheet.
-
-```bash
-cli-anything-onlyoffice xlsx-read grades.xlsx --json
-```
-
-### xlsx-append <file> <row-data>
-Append a row to a spreadsheet.
-
-```bash
-cli-anything-onlyoffice xlsx-append grades.xlsx "Charlie,92,88" --json
-```
-
-### xlsx-search <file> <text>
-Search for text in a spreadsheet.
-
-```bash
-cli-anything-onlyoffice xlsx-search grades.xlsx "Alice" --json
-```
-
-### xlsx-calc <file> <column> <operation>
-Calculate column statistics (sum, avg, min, max).
-
-```bash
-cli-anything-onlyoffice xlsx-calc grades.xlsx B sum --json
-```
-
-**JSON Output:**
-```json
-{
-  "success": true,
-  "column": "B",
-  "count": 5,
-  "sum": 425,
-  "average": 85.0,
-  "min": 70,
-  "max": 95
-}
-```
-
-### xlsx-formula <file> <cell> <formula>
-Add formula to a specific cell.
-
-```bash
-cli-anything-onlyoffice xlsx-formula grades.xlsx D2 "=AVERAGE(B2:C2)" --json
-```
+## Presentation Defaults (pptx-create)
+- Slide size: 16:9 widescreen (13.333" × 7.5")
 
 ---
 
-## CHARTS (.xlsx) - NEW IN v3.0
+## DOCUMENTS (.docx) — 25 commands
 
-### chart-create <file> <type> <data_range> <cat_range> <title> [options]
-Create a chart in a spreadsheet.
+### Core CRUD
+- `doc-create <file> <title> <content>`
+- `doc-read <file>`
+- `doc-append <file> <content>`
+- `doc-replace <file> <search> <replace>`
+- `doc-search <file> <text> [--case-sensitive]`
+- `doc-insert <file> <text> <index> [--style <name>]`
+- `doc-delete <file> <index>`
+- `doc-word-count <file>`
 
-**Chart Types:** bar, column, bar_horizontal, line, pie, scatter
+### Formatting
+- `doc-format <file> <paragraph_index> [--bold] [--italic] [--underline] [--font-name <n>] [--font-size <n>] [--color <hex>] [--align <left|center|right|justify>]`
+- `doc-set-style <file> <index> <style>`
+- `doc-list-styles <file>`
+- `doc-highlight <file> <text> [--color yellow|cyan|green|pink]`
+- `doc-formatting-info <file>`
 
-```bash
-# Basic bar chart
-cli-anything-onlyoffice chart-create grades.xlsx bar B2:D6 A2:A6 "Assignment Comparison" --json
+### Page Layout
+- `doc-layout <file> [--orientation portrait|landscape] [--margin-top <in>] [--margin-bottom <in>] [--margin-left <in>] [--margin-right <in>] [--header <text>] [--page-numbers]`
 
-# With options
-cli-anything-onlyoffice chart-create grades.xlsx bar B2:D6 A2:A6 "Sales Data" \
-  --sheet Sheet1 --output-sheet Charts --x-label "Students" --y-label "Scores" \
-  --labels --legend-pos bottom --colors FF0000,00FF00,0000FF --json
-```
+### Rich Content
+- `doc-add-table <file> <headers_csv> <data_csv>` — rows separated by `;`
+- `doc-read-tables <file>`
+- `doc-add-image <file> <image_path> [--width <inches>] [--caption <text>]`
+- `doc-add-hyperlink <file> <text> <url> [--paragraph <index>]`
+- `doc-add-page-break <file>`
+- `doc-add-list <file> <items> [--type bullet|number]` — items separated by `;`
 
-**Options:**
-- `--sheet <name>`: Source sheet name
-- `--output-sheet <name>`: Sheet to place chart (creates if not exists)
-- `--x-label <text>`: X-axis label
-- `--y-label <text>`: Y-axis label
-- `--labels`: Show data labels on chart
-- `--no-legend`: Hide legend
-- `--legend-pos <pos>`: Legend position (right, top, bottom, left)
-- `--colors <hex,hex>`: Custom colors for series
+### Metadata & Annotations
+- `doc-set-metadata <file> [--author] [--title] [--subject] [--keywords] [--comments] [--category]`
+- `doc-get-metadata <file>`
+- `doc-comment <file> <comment> [--paragraph <index>]`
 
-### chart-comparison <file> <type> <title> [options]
-Create a comparison chart from structured data.
-
-```bash
-cli-anything-onlyoffice chart-comparison grades.xlsx line "Assignment Trends" \
-  --start-row 2 --cat-col 1 --value-cols 2,3,4 --output A10 --labels --json
-```
-
-**Options:**
-- `--sheet <name>`: Source sheet
-- `--start-row <n>`: Starting row (default: 1)
-- `--start-col <n>`: Starting column (default: 1)
-- `--cats <n>`: Number of category rows
-- `--series <n>`: Number of data series
-- `--cat-col <n>`: Category column (1-indexed)
-- `--value-cols <n,n,n>`: Data columns (1-indexed)
-- `--output <cell>`: Output cell position
-- `--labels`: Show data labels
-- `--no-legend`: Hide legend
-
-### chart-grade-dist <file> <grade_col> <title> [options]
-Create a pie chart showing grade distribution. Automatically counts grade frequencies.
-
-```bash
-cli-anything-onlyoffice chart-grade-dist grades.xlsx B "Grade Distribution" --json
-```
-
-**Options:**
-- `--sheet <name>`: Source sheet
-- `--output <cell>`: Output cell (default: F2)
-
-**JSON Output:**
-```json
-{
-  "success": true,
-  "file": "grades.xlsx",
-  "chart_type": "pie",
-  "title": "Grade Distribution",
-  "total_grades": 5,
-  "distribution": {"A": 2, "B": 2, "C": 1},
-  "output_cell": "F2"
-}
-```
-
-### chart-progress <file> <student_col> <grade_col> <title> [options]
-Create a horizontal bar chart showing individual student grades.
-
-```bash
-cli-anything-onlyoffice chart-progress grades.xlsx A B "Student Grades" --json
-```
-
-**Options:**
-- `--sheet <name>`: Source sheet
-- `--output <cell>`: Output cell (default: D2)
-- `--labels`: Show data labels (default: true)
-- `--no-labels`: Hide data labels
+### References (APA 7th)
+- `doc-add-reference <file> <ref_json>` — types: journal, book, website, report, chapter
+- `doc-build-references <file>`
 
 ---
 
-## PRESENTATIONS (.pptx)
+## SPREADSHEETS (.xlsx) — 32 commands
 
-### pptx-create <file> <title> [subtitle]
-Create a new .pptx presentation with title slide.
+### Core CRUD
+- `xlsx-create <file> [sheet_name]`
+- `xlsx-write <file> <headers_csv> <data_csv> [--sheet <name>] [--overwrite] [--coerce-rows] [--text-columns <csv>]`
+- `xlsx-read <file> [sheet_name]`
+- `xlsx-append <file> <row_data_csv> [--sheet <name>]`
+- `xlsx-search <file> <text> [--sheet <name>]`
 
-```bash
-cli-anything-onlyoffice pptx-create lecture.pptx "Biology 101" "Introduction to Cell Structure" --json
-```
+### Cell & Range
+- `xlsx-cell-read <file> <cell> [--sheet <name>]`
+- `xlsx-cell-write <file> <cell> <value> [--sheet <name>] [--text]`
+- `xlsx-range-read <file> <range> [--sheet <name>]`
+- `xlsx-delete-rows <file> <start_row> [count] [--sheet <name>]`
+- `xlsx-delete-cols <file> <start_col> [count] [--sheet <name>]`
 
-### pptx-add-slide <file> <title> [content] [layout]
-Add a slide. Layouts: title_only, content, blank, two_content.
+### Sorting & Filtering
+- `xlsx-sort <file> <column> [--sheet <name>] [--desc] [--numeric]`
+- `xlsx-filter <file> <column> <op> <value> [--sheet <name>]` — ops: eq|ne|gt|lt|ge|le|contains|startswith|endswith
 
-```bash
-cli-anything-onlyoffice pptx-add-slide lecture.pptx "Key Concepts" "Main points here" content --json
-```
+### Formulas & Stats
+- `xlsx-formula <file> <cell> <formula> [--sheet <name>]`
+- `xlsx-calc <file> <column> <op> [--sheet <name>] [--include-formulas] [--strict-formulas]` — ops: sum|avg|min|max|all
+- `xlsx-formula-audit <file> [--sheet <name>]`
+- `xlsx-freq <file> <column> [--sheet <name>] [--valid <csv>]`
+- `xlsx-corr <file> <x_col> <y_col> [--sheet <name>] [--method pearson|spearman]`
+- `xlsx-ttest <file> <val_col> <grp_col> <group_a> <group_b> [--sheet <name>] [--equal-var]`
+- `xlsx-mannwhitney <file> <val_col> <grp_col> <group_a> <group_b> [--sheet <name>]`
+- `xlsx-chi2 <file> <row_col> <col_col> [--sheet <name>] [--row-valid <csv>] [--col-valid <csv>]`
+- `xlsx-text-extract <file> <column> [--sheet <name>] [--limit <n>] [--min-length <n>]`
+- `xlsx-text-keywords <file> <column> [--sheet <name>] [--top <n>]`
+- `xlsx-research-pack <file> [--sheet <name>] [--profile hlth3112]`
 
-### pptx-add-bullets <file> <title> <bullets>
-Add a bullet-point slide. Bullets separated by \n.
+### Sheet Management
+- `xlsx-sheet-list <file>`
+- `xlsx-sheet-add <file> <name> [--position <n>]`
+- `xlsx-sheet-delete <file> <name>`
+- `xlsx-sheet-rename <file> <old_name> <new_name>`
 
-```bash
-cli-anything-onlyoffice pptx-add-bullets lecture.pptx "Key Concepts" "Cell theory\nDNA structure\nMitochondria" --json
-```
+### Cell Formatting
+- `xlsx-merge-cells <file> <range> [--sheet <name>]`
+- `xlsx-unmerge-cells <file> <range> [--sheet <name>]`
+- `xlsx-format-cells <file> <range> [--sheet <name>] [--bold] [--italic] [--font-name <n>] [--font-size <n>] [--color <hex>] [--bg-color <hex>] [--number-format <fmt>] [--wrap] [--align <left|center|right>]`
 
-### pptx-add-table <file> <title> <headers> <data>
-Add a table slide. Headers comma-separated, rows semicolon-separated.
-
-```bash
-cli-anything-onlyoffice pptx-add-table lecture.pptx "Cell Types" "Type,Size,Features" \
-  "Prokaryotic,1-5um,No nucleus;Eukaryotic,10-100um,Has nucleus" --json
-```
-
-### pptx-add-image <file> <title> <image_path>
-Add an image slide.
-
-```bash
-cli-anything-onlyoffice pptx-add-image lecture.pptx "Cell Diagram" ~/images/cell.png --json
-```
-
-### pptx-read <file>
-Read all slides and content from a presentation.
-
-```bash
-cli-anything-onlyoffice pptx-read lecture.pptx --json
-```
-
----
-
-## GENERAL COMMANDS
-
-### list
-List recent documents, spreadsheets, and presentations.
-
-```bash
-cli-anything-onlyoffice list --json
-```
-
-### info <file>
-Get file information.
-
-```bash
-cli-anything-onlyoffice info grades.xlsx --json
-```
-
-### status
-Check installation and capabilities.
-
-```bash
-cli-anything-onlyoffice status --json
-```
-
-**JSON Output:**
-```json
-{
-  "success": true,
-  "document_server": {"healthy": true},
-  "python_docx": true,
-  "openpyxl": true,
-  "python_pptx": true,
-  "capabilities": {
-    "docx_create": true,
-    "xlsx_create": true,
-    "xlsx_charts": true,
-    "pptx_create": true
-  }
-}
-```
-
-### help
-Show usage information.
-
-```bash
-cli-anything-onlyoffice help --json
-```
+### CSV
+- `xlsx-csv-import <xlsx_file> <csv_file> [--sheet <name>] [--delimiter <char>]`
+- `xlsx-csv-export <xlsx_file> <csv_file> [--sheet <name>] [--delimiter <char>]`
 
 ---
 
-## GUI Integration - Real-Time Document Viewing
+## CHARTS (.xlsx) — 4 commands
 
-The CLI integrates with OnlyOffice Desktop Editors GUI for real-time document viewing:
+Types: bar, column, bar_horizontal, line, pie, scatter
 
-### Auto-Open After Creation
-Add `--open` flag to automatically launch the GUI after creating/modifying a file:
-
-```bash
-# Document opens in GUI after creation
-cli-anything-onlyoffice doc-create essay.docx "Title" "Content" --open
-
-# Spreadsheet opens in GUI after write
-cli-anything-onlyoffice xlsx-write data.xlsx "A,B,C" "1,2,3" --open
-```
-
-### Watch Mode for Real-Time Feedback
-Use `watch` command to monitor a file and keep GUI open for live updates:
-
-```bash
-# Terminal 1: Start watching
-cli-anything-onlyoffice watch /tmp/essay.docx gui
-
-# Terminal 2: Agent writes content
-cli-anything-onlyoffice doc-append /tmp/essay.docx "New paragraph..."
-# GUI updates automatically!
-```
-
-### SLOANE UI Integration
-The SLOANE web interface includes a **Document Viewer** panel (📄 button in header) that:
-- Embeds OnlyOffice Document Server in an iframe
-- Auto-refreshes when files change
-- Shows documents created by agents in real-time
-
-```python
-# Agent can trigger document viewer
-cli_anything_run(tool="onlyoffice", args=["open", "/tmp/essay.docx", "gui"])
-```
+- `chart-create <file> <type> <data_range> <categories_range> <title> [--sheet <name>] [--output-sheet <name>] [--x-label <text>] [--y-label <text>] [--labels] [--no-legend] [--legend-pos right|top|bottom|left] [--colors <hex,hex>]`
+- `chart-comparison <file> <type> <title> [--sheet <name>] [--start-row <n>] [--cat-col <n>] [--value-cols <n,n,n>] [--output <cell>] [--labels]`
+- `chart-grade-dist <file> <grade_col> <title> [--sheet <name>] [--output <cell>]`
+- `chart-progress <file> <student_col> <grade_col> <title> [--sheet <name>] [--output <cell>] [--labels]`
 
 ---
 
-## ACADEMIC WORKFLOW EXAMPLES
+## PRESENTATIONS (.pptx) — 10 commands
 
-### Create Grade Tracker with Charts
-
-```bash
-# 1. Create grade spreadsheet
-cli-anything-onlyoffice xlsx-write grades.xlsx \
-  "Student,Assignment1,Assignment2,Assignment3,Total" \
-  "Alice,85,90,88,=B2+C2+D2;Bob,78,82,85,=B3+C3+D3;Charlie,92,88,95,=B4+C4+D4" --json
-
-# 2. Add student progress chart
-cli-anything-onlyoffice chart-progress grades.xlsx A B "Student Performance" --output D2 --labels --json
-
-# 3. Add assignment comparison chart
-cli-anything-onlyoffice chart-create grades.xlsx bar B2:D4 A2:A4 "Assignment Comparison" \
-  --output-sheet Charts --x-label "Student" --y-label "Score" --labels --json
-
-# 4. Add grade distribution pie chart
-cli-anything-onlyoffice chart-grade-dist grades.xlsx E "Total Grade Distribution" --output H2 --json
-```
-
-### Create Lecture Presentation
-
-```bash
-# 1. Create presentation
-cli-anything-onlyoffice pptx-create lecture.pptx "Biology 101" "Cell Biology Introduction" --json
-
-# 2. Add bullet points slide
-cli-anything-onlyoffice pptx-add-bullets lecture.pptx "Learning Objectives" \
-  "Understand cell theory\nIdentify organelles\nExplain cellular functions" --json
-
-# 3. Add comparison table
-cli-anything-onlyoffice pptx-add-table lecture.pptx "Cell Types" \
-  "Type,Nucleus,Size,Examples" \
-  "Prokaryotic,No,1-5um,Bacteria;Eukaryotic,Yes,10-100um,Animals,Plants" --json
-```
-
-### Create Essay Document
-
-```bash
-# 1. Create document
-cli-anything-onlyoffice doc-create essay.docx "Research Essay" "Introduction paragraph..." --json
-
-# 2. Add content
-cli-anything-onlyoffice doc-append essay.docx "Body paragraph with analysis..." --json
-cli-anything-onlyoffice doc-append essay.docx "Conclusion summarizing findings..." --json
-
-# 3. Find and replace
-cli-anything-onlyoffice doc-replace essay.docx "draft" "final" --json
-
-# 4. Read and verify
-cli-anything-onlyoffice doc-read essay.docx --json
-```
+- `pptx-create <file> <title> [subtitle]` — 16:9 widescreen by default
+- `pptx-add-slide <file> <title> [content] [layout]` — layouts: title_only|content|blank|two_content|comparison
+- `pptx-add-bullets <file> <title> <bullets>` — bullets separated by `\n`
+- `pptx-add-table <file> <title> <headers_csv> <data_csv> [--coerce-rows]`
+- `pptx-add-image <file> <title> <image_path>`
+- `pptx-read <file>`
+- `pptx-slide-count <file>`
+- `pptx-delete-slide <file> <index>`
+- `pptx-speaker-notes <file> <slide_index> [notes_text]`
+- `pptx-update-text <file> <slide_index> [--title <t>] [--body <b>]`
 
 ---
 
-## Agent Usage Patterns
+## RDF KNOWLEDGE GRAPHS — 10 commands
 
-### Pattern 1: Create Academic Report with Charts
-
-```python
-# Create spreadsheet with data
-cli_anything_run(tool="onlyoffice", args=[
-    "xlsx-write", "report.xlsx",
-    "Month,Revenue,Expenses,Profit",
-    "Jan,5000,3000,=B2-C2;Feb,6000,3500,=B3-C3;Mar,5500,3200,=B4-C4"
-])
-
-# Add visualizations
-cli_anything_run(tool="onlyoffice", args=[
-    "chart-create", "report.xlsx", "line", "B2:D4", "A2:A4", "Revenue Trend",
-    "--labels", "--x-label", "Month", "--y-label", "Amount"
-])
-
-cli_anything_run(tool="onlyoffice", args=[
-    "chart-grade-dist", "report.xlsx", "D", "Profit Distribution", "--output", "F2"
-])
-```
-
-### Pattern 2: Student Grade Analysis
-
-```python
-# Load grades
-grades = cli_anything_run(tool="onlyoffice", args=["xlsx-read", "grades.xlsx", "--json"])
-
-# Create analysis charts
-cli_anything_run(tool="onlyoffice", args=[
-    "chart-progress", "grades.xlsx", "A", "E", "Student Grades", "--output", "G2"
-])
-
-cli_anything_run(tool="onlyoffice", args=[
-    "chart-comparison", "grades.xlsx", "bar", "Assignment Comparison",
-    "--start-row", "2", "--cat-col", "1", "--value-cols", "2,3,4", "--output", "I10"
-])
-```
+- `rdf-create <file> [--base <uri>] [--format turtle|xml|n3|json-ld] [--prefix <p>=<uri>]`
+- `rdf-read <file> [--limit <n>]`
+- `rdf-add <file> <subject> <predicate> <object> [--type uri|literal|bnode] [--lang <tag>] [--datatype <xsd_uri>]`
+- `rdf-remove <file> [--subject <uri>] [--predicate <uri>] [--object <value>]`
+- `rdf-query <file> <sparql_query> [--limit <n>]`
+- `rdf-export <file> <output_file> [--format <format>]`
+- `rdf-merge <file_a> <file_b> [--output <file>] [--format <f>]`
+- `rdf-stats <file>`
+- `rdf-namespace <file> [<prefix> <uri>]`
+- `rdf-validate <data_file> <shapes_file>`
 
 ---
 
-## Supported Formats
+## GENERAL — 9 commands
 
-| Category | Formats | Library |
-|----------|---------|---------|
-| Documents | .docx, .doc, .odt, .txt, .rtf | python-docx |
-| Spreadsheets | .xlsx, .xls, .ods, .csv | openpyxl |
-| Presentations | .pptx, .ppt, .odp | python-pptx |
-
-## Chart Types Supported
-
-| Type | Use Case | Example |
-|------|----------|---------|
-| bar/column | Comparing categories | Assignment scores |
-| bar_horizontal | Long labels | Student names |
-| line | Trends over time | Grade progression |
-| pie | Distribution | Grade breakdown |
-| scatter | Correlation | Study time vs grades |
-
-## Integration with SLOANE
-
-The CLI is automatically indexed for SLOANE subject agents after installation. Agents can:
-
-- ✅ Create and edit documents programmatically
-- ✅ Create spreadsheets with formulas
-- ✅ **Generate charts (bar, line, pie, scatter)**
-- ✅ Build presentations with slides, bullets, tables, images
-- ✅ Search and extract content from files
-- ✅ Perform calculations on spreadsheet data
-
-## Requirements
-
-- Python 3.10+
-- python-docx (for .docx)
-- openpyxl (for .xlsx with charts)
-- python-pptx (for .pptx)
+- `list` — List recent office files
+- `open <file> [gui|web]`
+- `watch <file> [gui|web]`
+- `info <file>`
+- `status` — Check installation (includes `python` field showing active interpreter)
+- `help`
+- `backup-list <file> [--limit <n>]`
+- `backup-prune [--file <f>] [--keep <n>] [--days <n>]`
+- `backup-restore <file> [--latest] [--dry-run]`
 
 ---
 
-**Last Updated:** 2026-04-01
-**Version:** 3.0.0
-**New Features:** Chart creation (bar, line, pie, scatter), comparison charts, grade distribution, student progress charts
+## Agent Rules
+
+1. **Always `--json`** — every response is `{"success": true/false, ...}`
+2. **Check `success` first**
+3. **Run `status --json` at session start** — verify `python` field = `.venv/bin/python3`
+4. **Never install anything** — tool is fully installed, all deps in venv
+5. **Never use system python3/pip3/pip**
+6. **Backups are automatic** — `backup-restore --latest` on any write error
+
+---
+
+**Last Updated:** 2026-04-07
+**Version:** 4.0.1
