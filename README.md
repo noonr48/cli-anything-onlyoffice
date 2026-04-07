@@ -1,4 +1,4 @@
-# CLI-Anything OnlyOffice v4.0
+# CLI-Anything OnlyOffice v4.0.2
 
 > Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), and RDF Knowledge Graphs — designed for AI agents.
 
@@ -1260,16 +1260,16 @@ result = cli_anything_run(tool="onlyoffice", args=[
 
 ```
 agent-harness/
-├── setup.py                          # Package config (v4.0.0)
+├── setup.py                          # Package config (v4.0.2)
 ├── README.md                         # This file
 ├── cli_anything/
 │   └── onlyoffice/
 │       ├── core/
 │       │   ├── __init__.py
-│       │   └── cli.py                # CLI router + dispatcher (~2,800 lines)
+│       │   └── cli.py                # CLI router + dispatcher (~2,815 lines)
 │       ├── utils/
 │       │   ├── __init__.py
-│       │   └── docserver.py          # Backend engine (~4,860 lines)
+│       │   └── docserver.py          # Backend engine (~5,034 lines)
 │       ├── skills/
 │       │   ├── __init__.py
 │       │   └── SKILL.md              # SLOANE skill manifest
@@ -1288,6 +1288,7 @@ agent-harness/
 
 | Version | Changes |
 |---------|---------|
+| **4.0.2** | Comprehensive bug-fix audit across all four modes: RDF full rewrite — 13 bugs fixed (ASK/CONSTRUCT/DESCRIBE query support, `rdf-remove` literal/bnode type flag, file-not-found guard, double-iteration fix, locking + atomic saves on all write methods, lang+datatype mutual exclusion, self-merge guard, `rdf-validate` structured violations output); xlsx — `xlsx-filter` now validates operator before executing, `xlsx-read` returns error on unknown sheet name instead of silently reading all sheets; docx — `doc-layout` landscape correctly swaps page dimensions, `doc-search` NameError fixed on table-only documents; pptx — `pptx-add-bullets` leading-empty-line enumerate-index bug fixed (orphan empty first paragraph) |
 | **4.0.1** | Bug fixes: two-layer file locking (threading.Lock + fcntl.flock) fixes concurrent write loss under thread load; docx defaults corrected to A4/1" margins/Calibri 11pt/double spacing; xlsx auto-fits column widths and sets A4 paper size; pptx defaults to 16:9 (13.333"×7.5"); status exposes active Python interpreter path |
 | **4.0.0** | Added RDF mode (10 commands), 42 new CRUD/sheet/cell commands across all modes, atomic saves, file locking, auto-backups, full JSON output, SHACL validation support |
 | 3.0.0 | Chart creation (bar, line, pie, scatter), statistical tests (t-test, chi-square, correlation), research analysis pack |

@@ -1,12 +1,12 @@
 ---
 name: onlyoffice
-version: 4.0.1
+version: 4.0.2
 author: SLOANE OS
 description: 90-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), and RDF Knowledge Graphs
 tags: [productivity, documents, office, onlyoffice, charts, spreadsheets, rdf, apa]
 ---
 
-# CLI-Anything OnlyOffice v4.0.1
+# CLI-Anything OnlyOffice v4.0.2
 
 Programmatic control over Office documents designed for AI agents. Full JSON output. Production-safe with atomic writes, two-layer file locking, and automatic backups.
 
@@ -211,4 +211,4 @@ Types: bar, column, bar_horizontal, line, pie, scatter
 ---
 
 **Last Updated:** 2026-04-07
-**Version:** 4.0.1
+**Version:** 4.0.2
