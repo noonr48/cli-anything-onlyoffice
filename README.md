@@ -1,8 +1,8 @@
-# CLI-Anything OnlyOffice v4.0.2
+# CLI-Anything OnlyOffice v4.1.0
 
-> Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), and RDF Knowledge Graphs — designed for AI agents.
+> Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs — designed for AI agents.
 
-**90 commands. 4 modes. Full JSON output. Production-safe.**
+**103 commands. 7 categories. Full JSON output. Production-safe.**
 
 Part of the [SLOANE OS](https://github.com/sloane-os) agent stack. Agents call this via `cli_anything_run(tool='onlyoffice', ...)`.
 
@@ -46,6 +46,8 @@ When calling from SLOANE OS or another agent, invoke via the venv binary directl
 | `rdflib>=7.0.0` | RDF graph / SPARQL | Core |
 | `lxml>=4.9.0` | XML parsing for OOXML | Core |
 | `scipy>=1.11.0` | Statistical tests | Core |
+| `PyMuPDF>=1.24.0` | PDF image extraction + page rendering | Core |
+| `Pillow>=10.0.0` | Image format conversion | Core |
 | `pyshacl>=0.25.0` | SHACL validation | Optional (`[shacl]`) |
 
 ---
@@ -59,10 +61,11 @@ cli-anything-onlyoffice <command> [args] [--json]
   core/cli.py          ← Arg parsing + dispatch router
         │
         ▼
-utils/docserver.py     ← Backend engine (4,859 lines)
-  ├── Documents        ← python-docx wrapper
-  ├── Spreadsheets     ← openpyxl wrapper + scipy stats
-  ├── Presentations    ← python-pptx wrapper
+utils/docserver.py     ← Backend engine (~5,900 lines)
+  ├── Documents        ← python-docx wrapper + image extraction
+  ├── Spreadsheets     ← openpyxl wrapper + scipy stats + data validation
+  ├── Presentations    ← python-pptx wrapper + spatial awareness + preview
+  ├── PDF              ← PyMuPDF wrapper (image extraction + page rendering)
   └── RDF              ← rdflib 7 wrapper
 ```
 
@@ -88,7 +91,7 @@ All responses have `{"success": true, ...}` or `{"success": false, "error": "...
 
 ## Mode 1 — Documents (.docx)
 
-**25 commands** — full lifecycle from creation to APA references.
+**26 commands** — full lifecycle from creation to APA references, plus image extraction.
 
 ### Document Defaults
 
@@ -276,6 +279,22 @@ Embed an image with optional caption.
 cli-anything-onlyoffice doc-add-image /tmp/essay.docx /tmp/figure1.png --width 5.0 --caption "Figure 1: Overview" --json
 ```
 
+#### `doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]`
+Extract all embedded images from a .docx file and save as separate files.
+
+```bash
+cli-anything-onlyoffice doc-extract-images /tmp/essay.docx /tmp/extracted_images --format png --json
+```
+```json
+{
+  "success": true,
+  "images_extracted": 3,
+  "images": [
+    {"index": 0, "file": "/tmp/extracted_images/image_000.png", "width": 800, "height": 600, "size_bytes": 45320}
+  ]
+}
+```
+
 #### `doc-add-hyperlink <file> <text> <url> [--paragraph <index>]`
 Insert a hyperlink. Use `--paragraph -1` (default) to add to a new paragraph.
 
@@ -353,7 +372,7 @@ cli-anything-onlyoffice doc-build-references /tmp/essay.docx --json
 
 ## Mode 2 — Spreadsheets (.xlsx)
 
-**32 commands** — cell-level access, sheets, stats, CSV I/O, charts.
+**37 commands** — cell-level access, sheets, stats, CSV I/O, charts, and data validation.
 
 ### Spreadsheet Defaults
 
@@ -598,6 +617,81 @@ cli-anything-onlyoffice xlsx-csv-export /tmp/grades.xlsx /tmp/grades.csv --sheet
 
 ---
 
+### Data Validation
+
+Excel-style cell validation with post-hoc data auditing.
+
+#### `xlsx-add-validation <file> <range> <type> [options]`
+Add a data validation rule. Types: `list`, `whole`, `decimal`, `date`, `time`, `textLength`, `custom`.
+
+Options: `--operator <op>`, `--formula1 <v>`, `--formula2 <v>`, `--sheet <name>`, `--error <msg>`, `--prompt <msg>`, `--error-style stop|warning|information`, `--no-blank`
+
+Operators: `between`, `notBetween`, `equal`, `notEqual`, `lessThan`, `lessThanOrEqual`, `greaterThan`, `greaterThanOrEqual`
+
+```bash
+# Number range: rating must be 1-10
+cli-anything-onlyoffice xlsx-add-validation /tmp/survey.xlsx C2:C100 whole \
+  --operator between --formula1 1 --formula2 10 \
+  --error "Rating must be 1-10" --json
+
+# Text length: max 200 characters
+cli-anything-onlyoffice xlsx-add-validation /tmp/survey.xlsx D2:D100 textLength \
+  --operator lessThanOrEqual --formula1 200 --json
+```
+
+#### `xlsx-add-dropdown <file> <range> <options_csv> [--sheet <name>] [--prompt <msg>] [--error <msg>]`
+Shortcut: add a dropdown list. Most common validation type.
+
+```bash
+cli-anything-onlyoffice xlsx-add-dropdown /tmp/survey.xlsx B2:B100 \
+  "Yes,No,Maybe" --prompt "Select your answer" --json
+```
+
+#### `xlsx-list-validations <file> [--sheet <name>]`
+List all validation rules on a sheet.
+
+```bash
+cli-anything-onlyoffice xlsx-list-validations /tmp/survey.xlsx --json
+```
+```json
+{
+  "success": true,
+  "validation_count": 2,
+  "validations": [
+    {"range": "B2:B100", "type": "list", "allowed_values": ["Yes", "No", "Maybe"]},
+    {"range": "C2:C100", "type": "whole", "operator": "between", "formula1": "1", "formula2": "10"}
+  ]
+}
+```
+
+#### `xlsx-remove-validation <file> [--range <range>] [--all] [--sheet <name>]`
+Remove validation rules by range or clear all.
+
+```bash
+cli-anything-onlyoffice xlsx-remove-validation /tmp/survey.xlsx --range B2:B100 --json
+cli-anything-onlyoffice xlsx-remove-validation /tmp/survey.xlsx --all --json
+```
+
+#### `xlsx-validate-data <file> [--sheet <name>] [--max-rows <n>]`
+Audit existing data against validation rules. Returns every failing cell with a reason.
+
+```bash
+cli-anything-onlyoffice xlsx-validate-data /tmp/survey.xlsx --sheet Data --json
+```
+```json
+{
+  "success": true,
+  "cells_checked": 12, "cells_passed": 9, "cells_failed": 3,
+  "failures": [
+    {"cell": "B4", "value": "INVALID", "reason": "'INVALID' not in allowed list: ['Yes', 'No', 'Maybe']"},
+    {"cell": "C3", "value": "11", "reason": "value 11 not between 1.0 and 10.0"},
+    {"cell": "C5", "value": "abc", "reason": "'abc' is not a valid whole number"}
+  ]
+}
+```
+
+---
+
 ### Statistical Analysis
 
 All statistical commands return APA-formatted results with effect sizes and confidence intervals where applicable.
@@ -748,7 +842,7 @@ cli-anything-onlyoffice chart-progress /tmp/grades.xlsx A B "Student Grades" \
 
 ## Mode 4 — Presentations (.pptx)
 
-**10 commands** — full slide lifecycle.
+**16 commands** — full slide lifecycle, spatial awareness, textbox control, image extraction, and visual preview.
 
 #### `pptx-create <file> <title> [subtitle]`
 Create a new presentation with a title slide. Slide size is **16:9 widescreen (13.333" × 7.5")** — the modern standard for PowerPoint and OnlyOffice.
@@ -842,7 +936,158 @@ cli-anything-onlyoffice pptx-update-text /tmp/lecture.pptx 1 \
 
 ---
 
-## Mode 5 — RDF Knowledge Graphs
+### Image Extraction
+
+#### `pptx-extract-images <file> <output_dir> [--slide <index>] [--format png|jpg]`
+Extract all images from slides. Optionally target a single slide.
+
+```bash
+cli-anything-onlyoffice pptx-extract-images /tmp/lecture.pptx /tmp/slide_images --json
+cli-anything-onlyoffice pptx-extract-images /tmp/lecture.pptx /tmp/slide3_imgs --slide 3 --json
+```
+```json
+{
+  "success": true, "images_extracted": 2,
+  "images": [
+    {"index": 0, "slide": 2, "file": "/tmp/slide_images/slide_02_000.png", "width": 800, "height": 600, "shape_name": "Picture 2"}
+  ]
+}
+```
+
+---
+
+### Spatial Awareness & Layout Control
+
+The agent can now see exact positions and sizes of all shapes, enabling precise layout control and overlap detection.
+
+**Slide coordinate system:** Origin (0,0) = top-left. Slide is **13.333" wide x 7.5" tall** (16:9).
+
+#### `pptx-list-shapes <file> [--slide <index>]`
+List all shapes with exact position, size, text, type, and edges. Essential for understanding layout before modifying slides.
+
+```bash
+cli-anything-onlyoffice pptx-list-shapes /tmp/lecture.pptx --slide 1 --json
+```
+```json
+{
+  "success": true,
+  "slide_width_inches": 13.333, "slide_height_inches": 7.5,
+  "slides": [{
+    "slide_index": 1, "shape_count": 3,
+    "shapes": [
+      {
+        "name": "Title 1", "shape_type": "PLACEHOLDER (14)",
+        "left_inches": 0.5, "top_inches": 0.3, "width_inches": 9.0, "height_inches": 1.25,
+        "right_inches": 9.5, "bottom_inches": 1.55,
+        "has_text": true, "text": "Data Slide"
+      },
+      {
+        "name": "TextBox 3", "shape_type": "TEXT_BOX (17)",
+        "left_inches": 10.0, "top_inches": 0.5, "width_inches": 3.0, "height_inches": 0.8,
+        "right_inches": 13.0, "bottom_inches": 1.3,
+        "has_text": true, "text": "Custom Label"
+      }
+    ]
+  }]
+}
+```
+
+#### `pptx-add-textbox <file> <slide_index> <text> [options]`
+Add a textbox at exact coordinates with full formatting control.
+
+Options: `--left <in>`, `--top <in>`, `--width <in>`, `--height <in>`, `--font-size <pt>`, `--font-name <name>`, `--bold`, `--italic`, `--color <RRGGBB>`, `--align <left|center|right>`
+
+```bash
+cli-anything-onlyoffice pptx-add-textbox /tmp/lecture.pptx 1 "Important Note" \
+  --left 10.0 --top 6.0 --width 3.0 --height 0.8 \
+  --font-size 14 --bold --color FF0000 --align center --json
+```
+
+#### `pptx-modify-shape <file> <slide_index> <shape_name> [options]`
+Move, resize, or edit any shape by name. Use `pptx-list-shapes` first to get shape names.
+
+Options: `--left <in>`, `--top <in>`, `--width <in>`, `--height <in>`, `--text <text>`, `--font-size <pt>`, `--rotation <deg>`
+
+```bash
+# Move and resize a textbox
+cli-anything-onlyoffice pptx-modify-shape /tmp/lecture.pptx 1 "TextBox 3" \
+  --left 10.5 --top 0.3 --width 2.5 --text "Updated Label" --json
+
+# Resize a title placeholder
+cli-anything-onlyoffice pptx-modify-shape /tmp/lecture.pptx 0 "Title 1" \
+  --width 12.0 --font-size 36 --json
+```
+
+---
+
+### Visual Preview
+
+#### `pptx-preview <file> <output_dir> [--slide <index>] [--dpi <n>]`
+Render slides as PNG images via OnlyOffice x2t converter. Requires the `onlyoffice-documentserver` Docker container running.
+
+```bash
+cli-anything-onlyoffice pptx-preview /tmp/lecture.pptx /tmp/previews --slide 1 --dpi 150 --json
+```
+```json
+{
+  "success": true, "total_slides": 5, "slides_rendered": 1,
+  "images": [{"slide": 1, "file": "/tmp/previews/slide_001.png", "width": 2000, "height": 1125}]
+}
+```
+
+**Recommended presentation workflow:**
+1. Create slides with content (`pptx-add-slide`, `pptx-add-bullets`, etc.)
+2. `pptx-list-shapes` — see exact positions of all elements
+3. `pptx-modify-shape` — fix overlaps, reposition elements
+4. `pptx-add-textbox` — add custom positioned text
+5. `pptx-preview` — render as PNG, view the image to verify layout
+6. Iterate if needed
+
+---
+
+## Mode 5 — PDF Image Operations
+
+**2 commands** — extract embedded images or render pages as images using PyMuPDF.
+
+#### `pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]`
+Extract embedded image objects (photos, figures, charts) from a PDF.
+
+```bash
+cli-anything-onlyoffice pdf-extract-images /tmp/paper.pdf /tmp/figures --format png --pages 0-5 --json
+```
+```json
+{
+  "success": true, "total_pages": 12, "pages_scanned": 6, "images_extracted": 4,
+  "images": [
+    {"index": 0, "page": 2, "file": "/tmp/figures/pdf_img_002_000.png", "width": 1200, "height": 800, "original_format": "jpeg"}
+  ]
+}
+```
+
+#### `pdf-page-to-image <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]`
+Render full PDF pages as images. Use when you want the entire page as a figure.
+
+```bash
+# Render all pages at 150 DPI
+cli-anything-onlyoffice pdf-page-to-image /tmp/paper.pdf /tmp/pages --json
+
+# Render specific pages at print quality
+cli-anything-onlyoffice pdf-page-to-image /tmp/paper.pdf /tmp/pages --pages 0,3,5 --dpi 300 --json
+```
+```json
+{
+  "success": true, "total_pages": 12, "pages_rendered": 3,
+  "images": [
+    {"page": 0, "file": "/tmp/pages/page_000.png", "width": 2480, "height": 3508, "dpi": 300}
+  ]
+}
+```
+
+Page ranges: `0-3` (pages 0 through 3), `1,3,5` (specific pages), omit for all. Default DPI: 150.
+
+---
+
+## Mode 6 — RDF Knowledge Graphs
 
 **10 commands** — full CRUD, SPARQL 1.1, multi-format I/O, optional SHACL validation.
 
@@ -1063,7 +1308,7 @@ cli-anything-onlyoffice status --json
 ```json
 {
   "success": true,
-  "version": "4.0.0",
+  "version": "4.1.0",
   "python": "/path/to/.venv/bin/python3",
   "python_docx": true,
   "openpyxl": true,
@@ -1122,13 +1367,14 @@ cli-anything-onlyoffice backup-restore /tmp/grades.xlsx --latest --dry-run --jso
 
 | Category | Count | Commands |
 |----------|-------|----------|
-| Documents (.docx) | 25 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, doc-word-count |
-| Spreadsheets (.xlsx) | 32 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export |
+| Documents (.docx) | 26 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, **doc-extract-images**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, doc-word-count |
+| Spreadsheets (.xlsx) | 37 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export, **xlsx-add-validation**, **xlsx-add-dropdown**, **xlsx-list-validations**, **xlsx-remove-validation**, **xlsx-validate-data** |
 | Charts (.xlsx) | 4 | chart-create, chart-comparison, chart-grade-dist, chart-progress |
-| Presentations (.pptx) | 10 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text |
+| Presentations (.pptx) | 16 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text, **pptx-extract-images**, **pptx-list-shapes**, **pptx-add-textbox**, **pptx-modify-shape**, **pptx-preview** |
+| PDF (.pdf) | 2 | **pdf-extract-images**, **pdf-page-to-image** |
 | RDF Knowledge Graphs | 10 | rdf-create, rdf-read, rdf-add, rdf-remove, rdf-query, rdf-export, rdf-merge, rdf-stats, rdf-namespace, rdf-validate |
 | General | 9 | list, open, watch, info, backup-list, backup-prune, backup-restore, status, help |
-| **Total** | **90** | |
+| **Total** | **103** | |
 
 ---
 
@@ -1182,6 +1428,41 @@ cli-anything-onlyoffice pptx-add-table /tmp/lecture.pptx "Cell Comparison" \
   "Type,Nucleus,Size" "Prokaryotic,No,1-5µm;Eukaryotic,Yes,10-100µm" --json
 cli-anything-onlyoffice pptx-speaker-notes /tmp/lecture.pptx 0 "Introduce yourself first" --json
 cli-anything-onlyoffice pptx-slide-count /tmp/lecture.pptx --json
+```
+
+### Presentation with Spatial Awareness
+
+```bash
+# 1. Create presentation
+cli-anything-onlyoffice pptx-create /tmp/report.pptx "Q1 Report" "Sales Overview" --json
+cli-anything-onlyoffice pptx-add-bullets /tmp/report.pptx "Key Metrics" \
+  "Revenue up 15%\nNew customers: 340\nChurn rate: 2.1%" --json
+
+# 2. Inspect the layout
+cli-anything-onlyoffice pptx-list-shapes /tmp/report.pptx --slide 1 --json
+
+# 3. Add a custom callout box in the empty space on the right
+cli-anything-onlyoffice pptx-add-textbox /tmp/report.pptx 1 "Record Quarter!" \
+  --left 10.0 --top 2.0 --width 3.0 --height 1.0 \
+  --font-size 20 --bold --color 00AA00 --align center --json
+
+# 4. Preview the slide to verify layout
+cli-anything-onlyoffice pptx-preview /tmp/report.pptx /tmp/previews --slide 1 --json
+# → Agent views /tmp/previews/slide_001.png to check for overlaps
+```
+
+### PDF Image Extraction
+
+```bash
+# Extract all figures from a research paper
+cli-anything-onlyoffice pdf-extract-images /tmp/paper.pdf /tmp/figures --pages 0-10 --json
+
+# Render page 5 as a high-quality image
+cli-anything-onlyoffice pdf-page-to-image /tmp/paper.pdf /tmp/pages --pages 5 --dpi 300 --json
+
+# Insert extracted figure into a document
+cli-anything-onlyoffice doc-add-image /tmp/essay.docx /tmp/figures/pdf_img_005_000.png \
+  --width 5.0 --caption "Figure 1: Study framework (adapted from Smith, 2024)" --json
 ```
 
 ### RDF Knowledge Graph Pipeline
@@ -1253,6 +1534,9 @@ result = cli_anything_run(tool="onlyoffice", args=[
 6. **Atomic writes** — no partial file corruption, safe to run concurrently from multiple threads or processes.
 7. **RDF for knowledge** — use the RDF mode to build structured knowledge graphs that can be queried with SPARQL, exported to any format, and validated against SHACL shapes.
 8. **Always invoke via the venv binary** — never `cd .venv && python3`. Use the full path: `.venv/bin/cli-anything-onlyoffice` or `.venv/bin/python3 -m cli_anything.onlyoffice.core.cli`. Running system `python3` will fail with `ModuleNotFoundError`.
+9. **Use `pptx-list-shapes` before modifying slides** — know exact positions to avoid overlaps and text clipping.
+10. **Use `pptx-preview` after building slides** — visually verify the layout before delivering.
+11. **Use `xlsx-validate-data` after writing data** — audit all cells against validation rules, fix failures, re-audit until clean.
 
 ---
 
@@ -1260,16 +1544,16 @@ result = cli_anything_run(tool="onlyoffice", args=[
 
 ```
 agent-harness/
-├── setup.py                          # Package config (v4.0.2)
+├── setup.py                          # Package config (v4.1.0)
 ├── README.md                         # This file
 ├── cli_anything/
 │   └── onlyoffice/
 │       ├── core/
 │       │   ├── __init__.py
-│       │   └── cli.py                # CLI router + dispatcher (~2,815 lines)
+│       │   └── cli.py                # CLI router + dispatcher (~3,200 lines)
 │       ├── utils/
 │       │   ├── __init__.py
-│       │   └── docserver.py          # Backend engine (~5,034 lines)
+│       │   └── docserver.py          # Backend engine (~5,900 lines)
 │       ├── skills/
 │       │   ├── __init__.py
 │       │   └── SKILL.md              # SLOANE skill manifest
@@ -1288,6 +1572,7 @@ agent-harness/
 
 | Version | Changes |
 |---------|---------|
+| **4.1.0** | **15 new commands.** Image extraction from PDFs (PyMuPDF), .docx, and .pptx files. PDF page-to-image rendering at configurable DPI. Spatial awareness for presentations — list all shapes with exact positions/sizes, add textboxes at precise coordinates, modify any shape by name. Slide preview rendering via OnlyOffice x2t. Excel-style data validation — dropdowns, number/decimal ranges, text length, date constraints, custom formulas — plus post-hoc data auditing that checks every cell against its rules. New deps: PyMuPDF, Pillow. |
 | **4.0.2** | Comprehensive bug-fix audit across all four modes: RDF full rewrite — 13 bugs fixed (ASK/CONSTRUCT/DESCRIBE query support, `rdf-remove` literal/bnode type flag, file-not-found guard, double-iteration fix, locking + atomic saves on all write methods, lang+datatype mutual exclusion, self-merge guard, `rdf-validate` structured violations output); xlsx — `xlsx-filter` now validates operator before executing, `xlsx-read` returns error on unknown sheet name instead of silently reading all sheets; docx — `doc-layout` landscape correctly swaps page dimensions, `doc-search` NameError fixed on table-only documents; pptx — `pptx-add-bullets` leading-empty-line enumerate-index bug fixed (orphan empty first paragraph) |
 | **4.0.1** | Bug fixes: two-layer file locking (threading.Lock + fcntl.flock) fixes concurrent write loss under thread load; docx defaults corrected to A4/1" margins/Calibri 11pt/double spacing; xlsx auto-fits column widths and sets A4 paper size; pptx defaults to 16:9 (13.333"×7.5"); status exposes active Python interpreter path |
 | **4.0.0** | Added RDF mode (10 commands), 42 new CRUD/sheet/cell commands across all modes, atomic saves, file locking, auto-backups, full JSON output, SHACL validation support |
