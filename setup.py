@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="cli-anything-onlyoffice",
-    version="4.0.2",
+    version="4.1.0",
     description="CLI for OnlyOffice Desktop Editors + RDF Knowledge Graphs",
     author="SLOANE OS",
     author_email="sloane@local",
@@ -21,6 +21,8 @@ setup(
         "scipy>=1.11.0",
         "rdflib>=7.0.0",
         "lxml>=4.9.0",
+        "PyMuPDF>=1.24.0",
+        "Pillow>=10.0.0",
     ],
     extras_require={
         "shacl": ["pyshacl>=0.25.0"],

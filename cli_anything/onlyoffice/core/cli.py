@@ -909,7 +909,7 @@ def cmd_status(json_output=False):
     import sys
     result = {
         "success": True,
-        "version": "4.0.1",
+        "version": "4.1.0",
         "python": sys.executable,
         "document_server": {
             "healthy": doc_server.check_health() if doc_server else False
@@ -942,7 +942,7 @@ def cmd_status(json_output=False):
             "rdf_query": rdflib_available,
             "rdf_validate": shacl_available,
         },
-        "total_commands": 72,
+        "total_commands": 103,
     }
     print_result(result, json_output)
 
@@ -958,7 +958,7 @@ def cmd_help(json_output=False):
 
     result = {
         "success": True,
-        "version": "4.0.1",
+        "version": "4.1.0",
         "categories": {
             "DOCUMENTS (.docx)": {
                 "doc-create <file> <title> <content>": "Create new .docx document",
@@ -986,6 +986,7 @@ def cmd_help(json_output=False):
                 "doc-set-metadata <file> [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>]": "Set document properties",
                 "doc-get-metadata <file>": "Read document properties",
                 "doc-word-count <file>": "Word/character/paragraph counts",
+                "doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]": "Extract all embedded images from .docx",
             },
             "SPREADSHEETS (.xlsx)": {
                 "xlsx-create <file> [sheet]": "Create new .xlsx spreadsheet",
@@ -1020,6 +1021,11 @@ def cmd_help(json_output=False):
                 "xlsx-format-cells <file> <range> [--sheet <name>] [--bold] [--italic] [--font-name <n>] [--font-size <n>] [--color <hex>] [--bg-color <hex>] [--number-format <fmt>] [--wrap]": "Format cell range",
                 "xlsx-csv-import <xlsx_file> <csv_file> [--sheet <name>] [--delimiter <char>]": "Import CSV into xlsx",
                 "xlsx-csv-export <xlsx_file> <csv_file> [--sheet <name>] [--delimiter <char>]": "Export sheet to CSV",
+                "xlsx-add-validation <file> <range> <type> [--operator <op>] [--formula1 <v>] [--formula2 <v>] [--error <msg>]": "Add data validation (list|whole|decimal|textLength|date|custom)",
+                "xlsx-add-dropdown <file> <range> <options_csv> [--prompt <msg>]": "Add dropdown list validation (shortcut)",
+                "xlsx-list-validations <file> [--sheet <name>]": "List all validation rules on a sheet",
+                "xlsx-remove-validation <file> [--range <range>] [--all]": "Remove validation rules",
+                "xlsx-validate-data <file> [--sheet <name>] [--max-rows <n>]": "Audit data against validation rules (pass/fail per cell)",
             },
             "CHARTS (.xlsx)": {
                 "chart-create <file> <type> <data_range> <cat_range> <title> [options]": "Create chart (bar|line|pie|scatter|bar_horizontal)",
@@ -1038,6 +1044,15 @@ def cmd_help(json_output=False):
                 "pptx-speaker-notes <file> <index> [text]": "Read or set speaker notes (omit text to read)",
                 "pptx-update-text <file> <index> [--title <t>] [--body <b>]": "Update existing slide text",
                 "pptx-slide-count <file>": "Get slide count and titles",
+                "pptx-extract-images <file> <output_dir> [--slide <index>] [--format png|jpg]": "Extract all images from slides",
+                "pptx-list-shapes <file> [--slide <index>]": "List all shapes with position/size/text (spatial map)",
+                "pptx-add-textbox <file> <slide_index> <text> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--font-size <pt>] [--bold] [--italic] [--color <hex>] [--align <dir>]": "Add textbox at exact position",
+                "pptx-modify-shape <file> <slide_index> <shape_name> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--text <text>] [--font-size <pt>] [--rotation <deg>]": "Move/resize/edit any shape by name",
+                "pptx-preview <file> <output_dir> [--slide <index>] [--dpi <n>]": "Render slides as PNG images (requires OnlyOffice Docker)",
+            },
+            "PDF (.pdf) — Image Extraction": {
+                "pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]": "Extract embedded images from PDF (PyMuPDF)",
+                "pdf-page-to-image <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]": "Render full PDF pages as images",
             },
             "RDF (Knowledge Graphs)": {
                 "rdf-create <file> [--base <uri>] [--format turtle|xml|n3|json-ld] [--prefix <p>=<uri>]": "Create empty RDF graph with prefixes",
@@ -1069,7 +1084,7 @@ def cmd_help(json_output=False):
             "python_pptx": PPTX_AVAILABLE,
             "rdflib": rdflib_available,
         },
-        "total_commands": 72,
+        "total_commands": 103,
         "examples": [
             "# Documents",
             "cli-anything-onlyoffice doc-create /tmp/essay.docx 'My Essay' 'Introduction paragraph here'",
@@ -2176,6 +2191,148 @@ def main():
             result = doc_server.csv_export(args.args[0], args.args[1], sheet_name=sheet, delimiter=delimiter)
             print_result(result, json_output)
 
+    # ==================== SPREADSHEET DATA VALIDATION ====================
+
+    elif args.command == "xlsx-add-validation":
+        if len(args.args) < 3:
+            print_result(
+                {"success": False, "error": "Usage: xlsx-add-validation <file> <range> <type> [--operator <op>] [--formula1 <v>] [--formula2 <v>] [--sheet <name>] [--error <msg>] [--prompt <msg>] [--error-style stop|warning|information] [--allow-blank]"},
+                json_output,
+            )
+        else:
+            file_path = args.args[0]
+            cell_range = args.args[1]
+            vtype = args.args[2]
+            operator = None
+            formula1 = None
+            formula2 = None
+            sheet = None
+            error_msg = None
+            error_title = None
+            prompt_msg = None
+            prompt_title = None
+            error_style = "stop"
+            allow_blank = True
+            i = 3
+            while i < len(args.args):
+                if args.args[i] == "--operator" and i + 1 < len(args.args):
+                    operator = args.args[i + 1]; i += 2
+                elif args.args[i] == "--formula1" and i + 1 < len(args.args):
+                    formula1 = args.args[i + 1]; i += 2
+                elif args.args[i] == "--formula2" and i + 1 < len(args.args):
+                    formula2 = args.args[i + 1]; i += 2
+                elif args.args[i] == "--sheet" and i + 1 < len(args.args):
+                    sheet = args.args[i + 1]; i += 2
+                elif args.args[i] == "--error" and i + 1 < len(args.args):
+                    error_msg = args.args[i + 1]; i += 2
+                elif args.args[i] == "--error-title" and i + 1 < len(args.args):
+                    error_title = args.args[i + 1]; i += 2
+                elif args.args[i] == "--prompt" and i + 1 < len(args.args):
+                    prompt_msg = args.args[i + 1]; i += 2
+                elif args.args[i] == "--prompt-title" and i + 1 < len(args.args):
+                    prompt_title = args.args[i + 1]; i += 2
+                elif args.args[i] == "--error-style" and i + 1 < len(args.args):
+                    error_style = args.args[i + 1]; i += 2
+                elif args.args[i] == "--no-blank":
+                    allow_blank = False; i += 1
+                else:
+                    i += 1
+            result = doc_server.add_validation(
+                file_path, cell_range, vtype,
+                operator=operator, formula1=formula1, formula2=formula2,
+                allow_blank=allow_blank, sheet_name=sheet,
+                error_message=error_msg, error_title=error_title,
+                prompt_message=prompt_msg, prompt_title=prompt_title,
+                error_style=error_style,
+            )
+            print_result(result, json_output)
+
+    elif args.command == "xlsx-add-dropdown":
+        if len(args.args) < 3:
+            print_result(
+                {"success": False, "error": "Usage: xlsx-add-dropdown <file> <range> <options_csv> [--sheet <name>] [--prompt <msg>] [--error <msg>]"},
+                json_output,
+            )
+        else:
+            sheet = None
+            prompt = None
+            error_msg = None
+            i = 3
+            while i < len(args.args):
+                if args.args[i] == "--sheet" and i + 1 < len(args.args):
+                    sheet = args.args[i + 1]; i += 2
+                elif args.args[i] == "--prompt" and i + 1 < len(args.args):
+                    prompt = args.args[i + 1]; i += 2
+                elif args.args[i] == "--error" and i + 1 < len(args.args):
+                    error_msg = args.args[i + 1]; i += 2
+                else:
+                    i += 1
+            result = doc_server.add_dropdown(
+                args.args[0], args.args[1], args.args[2],
+                sheet_name=sheet, prompt=prompt, error_message=error_msg,
+            )
+            print_result(result, json_output)
+
+    elif args.command == "xlsx-list-validations":
+        if not args.args:
+            print_result(
+                {"success": False, "error": "Usage: xlsx-list-validations <file> [--sheet <name>]"},
+                json_output,
+            )
+        else:
+            sheet = None
+            i = 1
+            while i < len(args.args):
+                if args.args[i] == "--sheet" and i + 1 < len(args.args):
+                    sheet = args.args[i + 1]; i += 2
+                else:
+                    i += 1
+            result = doc_server.list_validations(args.args[0], sheet_name=sheet)
+            print_result(result, json_output)
+
+    elif args.command == "xlsx-remove-validation":
+        if not args.args:
+            print_result(
+                {"success": False, "error": "Usage: xlsx-remove-validation <file> [--range <range>] [--all] [--sheet <name>]"},
+                json_output,
+            )
+        else:
+            cell_range = None
+            remove_all = False
+            sheet = None
+            i = 1
+            while i < len(args.args):
+                if args.args[i] == "--range" and i + 1 < len(args.args):
+                    cell_range = args.args[i + 1]; i += 2
+                elif args.args[i] == "--all":
+                    remove_all = True; i += 1
+                elif args.args[i] == "--sheet" and i + 1 < len(args.args):
+                    sheet = args.args[i + 1]; i += 2
+                else:
+                    i += 1
+            result = doc_server.remove_validation(args.args[0], cell_range=cell_range, sheet_name=sheet, remove_all=remove_all)
+            print_result(result, json_output)
+
+    elif args.command == "xlsx-validate-data":
+        if not args.args:
+            print_result(
+                {"success": False, "error": "Usage: xlsx-validate-data <file> [--sheet <name>] [--max-rows <n>]"},
+                json_output,
+            )
+        else:
+            sheet = None
+            max_rows = 1000
+            i = 1
+            while i < len(args.args):
+                if args.args[i] == "--sheet" and i + 1 < len(args.args):
+                    sheet = args.args[i + 1]; i += 2
+                elif args.args[i] == "--max-rows" and i + 1 < len(args.args):
+                    max_rows = int(args.args[i + 1]); i += 2
+                else:
+                    i += 1
+            result = doc_server.validate_data(args.args[0], sheet_name=sheet, max_rows=max_rows)
+            print_result(result, json_output)
+
     # Chart commands
     elif args.command == "chart-create":
         if len(args.args) < 5:
@@ -2798,6 +2955,259 @@ def main():
                 dry_run=dry_run,
                 json_output=json_output,
             )
+
+    # ==================== IMAGE EXTRACTION ====================
+
+    elif args.command == "doc-extract-images":
+        if len(args.args) < 2:
+            print_result(
+                {"success": False, "error": "Usage: doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]"},
+                json_output,
+            )
+        else:
+            fmt = "png"
+            prefix = "image"
+            i = 2
+            while i < len(args.args):
+                if args.args[i] == "--format" and i + 1 < len(args.args):
+                    fmt = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--prefix" and i + 1 < len(args.args):
+                    prefix = args.args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.extract_images_from_docx(args.args[0], args.args[1], fmt=fmt, prefix=prefix)
+            print_result(result, json_output)
+
+    elif args.command == "pptx-extract-images":
+        if len(args.args) < 2:
+            print_result(
+                {"success": False, "error": "Usage: pptx-extract-images <file> <output_dir> [--slide <index>] [--format png|jpg]"},
+                json_output,
+            )
+        else:
+            fmt = "png"
+            slide_idx = None
+            prefix = "slide"
+            i = 2
+            while i < len(args.args):
+                if args.args[i] == "--format" and i + 1 < len(args.args):
+                    fmt = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--slide" and i + 1 < len(args.args):
+                    slide_idx = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--prefix" and i + 1 < len(args.args):
+                    prefix = args.args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.extract_images_from_pptx(args.args[0], args.args[1], slide_index=slide_idx, fmt=fmt, prefix=prefix)
+            print_result(result, json_output)
+
+    elif args.command == "pdf-extract-images":
+        if len(args.args) < 2:
+            print_result(
+                {"success": False, "error": "Usage: pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]"},
+                json_output,
+            )
+        else:
+            fmt = "png"
+            pages = None
+            i = 2
+            while i < len(args.args):
+                if args.args[i] == "--format" and i + 1 < len(args.args):
+                    fmt = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--pages" and i + 1 < len(args.args):
+                    pages = args.args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.pdf_extract_images(args.args[0], args.args[1], fmt=fmt, pages=pages)
+            print_result(result, json_output)
+
+    elif args.command == "pdf-page-to-image":
+        if len(args.args) < 2:
+            print_result(
+                {"success": False, "error": "Usage: pdf-page-to-image <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]"},
+                json_output,
+            )
+        else:
+            fmt = "png"
+            pages = None
+            dpi = 150
+            i = 2
+            while i < len(args.args):
+                if args.args[i] == "--format" and i + 1 < len(args.args):
+                    fmt = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--pages" and i + 1 < len(args.args):
+                    pages = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--dpi" and i + 1 < len(args.args):
+                    dpi = int(args.args[i + 1])
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.pdf_page_to_image(args.args[0], args.args[1], pages=pages, dpi=dpi, fmt=fmt)
+            print_result(result, json_output)
+
+    # ==================== PPTX SPATIAL / TEXTBOX ====================
+
+    elif args.command == "pptx-list-shapes":
+        if not args.args:
+            print_result(
+                {"success": False, "error": "Usage: pptx-list-shapes <file> [--slide <index>]"},
+                json_output,
+            )
+        else:
+            slide_idx = None
+            i = 1
+            while i < len(args.args):
+                if args.args[i] == "--slide" and i + 1 < len(args.args):
+                    slide_idx = int(args.args[i + 1])
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.list_shapes(args.args[0], slide_index=slide_idx)
+            print_result(result, json_output)
+
+    elif args.command == "pptx-add-textbox":
+        if len(args.args) < 3:
+            print_result(
+                {"success": False, "error": "Usage: pptx-add-textbox <file> <slide_index> <text> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--font-size <pt>] [--font-name <name>] [--bold] [--italic] [--color <hex>] [--align <left|center|right>]"},
+                json_output,
+            )
+        else:
+            file_path = args.args[0]
+            slide_idx = int(args.args[1])
+            text = args.args[2]
+            left = 1.0
+            top = 1.0
+            width = 5.0
+            height = 1.5
+            font_size = None
+            font_name = None
+            bold = False
+            italic = False
+            color = None
+            align = None
+            i = 3
+            while i < len(args.args):
+                if args.args[i] == "--left" and i + 1 < len(args.args):
+                    left = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--top" and i + 1 < len(args.args):
+                    top = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--width" and i + 1 < len(args.args):
+                    width = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--height" and i + 1 < len(args.args):
+                    height = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--font-size" and i + 1 < len(args.args):
+                    font_size = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--font-name" and i + 1 < len(args.args):
+                    font_name = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--bold":
+                    bold = True
+                    i += 1
+                elif args.args[i] == "--italic":
+                    italic = True
+                    i += 1
+                elif args.args[i] == "--color" and i + 1 < len(args.args):
+                    color = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--align" and i + 1 < len(args.args):
+                    align = args.args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.add_textbox(
+                file_path, slide_idx, text,
+                left=left, top=top, width=width, height=height,
+                font_size=font_size, font_name=font_name,
+                bold=bold, italic=italic, color=color, align=align,
+            )
+            print_result(result, json_output)
+
+    elif args.command == "pptx-modify-shape":
+        if len(args.args) < 3:
+            print_result(
+                {"success": False, "error": "Usage: pptx-modify-shape <file> <slide_index> <shape_name> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--text <text>] [--font-size <pt>] [--rotation <deg>]"},
+                json_output,
+            )
+        else:
+            file_path = args.args[0]
+            slide_idx = int(args.args[1])
+            shape_name = args.args[2]
+            left = None
+            top = None
+            width = None
+            height = None
+            text = None
+            font_size = None
+            rotation = None
+            i = 3
+            while i < len(args.args):
+                if args.args[i] == "--left" and i + 1 < len(args.args):
+                    left = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--top" and i + 1 < len(args.args):
+                    top = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--width" and i + 1 < len(args.args):
+                    width = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--height" and i + 1 < len(args.args):
+                    height = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--text" and i + 1 < len(args.args):
+                    text = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--font-size" and i + 1 < len(args.args):
+                    font_size = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--rotation" and i + 1 < len(args.args):
+                    rotation = float(args.args[i + 1])
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.modify_shape(
+                file_path, slide_idx, shape_name,
+                left=left, top=top, width=width, height=height,
+                text=text, font_size=font_size, rotation=rotation,
+            )
+            print_result(result, json_output)
+
+    elif args.command == "pptx-preview":
+        if len(args.args) < 2:
+            print_result(
+                {"success": False, "error": "Usage: pptx-preview <file> <output_dir> [--slide <index>] [--dpi <n>]"},
+                json_output,
+            )
+        else:
+            slide_idx = None
+            dpi = 150
+            i = 2
+            while i < len(args.args):
+                if args.args[i] == "--slide" and i + 1 < len(args.args):
+                    slide_idx = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--dpi" and i + 1 < len(args.args):
+                    dpi = int(args.args[i + 1])
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.preview_slide(args.args[0], args.args[1], slide_index=slide_idx, dpi=dpi)
+            print_result(result, json_output)
+
+    # ==================== GENERAL ====================
 
     elif args.command == "status":
         cmd_status(json_output)

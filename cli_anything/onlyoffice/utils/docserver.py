@@ -4450,6 +4450,306 @@ class DocumentServerClient:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    # ==================== SPREADSHEET DATA VALIDATION ====================
+
+    def add_validation(
+        self, file_path: str, cell_range: str,
+        validation_type: str, operator: str = None,
+        formula1: str = None, formula2: str = None,
+        allow_blank: bool = True, sheet_name: str = None,
+        error_message: str = None, error_title: str = None,
+        prompt_message: str = None, prompt_title: str = None,
+        error_style: str = "stop",
+    ) -> Dict[str, Any]:
+        """Add a data validation rule to a cell range.
+        Types: list, whole, decimal, date, time, textLength, custom.
+        Operators: between, notBetween, equal, notEqual, lessThan,
+                   lessThanOrEqual, greaterThan, greaterThanOrEqual.
+        For list type: formula1 is comma-separated values (e.g. 'Yes,No,Maybe').
+        error_style: stop (reject), warning (warn+allow), information (info+allow)."""
+        if not OPENPYXL_AVAILABLE:
+            return {"success": False, "error": "openpyxl not installed"}
+        valid_types = {"list", "whole", "decimal", "date", "time", "textLength", "custom"}
+        if validation_type not in valid_types:
+            return {"success": False, "error": f"Unknown type '{validation_type}'. Valid: {sorted(valid_types)}"}
+        valid_ops = {"between", "notBetween", "equal", "notEqual", "lessThan",
+                     "lessThanOrEqual", "greaterThan", "greaterThanOrEqual"}
+        if operator and operator not in valid_ops:
+            return {"success": False, "error": f"Unknown operator '{operator}'. Valid: {sorted(valid_ops)}"}
+        try:
+            from openpyxl.worksheet.datavalidation import DataValidation
+            with self._file_lock(file_path):
+                backup = self._snapshot_backup(file_path)
+                wb = load_workbook(file_path)
+                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
+
+                # Build formula1 for list type
+                f1 = formula1
+                if validation_type == "list" and f1 and not f1.startswith('"') and not f1.startswith("="):
+                    f1 = f'"{f1}"'
+
+                dv = DataValidation(
+                    type=validation_type,
+                    operator=operator,
+                    formula1=f1,
+                    formula2=formula2,
+                    allow_blank=allow_blank,
+                )
+                if error_message:
+                    dv.error = error_message
+                    dv.showErrorMessage = True
+                if error_title:
+                    dv.errorTitle = error_title
+                    dv.showErrorMessage = True
+                if prompt_message:
+                    dv.prompt = prompt_message
+                    dv.showInputMessage = True
+                if prompt_title:
+                    dv.promptTitle = prompt_title
+                    dv.showInputMessage = True
+                if error_style:
+                    dv.errorStyle = error_style
+
+                dv.add(cell_range)
+                ws.add_data_validation(dv)
+                self._safe_save(wb, file_path)
+            return {
+                "success": True, "file": file_path,
+                "sheet": ws.title, "range": cell_range,
+                "type": validation_type, "operator": operator,
+                "formula1": f1, "formula2": formula2,
+                "error_style": error_style,
+                "backup": backup or None,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def add_dropdown(
+        self, file_path: str, cell_range: str, options: str,
+        allow_blank: bool = True, sheet_name: str = None,
+        prompt: str = None, error_message: str = None,
+    ) -> Dict[str, Any]:
+        """Shortcut: add a dropdown list validation. Options are comma-separated."""
+        return self.add_validation(
+            file_path, cell_range, validation_type="list",
+            formula1=options, allow_blank=allow_blank,
+            sheet_name=sheet_name,
+            prompt_message=prompt, prompt_title="Select",
+            error_message=error_message or f"Must be one of: {options}",
+            error_title="Invalid Selection",
+        )
+
+    def list_validations(
+        self, file_path: str, sheet_name: str = None,
+    ) -> Dict[str, Any]:
+        """List all data validation rules on a sheet."""
+        if not OPENPYXL_AVAILABLE:
+            return {"success": False, "error": "openpyxl not installed"}
+        try:
+            wb = load_workbook(file_path)
+            ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
+            rules = []
+            for dv in ws.data_validations.dataValidation:
+                rule = {
+                    "range": str(dv.sqref),
+                    "type": dv.type,
+                    "operator": dv.operator,
+                    "formula1": dv.formula1,
+                    "formula2": dv.formula2,
+                    "allow_blank": dv.allowBlank,
+                    "error_style": dv.errorStyle,
+                    "error_message": dv.error,
+                    "error_title": dv.errorTitle,
+                    "prompt": dv.prompt,
+                    "prompt_title": dv.promptTitle,
+                }
+                # For list type, parse the allowed values
+                if dv.type == "list" and dv.formula1:
+                    raw = dv.formula1.strip('"')
+                    rule["allowed_values"] = [v.strip() for v in raw.split(",")]
+                rules.append(rule)
+            wb.close()
+            return {
+                "success": True, "file": file_path,
+                "sheet": ws.title,
+                "validation_count": len(rules),
+                "validations": rules,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def remove_validation(
+        self, file_path: str, cell_range: str = None,
+        sheet_name: str = None, remove_all: bool = False,
+    ) -> Dict[str, Any]:
+        """Remove data validation from a range or all validations on a sheet."""
+        if not OPENPYXL_AVAILABLE:
+            return {"success": False, "error": "openpyxl not installed"}
+        if not cell_range and not remove_all:
+            return {"success": False, "error": "Provide --range <range> or --all to remove validations"}
+        try:
+            with self._file_lock(file_path):
+                backup = self._snapshot_backup(file_path)
+                wb = load_workbook(file_path)
+                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
+                removed = 0
+                if remove_all:
+                    removed = len(ws.data_validations.dataValidation)
+                    ws.data_validations.dataValidation.clear()
+                else:
+                    target = cell_range.upper()
+                    to_keep = []
+                    for dv in ws.data_validations.dataValidation:
+                        if str(dv.sqref).upper() == target:
+                            removed += 1
+                        else:
+                            to_keep.append(dv)
+                    ws.data_validations.dataValidation.clear()
+                    for dv in to_keep:
+                        ws.add_data_validation(dv)
+                self._safe_save(wb, file_path)
+            return {
+                "success": True, "file": file_path,
+                "sheet": ws.title,
+                "removed": removed,
+                "remaining": len(ws.data_validations.dataValidation),
+                "backup": backup or None,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def validate_data(
+        self, file_path: str, sheet_name: str = None,
+        max_rows: int = 1000,
+    ) -> Dict[str, Any]:
+        """Audit existing cell data against validation rules. Returns pass/fail per cell."""
+        if not OPENPYXL_AVAILABLE:
+            return {"success": False, "error": "openpyxl not installed"}
+        try:
+            wb = load_workbook(file_path)
+            ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
+            results = []
+            total_checked = 0
+            total_pass = 0
+            total_fail = 0
+            for dv in ws.data_validations.dataValidation:
+                for cell_range_str in str(dv.sqref).split():
+                    min_col, min_row, max_col, max_row = openpyxl.utils.range_boundaries(cell_range_str)
+                    max_row = min(max_row, min_row + max_rows - 1)
+                    for row in range(min_row, max_row + 1):
+                        for col in range(min_col, max_col + 1):
+                            cell = ws.cell(row=row, column=col)
+                            if cell.value is None:
+                                if not dv.allowBlank:
+                                    total_checked += 1
+                                    total_fail += 1
+                                    results.append({
+                                        "cell": cell.coordinate,
+                                        "value": None,
+                                        "valid": False,
+                                        "reason": "Blank not allowed",
+                                        "rule_type": dv.type,
+                                    })
+                                continue
+                            total_checked += 1
+                            valid, reason = self._check_validation(cell.value, dv)
+                            if valid:
+                                total_pass += 1
+                            else:
+                                total_fail += 1
+                                results.append({
+                                    "cell": cell.coordinate,
+                                    "value": str(cell.value)[:100],
+                                    "valid": False,
+                                    "reason": reason,
+                                    "rule_type": dv.type,
+                                    "rule_range": str(dv.sqref),
+                                })
+            wb.close()
+            return {
+                "success": True, "file": file_path,
+                "sheet": ws.title,
+                "cells_checked": total_checked,
+                "cells_passed": total_pass,
+                "cells_failed": total_fail,
+                "failures": results,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _check_validation(value, dv) -> tuple:
+        """Check a single value against a DataValidation rule. Returns (valid, reason)."""
+        vtype = dv.type
+        op = dv.operator
+        f1 = dv.formula1
+        f2 = dv.formula2
+
+        try:
+            if vtype == "list":
+                allowed = f1.strip('"').split(",") if f1 else []
+                allowed = [a.strip() for a in allowed]
+                if str(value).strip() not in allowed:
+                    return False, f"'{value}' not in allowed list: {allowed}"
+                return True, ""
+
+            elif vtype in ("whole", "decimal"):
+                try:
+                    v = int(value) if vtype == "whole" else float(value)
+                except (ValueError, TypeError):
+                    return False, f"'{value}' is not a valid {vtype} number"
+                return DocumentServerClient._check_numeric_op(v, op, f1, f2)
+
+            elif vtype == "textLength":
+                length = len(str(value))
+                return DocumentServerClient._check_numeric_op(length, op, f1, f2, label="length")
+
+            elif vtype == "date":
+                # Basic date check — value should be a datetime
+                from datetime import datetime as dt
+                if not isinstance(value, dt):
+                    return False, f"'{value}' is not a date"
+                return True, ""
+
+            elif vtype == "custom":
+                # Custom formulas can't be evaluated client-side
+                return True, "(custom formula — not auditable client-side)"
+
+            else:
+                return True, ""
+        except Exception as e:
+            return False, f"Validation error: {e}"
+
+    @staticmethod
+    def _check_numeric_op(value, operator, f1, f2, label="value"):
+        """Check a numeric value against an operator and formula bounds."""
+        try:
+            n1 = float(f1) if f1 else None
+            n2 = float(f2) if f2 else None
+        except (ValueError, TypeError):
+            return True, ""
+
+        checks = {
+            "between": lambda: n1 is not None and n2 is not None and n1 <= value <= n2,
+            "notBetween": lambda: n1 is not None and n2 is not None and not (n1 <= value <= n2),
+            "equal": lambda: n1 is not None and value == n1,
+            "notEqual": lambda: n1 is not None and value != n1,
+            "lessThan": lambda: n1 is not None and value < n1,
+            "lessThanOrEqual": lambda: n1 is not None and value <= n1,
+            "greaterThan": lambda: n1 is not None and value > n1,
+            "greaterThanOrEqual": lambda: n1 is not None and value >= n1,
+        }
+        if operator not in checks:
+            return True, ""
+        if checks[operator]():
+            return True, ""
+        if operator == "between":
+            return False, f"{label} {value} not between {n1} and {n2}"
+        elif operator == "notBetween":
+            return False, f"{label} {value} is between {n1} and {n2} (should not be)"
+        else:
+            return False, f"{label} {value} fails {operator} {n1}"
+
     # ==================== EXTENDED PRESENTATION OPERATIONS ====================
 
     def delete_slide(self, file_path: str, slide_index: int) -> Dict[str, Any]:
@@ -4575,6 +4875,573 @@ class DocumentServerClient:
                 "slide_count": count,
                 "slide_titles": titles,
             }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ==================== IMAGE EXTRACTION ====================
+
+    def extract_images_from_docx(
+        self, file_path: str, output_dir: str,
+        fmt: str = "png", prefix: str = "image",
+    ) -> Dict[str, Any]:
+        """Extract all embedded images from a .docx file."""
+        if not DOCX_AVAILABLE:
+            return {"success": False, "error": "python-docx not installed"}
+        try:
+            from PIL import Image as PILImage
+            import io
+            os.makedirs(output_dir, exist_ok=True)
+            doc = Document(file_path)
+            extracted = []
+            idx = 0
+            for rel in doc.part.rels.values():
+                if "image" in rel.reltype:
+                    try:
+                        image_part = rel.target_part
+                        image_bytes = image_part.blob
+                        content_type = image_part.content_type
+                        # Determine source extension
+                        ext_map = {
+                            "image/png": "png", "image/jpeg": "jpg",
+                            "image/gif": "gif", "image/bmp": "bmp",
+                            "image/tiff": "tiff", "image/x-emf": "emf",
+                            "image/x-wmf": "wmf",
+                        }
+                        src_ext = ext_map.get(content_type, "png")
+                        out_name = f"{prefix}_{idx:03d}.{fmt}"
+                        out_path = os.path.join(output_dir, out_name)
+                        # Convert format if needed (skip EMF/WMF — save raw)
+                        if src_ext in ("emf", "wmf"):
+                            raw_name = f"{prefix}_{idx:03d}.{src_ext}"
+                            raw_path = os.path.join(output_dir, raw_name)
+                            with open(raw_path, "wb") as f:
+                                f.write(image_bytes)
+                            extracted.append({
+                                "index": idx, "file": raw_path,
+                                "format": src_ext, "size_bytes": len(image_bytes),
+                                "note": f"Vector format saved as .{src_ext} (cannot convert to {fmt})",
+                            })
+                        else:
+                            img = PILImage.open(io.BytesIO(image_bytes))
+                            if fmt.lower() == "jpg":
+                                img = img.convert("RGB")
+                                img.save(out_path, "JPEG", quality=90)
+                            else:
+                                img.save(out_path, fmt.upper())
+                            extracted.append({
+                                "index": idx, "file": out_path,
+                                "format": fmt, "width": img.width,
+                                "height": img.height,
+                                "size_bytes": os.path.getsize(out_path),
+                            })
+                        idx += 1
+                    except Exception as img_err:
+                        extracted.append({
+                            "index": idx, "error": str(img_err),
+                        })
+                        idx += 1
+            return {
+                "success": True, "file": file_path,
+                "output_dir": output_dir,
+                "images_extracted": len(extracted),
+                "images": extracted,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def extract_images_from_pptx(
+        self, file_path: str, output_dir: str,
+        slide_index: int = None, fmt: str = "png", prefix: str = "slide",
+    ) -> Dict[str, Any]:
+        """Extract all images from a .pptx presentation (or a single slide)."""
+        if not PPTX_AVAILABLE:
+            return {"success": False, "error": "python-pptx not installed"}
+        try:
+            from PIL import Image as PILImage
+            import io
+            os.makedirs(output_dir, exist_ok=True)
+            prs = Presentation(file_path)
+            extracted = []
+            idx = 0
+            slides_to_scan = []
+            if slide_index is not None:
+                if slide_index < 0 or slide_index >= len(prs.slides):
+                    return {"success": False, "error": f"Slide index {slide_index} out of range (0-{len(prs.slides)-1})"}
+                slides_to_scan = [(slide_index, prs.slides[slide_index])]
+            else:
+                slides_to_scan = list(enumerate(prs.slides))
+
+            for si, slide in slides_to_scan:
+                for shape in slide.shapes:
+                    if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
+                        try:
+                            image = shape.image
+                            image_bytes = image.blob
+                            content_type = image.content_type
+                            ext_map = {
+                                "image/png": "png", "image/jpeg": "jpg",
+                                "image/gif": "gif", "image/bmp": "bmp",
+                                "image/tiff": "tiff",
+                            }
+                            src_ext = ext_map.get(content_type, "png")
+                            out_name = f"{prefix}_{si:02d}_{idx:03d}.{fmt}"
+                            out_path = os.path.join(output_dir, out_name)
+                            img = PILImage.open(io.BytesIO(image_bytes))
+                            if fmt.lower() == "jpg":
+                                img = img.convert("RGB")
+                                img.save(out_path, "JPEG", quality=90)
+                            else:
+                                img.save(out_path, fmt.upper())
+                            extracted.append({
+                                "index": idx, "slide": si, "file": out_path,
+                                "format": fmt, "width": img.width,
+                                "height": img.height,
+                                "size_bytes": os.path.getsize(out_path),
+                                "shape_name": shape.name,
+                            })
+                            idx += 1
+                        except Exception as img_err:
+                            extracted.append({
+                                "index": idx, "slide": si,
+                                "error": str(img_err),
+                            })
+                            idx += 1
+            return {
+                "success": True, "file": file_path,
+                "output_dir": output_dir,
+                "images_extracted": len(extracted),
+                "images": extracted,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def pdf_extract_images(
+        self, file_path: str, output_dir: str,
+        fmt: str = "png", pages: str = None,
+    ) -> Dict[str, Any]:
+        """Extract embedded image objects from a PDF using PyMuPDF."""
+        try:
+            import fitz
+            from PIL import Image as PILImage
+            import io
+        except ImportError:
+            return {"success": False, "error": "PyMuPDF (fitz) not installed. Run: pip install PyMuPDF"}
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            doc = fitz.open(file_path)
+            total_pages = len(doc)
+            # Parse page range
+            page_indices = self._parse_page_range(pages, total_pages)
+            extracted = []
+            seen_xrefs = set()
+            idx = 0
+            for pi in page_indices:
+                page = doc[pi]
+                image_list = page.get_images(full=True)
+                for img_info in image_list:
+                    xref = img_info[0]
+                    if xref in seen_xrefs:
+                        continue
+                    seen_xrefs.add(xref)
+                    try:
+                        base_image = doc.extract_image(xref)
+                        if not base_image:
+                            continue
+                        image_bytes = base_image["image"]
+                        img_ext = base_image.get("ext", "png")
+                        out_name = f"pdf_img_{pi:03d}_{idx:03d}.{fmt}"
+                        out_path = os.path.join(output_dir, out_name)
+                        img = PILImage.open(io.BytesIO(image_bytes))
+                        if fmt.lower() == "jpg":
+                            img = img.convert("RGB")
+                            img.save(out_path, "JPEG", quality=90)
+                        else:
+                            img.save(out_path, fmt.upper())
+                        extracted.append({
+                            "index": idx, "page": pi, "xref": xref,
+                            "file": out_path, "format": fmt,
+                            "width": img.width, "height": img.height,
+                            "size_bytes": os.path.getsize(out_path),
+                            "original_format": img_ext,
+                        })
+                        idx += 1
+                    except Exception as img_err:
+                        extracted.append({
+                            "index": idx, "page": pi, "xref": xref,
+                            "error": str(img_err),
+                        })
+                        idx += 1
+            doc.close()
+            return {
+                "success": True, "file": file_path,
+                "output_dir": output_dir,
+                "total_pages": total_pages,
+                "pages_scanned": len(page_indices),
+                "images_extracted": len([e for e in extracted if "file" in e]),
+                "images": extracted,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def pdf_page_to_image(
+        self, file_path: str, output_dir: str,
+        pages: str = None, dpi: int = 150, fmt: str = "png",
+    ) -> Dict[str, Any]:
+        """Render full PDF pages as images using PyMuPDF."""
+        try:
+            import fitz
+        except ImportError:
+            return {"success": False, "error": "PyMuPDF (fitz) not installed. Run: pip install PyMuPDF"}
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            doc = fitz.open(file_path)
+            total_pages = len(doc)
+            page_indices = self._parse_page_range(pages, total_pages)
+            rendered = []
+            for pi in page_indices:
+                page = doc[pi]
+                pix = page.get_pixmap(dpi=dpi)
+                if fmt.lower() == "jpg":
+                    out_name = f"page_{pi:03d}.jpg"
+                    out_path = os.path.join(output_dir, out_name)
+                    pix.pil_save(out_path, format="JPEG", quality=90)
+                else:
+                    out_name = f"page_{pi:03d}.png"
+                    out_path = os.path.join(output_dir, out_name)
+                    pix.save(out_path)
+                rendered.append({
+                    "page": pi, "file": out_path, "format": fmt,
+                    "width": pix.width, "height": pix.height,
+                    "dpi": dpi, "size_bytes": os.path.getsize(out_path),
+                })
+            doc.close()
+            return {
+                "success": True, "file": file_path,
+                "output_dir": output_dir,
+                "total_pages": total_pages,
+                "pages_rendered": len(rendered),
+                "dpi": dpi, "images": rendered,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _parse_page_range(pages_str: str, total: int) -> List[int]:
+        """Parse a page range string like '0-3', '1,3,5', or None (= all)."""
+        if not pages_str:
+            return list(range(total))
+        result = []
+        for part in pages_str.split(","):
+            part = part.strip()
+            if "-" in part:
+                a, b = part.split("-", 1)
+                a = max(0, int(a))
+                b = min(total - 1, int(b))
+                result.extend(range(a, b + 1))
+            else:
+                idx = int(part)
+                if 0 <= idx < total:
+                    result.append(idx)
+        return sorted(set(result))
+
+    # ==================== PPTX SPATIAL / TEXTBOX ====================
+
+    def list_shapes(self, file_path: str, slide_index: int = None) -> Dict[str, Any]:
+        """List all shapes on slides with full spatial info (position, size, type, text)."""
+        if not PPTX_AVAILABLE:
+            return {"success": False, "error": "python-pptx not installed"}
+        try:
+            prs = Presentation(file_path)
+            slide_width_emu = prs.slide_width
+            slide_height_emu = prs.slide_height
+            slides_data = []
+            slides_to_scan = []
+            if slide_index is not None:
+                if slide_index < 0 or slide_index >= len(prs.slides):
+                    return {"success": False, "error": f"Slide index {slide_index} out of range (0-{len(prs.slides)-1})"}
+                slides_to_scan = [(slide_index, prs.slides[slide_index])]
+            else:
+                slides_to_scan = list(enumerate(prs.slides))
+
+            for si, slide in slides_to_scan:
+                shapes_info = []
+                for shape in slide.shapes:
+                    info = {
+                        "shape_id": shape.shape_id,
+                        "name": shape.name,
+                        "shape_type": str(shape.shape_type),
+                        "left_inches": round(shape.left / 914400, 3) if shape.left is not None else None,
+                        "top_inches": round(shape.top / 914400, 3) if shape.top is not None else None,
+                        "width_inches": round(shape.width / 914400, 3) if shape.width is not None else None,
+                        "height_inches": round(shape.height / 914400, 3) if shape.height is not None else None,
+                        "rotation": shape.rotation,
+                        "has_text": shape.has_text_frame,
+                    }
+                    if shape.has_text_frame:
+                        tf = shape.text_frame
+                        info["text"] = tf.text[:200]
+                        info["word_wrap"] = tf.word_wrap
+                        info["auto_size"] = str(tf.auto_size) if tf.auto_size else None
+                        info["margin_left"] = round(tf.margin_left / 914400, 3) if tf.margin_left is not None else None
+                        info["margin_right"] = round(tf.margin_right / 914400, 3) if tf.margin_right is not None else None
+                        info["margin_top"] = round(tf.margin_top / 914400, 3) if tf.margin_top is not None else None
+                        info["margin_bottom"] = round(tf.margin_bottom / 914400, 3) if tf.margin_bottom is not None else None
+                    # Check if it's a placeholder
+                    try:
+                        pf = shape.placeholder_format
+                        if pf is not None:
+                            info["placeholder_idx"] = pf.idx
+                            info["placeholder_type"] = str(pf.type)
+                    except Exception:
+                        pass
+                    # Right/bottom edge (for overlap detection)
+                    if info["left_inches"] is not None and info["width_inches"] is not None:
+                        info["right_inches"] = round(info["left_inches"] + info["width_inches"], 3)
+                    if info["top_inches"] is not None and info["height_inches"] is not None:
+                        info["bottom_inches"] = round(info["top_inches"] + info["height_inches"], 3)
+                    shapes_info.append(info)
+                slides_data.append({
+                    "slide_index": si,
+                    "shape_count": len(shapes_info),
+                    "shapes": shapes_info,
+                })
+            return {
+                "success": True, "file": file_path,
+                "slide_width_inches": round(slide_width_emu / 914400, 3),
+                "slide_height_inches": round(slide_height_emu / 914400, 3),
+                "slides": slides_data,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def add_textbox(
+        self, file_path: str, slide_index: int,
+        text: str, left: float = 1.0, top: float = 1.0,
+        width: float = 5.0, height: float = 1.5,
+        font_size: float = None, font_name: str = None,
+        bold: bool = False, italic: bool = False,
+        color: str = None, align: str = None,
+        word_wrap: bool = True,
+    ) -> Dict[str, Any]:
+        """Add a textbox at a specific position on a slide (all units in inches)."""
+        if not PPTX_AVAILABLE:
+            return {"success": False, "error": "python-pptx not installed"}
+        try:
+            with self._file_lock(file_path):
+                backup = self._snapshot_backup(file_path)
+                prs = Presentation(file_path)
+                total = len(prs.slides)
+                if slide_index < 0 or slide_index >= total:
+                    return {"success": False, "error": f"Slide index {slide_index} out of range (0-{total-1})"}
+                slide = prs.slides[slide_index]
+                txBox = slide.shapes.add_textbox(
+                    Inches(left), Inches(top),
+                    Inches(width), Inches(height),
+                )
+                tf = txBox.text_frame
+                tf.word_wrap = word_wrap
+                p = tf.paragraphs[0]
+                p.text = text
+                # Apply formatting
+                if font_size or font_name or bold or italic or color:
+                    run = p.runs[0] if p.runs else p.add_run()
+                    if not p.runs:
+                        run.text = text
+                        p.clear()
+                        p._p.append(run._r)
+                    if font_size:
+                        run.font.size = Pt(font_size)
+                    if font_name:
+                        run.font.name = font_name
+                    run.font.bold = bold if bold else None
+                    run.font.italic = italic if italic else None
+                    if color:
+                        c = color.lstrip("#")
+                        from pptx.dml.color import RGBColor as PptxRGB
+                        run.font.color.rgb = PptxRGB(int(c[:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+                if align:
+                    align_map = {
+                        "left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER,
+                        "right": PP_ALIGN.RIGHT, "justify": PP_ALIGN.JUSTIFY,
+                    }
+                    if align.lower() in align_map:
+                        p.alignment = align_map[align.lower()]
+                self._safe_save(prs, file_path)
+            return {
+                "success": True, "file": file_path,
+                "slide_index": slide_index,
+                "shape_name": txBox.name,
+                "position": {"left": left, "top": top, "width": width, "height": height},
+                "text": text[:100],
+                "backup": backup or None,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def modify_shape(
+        self, file_path: str, slide_index: int, shape_name: str,
+        left: float = None, top: float = None,
+        width: float = None, height: float = None,
+        text: str = None, font_size: float = None,
+        rotation: float = None,
+    ) -> Dict[str, Any]:
+        """Modify position, size, text, or rotation of an existing shape by name."""
+        if not PPTX_AVAILABLE:
+            return {"success": False, "error": "python-pptx not installed"}
+        try:
+            with self._file_lock(file_path):
+                backup = self._snapshot_backup(file_path)
+                prs = Presentation(file_path)
+                total = len(prs.slides)
+                if slide_index < 0 or slide_index >= total:
+                    return {"success": False, "error": f"Slide index {slide_index} out of range (0-{total-1})"}
+                slide = prs.slides[slide_index]
+                target = None
+                for shape in slide.shapes:
+                    if shape.name == shape_name:
+                        target = shape
+                        break
+                if target is None:
+                    available = [s.name for s in slide.shapes]
+                    return {"success": False, "error": f"Shape '{shape_name}' not found. Available: {available}"}
+                changes = []
+                if left is not None:
+                    target.left = Inches(left)
+                    changes.append(f"left={left}in")
+                if top is not None:
+                    target.top = Inches(top)
+                    changes.append(f"top={top}in")
+                if width is not None:
+                    target.width = Inches(width)
+                    changes.append(f"width={width}in")
+                if height is not None:
+                    target.height = Inches(height)
+                    changes.append(f"height={height}in")
+                if rotation is not None:
+                    target.rotation = rotation
+                    changes.append(f"rotation={rotation}°")
+                if text is not None and target.has_text_frame:
+                    target.text_frame.text = text
+                    changes.append(f"text='{text[:50]}'")
+                if font_size is not None and target.has_text_frame:
+                    for paragraph in target.text_frame.paragraphs:
+                        for run in paragraph.runs:
+                            run.font.size = Pt(font_size)
+                    changes.append(f"font_size={font_size}pt")
+                self._safe_save(prs, file_path)
+            return {
+                "success": True, "file": file_path,
+                "slide_index": slide_index,
+                "shape_name": shape_name,
+                "changes": changes,
+                "backup": backup or None,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def preview_slide(
+        self, file_path: str, output_dir: str,
+        slide_index: int = None, dpi: int = 150,
+    ) -> Dict[str, Any]:
+        """Render presentation slides as images via OnlyOffice x2t + PyMuPDF.
+        Requires: Docker container 'onlyoffice-documentserver' running, PyMuPDF on system."""
+        try:
+            import subprocess
+            import uuid
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Step 1: Copy pptx into Docker container
+            abs_path = str(Path(file_path).resolve())
+            tmp_id = uuid.uuid4().hex[:8]
+            container_pptx = f"/tmp/preview_{tmp_id}.pptx"
+            container_pdf = f"/tmp/preview_{tmp_id}.pdf"
+            container_xml = f"/tmp/preview_{tmp_id}.xml"
+
+            subprocess.run(
+                ["docker", "cp", abs_path, f"onlyoffice-documentserver:{container_pptx}"],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            # Step 2: Create x2t conversion XML
+            x2t_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<TaskQueueDataConvert>
+  <m_sFileFrom>{container_pptx}</m_sFileFrom>
+  <m_sFileTo>{container_pdf}</m_sFileTo>
+  <m_nFormatTo>513</m_nFormatTo>
+  <m_sFontDir>/usr/share/fonts</m_sFontDir>
+  <m_sThemeDir>/var/www/onlyoffice/documentserver/server/FileConverter/bin/empty/themes</m_sThemeDir>
+</TaskQueueDataConvert>"""
+            subprocess.run(
+                ["docker", "exec", "-i", "onlyoffice-documentserver", "bash", "-c",
+                 f"cat > {container_xml} << 'XMLEOF'\n{x2t_xml}\nXMLEOF"],
+                check=True, capture_output=True, timeout=15,
+            )
+
+            # Step 3: Run x2t conversion
+            subprocess.run(
+                ["docker", "exec", "onlyoffice-documentserver",
+                 "/var/www/onlyoffice/documentserver/server/FileConverter/bin/x2t",
+                 container_xml],
+                check=True, capture_output=True, timeout=60,
+            )
+
+            # Step 4: Copy PDF back
+            local_pdf = os.path.join(output_dir, f"preview_{tmp_id}.pdf")
+            subprocess.run(
+                ["docker", "cp", f"onlyoffice-documentserver:{container_pdf}", local_pdf],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            # Step 5: Render PDF pages to images with PyMuPDF
+            import fitz
+            doc = fitz.open(local_pdf)
+            total_pages = len(doc)
+            rendered = []
+
+            pages_to_render = []
+            if slide_index is not None:
+                if slide_index < 0 or slide_index >= total_pages:
+                    doc.close()
+                    return {"success": False, "error": f"Slide {slide_index} out of range (0-{total_pages-1})"}
+                pages_to_render = [slide_index]
+            else:
+                pages_to_render = list(range(total_pages))
+
+            for pi in pages_to_render:
+                page = doc[pi]
+                pix = page.get_pixmap(dpi=dpi)
+                out_path = os.path.join(output_dir, f"slide_{pi:03d}.png")
+                pix.save(out_path)
+                rendered.append({
+                    "slide": pi, "file": out_path,
+                    "width": pix.width, "height": pix.height,
+                    "dpi": dpi, "size_bytes": os.path.getsize(out_path),
+                })
+            doc.close()
+
+            # Cleanup temp PDF
+            try:
+                os.unlink(local_pdf)
+            except OSError:
+                pass
+            # Cleanup container files
+            subprocess.run(
+                ["docker", "exec", "onlyoffice-documentserver", "rm", "-f",
+                 container_pptx, container_pdf, container_xml],
+                capture_output=True, timeout=10,
+            )
+
+            return {
+                "success": True, "file": file_path,
+                "output_dir": output_dir,
+                "total_slides": total_pages,
+                "slides_rendered": len(rendered),
+                "dpi": dpi, "images": rendered,
+            }
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Conversion timed out (is onlyoffice-documentserver running?)"}
+        except FileNotFoundError:
+            return {"success": False, "error": "Docker not found. Is it installed?"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 

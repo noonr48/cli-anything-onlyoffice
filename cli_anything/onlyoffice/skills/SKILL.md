@@ -1,23 +1,31 @@
 ---
 name: onlyoffice
-version: 4.0.2
+version: 4.1.0
 author: SLOANE OS
-description: 90-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), and RDF Knowledge Graphs
-tags: [productivity, documents, office, onlyoffice, charts, spreadsheets, rdf, apa]
+description: 103-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
+tags: [productivity, documents, office, onlyoffice, charts, spreadsheets, rdf, apa, pdf, image-extraction, spatial, data-validation]
 ---
 
-# CLI-Anything OnlyOffice v4.0.2
+# CLI-Anything OnlyOffice v4.1.0
 
 Programmatic control over Office documents designed for AI agents. Full JSON output. Production-safe with atomic writes, two-layer file locking, and automatic backups.
 
-## ⚠️ CRITICAL: How to Call This Tool
+## What's New in v4.1.0
+- **Image Extraction** — pull images out of PDFs, .docx, and .pptx files
+- **PDF Rendering** — render PDF pages as PNG/JPG images (PyMuPDF)
+- **Spatial Awareness** — list all shapes with exact positions/sizes for layout control
+- **Textbox Control** — add/modify textboxes at exact coordinates on slides
+- **Slide Preview** — render slides as PNG images via OnlyOffice x2t
+- **Data Validation** — Excel-style cell validation (dropdowns, number ranges, text length) + data audit
+
+## CRITICAL: How to Call This Tool
 
 ```bash
 # Via SLOANE skill router (preferred for subject agents):
 cli_anything_run --app onlyoffice <command> [args] --json
 
 # Direct binary (Claude Code / shell):
-/home/benbi/AI_Library/cli-anything-onlyoffice/.venv/bin/cli-anything-onlyoffice <command> [args] --json
+/home/benbi/cli-anything/onlyoffice/agent-harness/.venv/bin/cli-anything-onlyoffice <command> [args] --json
 ```
 
 **NEVER do any of these — they will fail:**
@@ -38,7 +46,7 @@ Check the `python` field in the response — it must point to `.venv/bin/python3
 
 | Setting | Value |
 |---------|-------|
-| Page size | A4 (210 × 297 mm) |
+| Page size | A4 (210 x 297 mm) |
 | Margins | 1.0" all sides |
 | Font | Calibri 11pt |
 | Line spacing | Double (APA 7th) |
@@ -49,11 +57,11 @@ Check the `python` field in the response — it must point to `.venv/bin/python3
 - A4 paper size set on all sheets
 
 ## Presentation Defaults (pptx-create)
-- Slide size: 16:9 widescreen (13.333" × 7.5")
+- Slide size: 16:9 widescreen (13.333" x 7.5")
 
 ---
 
-## DOCUMENTS (.docx) — 25 commands
+## DOCUMENTS (.docx) — 26 commands
 
 ### Core CRUD
 - `doc-create <file> <title> <content>`
@@ -83,6 +91,9 @@ Check the `python` field in the response — it must point to `.venv/bin/python3
 - `doc-add-page-break <file>`
 - `doc-add-list <file> <items> [--type bullet|number]` — items separated by `;`
 
+### Image Extraction
+- `doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]` — extract all embedded images
+
 ### Metadata & Annotations
 - `doc-set-metadata <file> [--author] [--title] [--subject] [--keywords] [--comments] [--category]`
 - `doc-get-metadata <file>`
@@ -94,7 +105,7 @@ Check the `python` field in the response — it must point to `.venv/bin/python3
 
 ---
 
-## SPREADSHEETS (.xlsx) — 32 commands
+## SPREADSHEETS (.xlsx) — 37 commands
 
 ### Core CRUD
 - `xlsx-create <file> [sheet_name]`
@@ -142,6 +153,22 @@ Check the `python` field in the response — it must point to `.venv/bin/python3
 - `xlsx-csv-import <xlsx_file> <csv_file> [--sheet <name>] [--delimiter <char>]`
 - `xlsx-csv-export <xlsx_file> <csv_file> [--sheet <name>] [--delimiter <char>]`
 
+### Data Validation
+- `xlsx-add-validation <file> <range> <type> [--operator <op>] [--formula1 <v>] [--formula2 <v>] [--sheet <name>] [--error <msg>] [--prompt <msg>] [--error-style stop|warning|information] [--no-blank]`
+  - Types: `list`, `whole`, `decimal`, `date`, `time`, `textLength`, `custom`
+  - Operators: `between`, `notBetween`, `equal`, `notEqual`, `lessThan`, `lessThanOrEqual`, `greaterThan`, `greaterThanOrEqual`
+- `xlsx-add-dropdown <file> <range> <options_csv> [--sheet <name>] [--prompt <msg>] [--error <msg>]` — shortcut for dropdown list
+- `xlsx-list-validations <file> [--sheet <name>]` — list all validation rules
+- `xlsx-remove-validation <file> [--range <range>] [--all] [--sheet <name>]` — remove rules
+- `xlsx-validate-data <file> [--sheet <name>] [--max-rows <n>]` — audit existing data against rules (pass/fail per cell)
+
+**Validation Workflow:**
+1. Write data with `xlsx-write`
+2. Add rules with `xlsx-add-validation` or `xlsx-add-dropdown`
+3. Run `xlsx-validate-data` to audit — returns every failing cell with reason
+4. Fix failing cells with `xlsx-cell-write`
+5. Re-run `xlsx-validate-data` to confirm all clean
+
 ---
 
 ## CHARTS (.xlsx) — 4 commands
@@ -155,8 +182,9 @@ Types: bar, column, bar_horizontal, line, pie, scatter
 
 ---
 
-## PRESENTATIONS (.pptx) — 10 commands
+## PRESENTATIONS (.pptx) — 16 commands
 
+### Core
 - `pptx-create <file> <title> [subtitle]` — 16:9 widescreen by default
 - `pptx-add-slide <file> <title> [content] [layout]` — layouts: title_only|content|blank|two_content|comparison
 - `pptx-add-bullets <file> <title> <bullets>` — bullets separated by `\n`
@@ -167,6 +195,37 @@ Types: bar, column, bar_horizontal, line, pie, scatter
 - `pptx-delete-slide <file> <index>`
 - `pptx-speaker-notes <file> <slide_index> [notes_text]`
 - `pptx-update-text <file> <slide_index> [--title <t>] [--body <b>]`
+
+### Image Extraction
+- `pptx-extract-images <file> <output_dir> [--slide <index>] [--format png|jpg]` — extract all images from slides
+
+### Spatial Awareness & Layout Control
+- `pptx-list-shapes <file> [--slide <index>]` — list ALL shapes with exact position, size, text, type
+- `pptx-add-textbox <file> <slide_index> <text> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--font-size <pt>] [--font-name <name>] [--bold] [--italic] [--color <hex>] [--align <left|center|right>]`
+- `pptx-modify-shape <file> <slide_index> <shape_name> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--text <text>] [--font-size <pt>] [--rotation <deg>]`
+
+### Visual Preview
+- `pptx-preview <file> <output_dir> [--slide <index>] [--dpi <n>]` — render slides as PNG (requires OnlyOffice Docker)
+
+**Spatial Workflow (recommended for quality presentations):**
+1. Create slides with content
+2. Run `pptx-list-shapes` to see exact positions of all elements
+3. Use `pptx-modify-shape` to fix overlaps or reposition elements
+4. Use `pptx-add-textbox` for custom positioned text
+5. Run `pptx-preview` to render a visual check — view the PNG to verify layout
+6. Iterate if needed
+
+**Slide coordinate system:** Origin (0,0) = top-left. Slide is 13.333" wide x 7.5" tall (16:9).
+
+---
+
+## PDF (.pdf) — 2 commands
+
+- `pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]` — extract embedded image objects (PyMuPDF)
+- `pdf-page-to-image <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]` — render full pages as images
+
+Page ranges: `0-3` (pages 0 through 3), `1,3,5` (specific pages), omit for all pages.
+Default DPI: 150. Use 300 for print quality.
 
 ---
 
@@ -207,8 +266,10 @@ Types: bar, column, bar_horizontal, line, pie, scatter
 4. **Never install anything** — tool is fully installed, all deps in venv
 5. **Never use system python3/pip3/pip**
 6. **Backups are automatic** — `backup-restore --latest` on any write error
+7. **Use `pptx-list-shapes` before modifying slides** — know exact positions to avoid overlaps
+8. **Use `pptx-preview` after building slides** — visually verify the layout looks correct
 
 ---
 
-**Last Updated:** 2026-04-07
-**Version:** 4.0.2
+**Last Updated:** 2026-04-08
+**Version:** 4.1.0
