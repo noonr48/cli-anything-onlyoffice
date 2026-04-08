@@ -987,6 +987,7 @@ def cmd_help(json_output=False):
                 "doc-get-metadata <file>": "Read document properties",
                 "doc-word-count <file>": "Word/character/paragraph counts",
                 "doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]": "Extract all embedded images from .docx",
+                "doc-to-pdf <file> [output_path]": "Convert .docx to PDF via OnlyOffice",
             },
             "SPREADSHEETS (.xlsx)": {
                 "xlsx-create <file> [sheet]": "Create new .xlsx spreadsheet",
@@ -2978,6 +2979,17 @@ def main():
                 else:
                     i += 1
             result = doc_server.extract_images_from_docx(args.args[0], args.args[1], fmt=fmt, prefix=prefix)
+            print_result(result, json_output)
+
+    elif args.command == "doc-to-pdf":
+        if len(args.args) < 1:
+            print_result(
+                {"success": False, "error": "Usage: doc-to-pdf <file> [output_path]"},
+                json_output,
+            )
+        else:
+            out_path = args.args[1] if len(args.args) >= 2 else None
+            result = doc_server.doc_to_pdf(args.args[0], output_path=out_path)
             print_result(result, json_output)
 
     elif args.command == "pptx-extract-images":

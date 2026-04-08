@@ -5445,6 +5445,113 @@ class DocumentServerClient:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def doc_to_pdf(
+        self, file_path: str, output_path: str = None,
+    ) -> Dict[str, Any]:
+        """Convert a .docx file to PDF via OnlyOffice x2t inside the Docker container.
+        Requires: Docker container 'onlyoffice-documentserver' running, PyMuPDF on system."""
+        try:
+            import subprocess
+            import uuid
+
+            abs_path = str(Path(file_path).resolve())
+            if not os.path.exists(abs_path):
+                return {"success": False, "error": f"File not found: {file_path}"}
+
+            # Determine output path
+            if output_path is None:
+                output_path = str(Path(abs_path).with_suffix(".pdf"))
+            else:
+                output_path = str(Path(output_path).resolve())
+
+            # Ensure output directory exists
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+            tmp_id = uuid.uuid4().hex[:8]
+            container_docx = f"/tmp/convert_{tmp_id}.docx"
+            container_pdf = f"/tmp/convert_{tmp_id}.pdf"
+            container_xml = f"/tmp/convert_{tmp_id}.xml"
+
+            # Step 1: Copy docx into Docker container
+            subprocess.run(
+                ["docker", "cp", abs_path, f"onlyoffice-documentserver:{container_docx}"],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            # Step 2: Create x2t conversion XML
+            x2t_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<TaskQueueDataConvert>
+  <m_sFileFrom>{container_docx}</m_sFileFrom>
+  <m_sFileTo>{container_pdf}</m_sFileTo>
+  <m_nFormatTo>513</m_nFormatTo>
+  <m_sFontDir>/usr/share/fonts</m_sFontDir>
+  <m_sThemeDir>/var/www/onlyoffice/documentserver/server/FileConverter/bin/empty/themes</m_sThemeDir>
+</TaskQueueDataConvert>"""
+            subprocess.run(
+                ["docker", "exec", "-i", "onlyoffice-documentserver", "bash", "-c",
+                 f"cat > {container_xml} << 'XMLEOF'\n{x2t_xml}\nXMLEOF"],
+                check=True, capture_output=True, timeout=15,
+            )
+
+            # Step 3: Run x2t conversion
+            result = subprocess.run(
+                ["docker", "exec", "onlyoffice-documentserver",
+                 "/var/www/onlyoffice/documentserver/server/FileConverter/bin/x2t",
+                 container_xml],
+                capture_output=True, timeout=120,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", errors="replace").strip()
+                # Cleanup container files
+                subprocess.run(
+                    ["docker", "exec", "onlyoffice-documentserver", "rm", "-f",
+                     container_docx, container_pdf, container_xml],
+                    capture_output=True, timeout=10,
+                )
+                return {"success": False, "error": f"x2t conversion failed (exit {result.returncode}): {stderr}"}
+
+            # Step 4: Copy PDF back
+            subprocess.run(
+                ["docker", "cp", f"onlyoffice-documentserver:{container_pdf}", output_path],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            if not os.path.exists(output_path):
+                return {"success": False, "error": "Conversion produced no output file"}
+
+            file_size = os.path.getsize(output_path)
+
+            # Count pages with PyMuPDF
+            pages = None
+            try:
+                import fitz
+                doc = fitz.open(output_path)
+                pages = len(doc)
+                doc.close()
+            except Exception:
+                pass
+
+            # Cleanup container files
+            subprocess.run(
+                ["docker", "exec", "onlyoffice-documentserver", "rm", "-f",
+                 container_docx, container_pdf, container_xml],
+                capture_output=True, timeout=10,
+            )
+
+            return {
+                "success": True,
+                "input_file": abs_path,
+                "output_file": output_path,
+                "file_size": file_size,
+                "pages": pages,
+            }
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Conversion timed out (is onlyoffice-documentserver running?)"}
+        except FileNotFoundError:
+            return {"success": False, "error": "Docker not found. Is it installed?"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     # ==================== RDF OPERATIONS ====================
 
     _RDF_FORMAT_MAP = {

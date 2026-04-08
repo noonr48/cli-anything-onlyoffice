@@ -2,7 +2,7 @@
 
 > Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs — designed for AI agents.
 
-**103 commands. 7 categories. Full JSON output. Production-safe.**
+**104 commands. 7 categories. Full JSON output. Production-safe.**
 
 Part of the [SLOANE OS](https://github.com/sloane-os) agent stack. Agents call this via `cli_anything_run(tool='onlyoffice', ...)`.
 
@@ -292,6 +292,24 @@ cli-anything-onlyoffice doc-extract-images /tmp/essay.docx /tmp/extracted_images
   "images": [
     {"index": 0, "file": "/tmp/extracted_images/image_000.png", "width": 800, "height": 600, "size_bytes": 45320}
   ]
+}
+```
+
+#### `doc-to-pdf <file> [output_path]`
+Convert a .docx file to PDF using OnlyOffice DocumentServer's x2t converter (runs inside Docker).
+Requires `onlyoffice-documentserver` container to be running.
+
+```bash
+cli-anything-onlyoffice doc-to-pdf /tmp/report.docx --json
+cli-anything-onlyoffice doc-to-pdf /tmp/report.docx /tmp/final-submission.pdf --json
+```
+```json
+{
+  "success": true,
+  "input_file": "/tmp/report.docx",
+  "output_file": "/tmp/report.pdf",
+  "file_size": 15145,
+  "pages": 1
 }
 ```
 
@@ -1367,14 +1385,14 @@ cli-anything-onlyoffice backup-restore /tmp/grades.xlsx --latest --dry-run --jso
 
 | Category | Count | Commands |
 |----------|-------|----------|
-| Documents (.docx) | 26 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, **doc-extract-images**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, doc-word-count |
+| Documents (.docx) | 27 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, doc-word-count |
 | Spreadsheets (.xlsx) | 37 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export, **xlsx-add-validation**, **xlsx-add-dropdown**, **xlsx-list-validations**, **xlsx-remove-validation**, **xlsx-validate-data** |
 | Charts (.xlsx) | 4 | chart-create, chart-comparison, chart-grade-dist, chart-progress |
 | Presentations (.pptx) | 16 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text, **pptx-extract-images**, **pptx-list-shapes**, **pptx-add-textbox**, **pptx-modify-shape**, **pptx-preview** |
 | PDF (.pdf) | 2 | **pdf-extract-images**, **pdf-page-to-image** |
 | RDF Knowledge Graphs | 10 | rdf-create, rdf-read, rdf-add, rdf-remove, rdf-query, rdf-export, rdf-merge, rdf-stats, rdf-namespace, rdf-validate |
 | General | 9 | list, open, watch, info, backup-list, backup-prune, backup-restore, status, help |
-| **Total** | **103** | |
+| **Total** | **104** | |
 
 ---
 
