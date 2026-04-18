@@ -2,7 +2,7 @@
 
 > Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs — designed for AI agents.
 
-**104 commands. 7 categories. Full JSON output. Production-safe.**
+**105 commands. 7 categories. Full JSON output. Production-safe.**
 
 Part of the [SLOANE OS](https://github.com/sloane-os) agent stack. Agents call this via `cli_anything_run(tool='onlyoffice', ...)`.
 
@@ -91,7 +91,7 @@ All responses have `{"success": true, ...}` or `{"success": false, "error": "...
 
 ## Mode 1 — Documents (.docx)
 
-**26 commands** — full lifecycle from creation to APA references, plus image extraction.
+**28 commands** — full lifecycle from creation to APA references, plus image extraction and rendered page preview.
 
 ### Document Defaults
 
@@ -272,11 +272,13 @@ cli-anything-onlyoffice doc-read-tables /tmp/essay.docx --json
 }
 ```
 
-#### `doc-add-image <file> <image_path> [--width <inches>] [--caption <text>]`
-Embed an image with optional caption.
+#### `doc-add-image <file> <image_path> [--width <inches>] [--caption <text>] [--paragraph <index>] [--position before|after]`
+Embed an image with optional caption. By default it appends to the end; use `--paragraph` with `--position` to anchor the figure before or after a specific paragraph.
 
 ```bash
 cli-anything-onlyoffice doc-add-image /tmp/essay.docx /tmp/figure1.png --width 5.0 --caption "Figure 1: Overview" --json
+cli-anything-onlyoffice doc-add-image /tmp/essay.docx /tmp/figure1.png \
+  --paragraph 3 --position after --caption "Figure 1: Overview" --json
 ```
 
 #### `doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]`
@@ -310,6 +312,25 @@ cli-anything-onlyoffice doc-to-pdf /tmp/report.docx /tmp/final-submission.pdf --
   "output_file": "/tmp/report.pdf",
   "file_size": 15145,
   "pages": 1
+}
+```
+
+#### `doc-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]`
+Render a DOCX as page images using the existing OnlyOffice conversion path plus PyMuPDF. Use this after figure insertion to inspect the actual rendered page layout.
+
+```bash
+cli-anything-onlyoffice doc-preview /tmp/report.docx /tmp/doc_previews --json
+cli-anything-onlyoffice doc-preview /tmp/report.docx /tmp/doc_previews --pages 1-2 --dpi 200 --format jpg --json
+```
+```json
+{
+  "success": true,
+  "file": "/tmp/report.docx",
+  "total_pages": 3,
+  "pages_rendered": 2,
+  "images": [
+    {"page": 1, "file": "/tmp/doc_previews/page_001.jpg", "width": 1654, "height": 2339, "dpi": 200}
+  ]
 }
 ```
 
@@ -1385,14 +1406,14 @@ cli-anything-onlyoffice backup-restore /tmp/grades.xlsx --latest --dry-run --jso
 
 | Category | Count | Commands |
 |----------|-------|----------|
-| Documents (.docx) | 27 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, doc-word-count |
+| Documents (.docx) | 28 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, doc-word-count |
 | Spreadsheets (.xlsx) | 37 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export, **xlsx-add-validation**, **xlsx-add-dropdown**, **xlsx-list-validations**, **xlsx-remove-validation**, **xlsx-validate-data** |
 | Charts (.xlsx) | 4 | chart-create, chart-comparison, chart-grade-dist, chart-progress |
 | Presentations (.pptx) | 16 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text, **pptx-extract-images**, **pptx-list-shapes**, **pptx-add-textbox**, **pptx-modify-shape**, **pptx-preview** |
 | PDF (.pdf) | 2 | **pdf-extract-images**, **pdf-page-to-image** |
 | RDF Knowledge Graphs | 10 | rdf-create, rdf-read, rdf-add, rdf-remove, rdf-query, rdf-export, rdf-merge, rdf-stats, rdf-namespace, rdf-validate |
 | General | 9 | list, open, watch, info, backup-list, backup-prune, backup-restore, status, help |
-| **Total** | **104** | |
+| **Total** | **105** | |
 
 ---
 
@@ -1480,7 +1501,11 @@ cli-anything-onlyoffice pdf-page-to-image /tmp/paper.pdf /tmp/pages --pages 5 --
 
 # Insert extracted figure into a document
 cli-anything-onlyoffice doc-add-image /tmp/essay.docx /tmp/figures/pdf_img_005_000.png \
-  --width 5.0 --caption "Figure 1: Study framework (adapted from Smith, 2024)" --json
+  --width 5.0 --paragraph 8 --position after \
+  --caption "Figure 1: Study framework (adapted from Smith, 2024)" --json
+
+# Render the affected pages to verify the figure placement visually
+cli-anything-onlyoffice doc-preview /tmp/essay.docx /tmp/doc-preview --pages 2-3 --json
 ```
 
 ### RDF Knowledge Graph Pipeline

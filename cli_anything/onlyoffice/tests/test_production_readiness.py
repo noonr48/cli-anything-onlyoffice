@@ -3,8 +3,11 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
+from docx import Document
 from openpyxl import Workbook, load_workbook
+from PIL import Image
 
 from cli_anything.onlyoffice.utils.docserver import get_client
 
@@ -113,6 +116,84 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
         self.assertTrue(append.get("backup"))
         self.assertTrue(os.path.exists(append["backup"]))
 
+    def test_doc_add_image_can_anchor_near_paragraph(self):
+        path = self._path("anchored.docx")
+        image_path = self._path("figure.png")
+
+        doc = Document()
+        doc.add_paragraph("Alpha")
+        doc.add_paragraph("Beta")
+        doc.save(path)
+
+        Image.new("RGB", (40, 20), color="navy").save(image_path)
+
+        result = self.client.add_image(
+            path,
+            image_path,
+            width_inches=1.0,
+            caption="Figure 1",
+            paragraph_index=0,
+            position="after",
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["paragraph_index"], 0)
+        self.assertEqual(result["position"], "after")
+
+        updated = Document(path)
+        self.assertEqual(updated.paragraphs[0].text, "Alpha")
+        self.assertEqual(updated.paragraphs[2].text, "Figure 1")
+        self.assertEqual(updated.paragraphs[3].text, "Beta")
+        self.assertTrue(updated.paragraphs[1].paragraph_format.keep_with_next)
+        self.assertTrue(updated.paragraphs[2].paragraph_format.keep_together)
+
+    def test_preview_document_reuses_pdf_render_pipeline(self):
+        path = self._path("preview.docx")
+        self.client.create_document(path, "Title", "Intro")
+        output_dir = self._path("previews")
+
+        captured = {}
+
+        def fake_doc_to_pdf(file_path, output_path=None):
+            self.assertEqual(file_path, path)
+            self.assertIsNotNone(output_path)
+            with open(output_path, "wb") as f:
+                f.write(b"%PDF-1.4 fake")
+            captured["pdf_path"] = output_path
+            return {
+                "success": True,
+                "input_file": file_path,
+                "output_file": output_path,
+                "pages": 2,
+            }
+
+        def fake_pdf_page_to_image(file_path, render_dir, pages=None, dpi=150, fmt="png"):
+            self.assertEqual(file_path, captured["pdf_path"])
+            self.assertTrue(os.path.exists(file_path))
+            self.assertEqual(render_dir, output_dir)
+            self.assertEqual(pages, "0-1")
+            self.assertEqual(dpi, 200)
+            self.assertEqual(fmt, "jpg")
+            return {
+                "success": True,
+                "total_pages": 2,
+                "pages_rendered": 2,
+                "images": [{"page": 0, "file": os.path.join(render_dir, "page_000.jpg")}],
+            }
+
+        with mock.patch.object(self.client, "doc_to_pdf", side_effect=fake_doc_to_pdf):
+            with mock.patch.object(
+                self.client, "pdf_page_to_image", side_effect=fake_pdf_page_to_image
+            ):
+                result = self.client.preview_document(
+                    path, output_dir, pages="0-1", dpi=200, fmt="jpg"
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["total_pages"], 2)
+        self.assertEqual(result["pages_rendered"], 2)
+        self.assertEqual(result["format"], "jpg")
+        self.assertFalse(os.path.exists(captured["pdf_path"]))
+
     def test_cli_help_exposes_hardened_commands(self):
         proc = subprocess.run(
             ["cli-anything-onlyoffice", "help", "--json"],
@@ -125,6 +206,10 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
         sheet = payload["categories"]["SPREADSHEETS (.xlsx)"]
         self.assertIn(
             "doc-format <file> <paragraph_index> [--bold] [--italic] [--underline] [--font-name <name>] [--font-size <n>] [--color <hex>] [--align <left|center|right|justify>]",
+            docs,
+        )
+        self.assertIn(
+            "doc-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]",
             docs,
         )
         self.assertIn(

@@ -942,7 +942,7 @@ def cmd_status(json_output=False):
             "rdf_query": rdflib_available,
             "rdf_validate": shacl_available,
         },
-        "total_commands": 103,
+        "total_commands": 105,
     }
     print_result(result, json_output)
 
@@ -977,7 +977,7 @@ def cmd_help(json_output=False):
                 "doc-list-styles <file>": "List all available paragraph/character styles",
                 "doc-add-table <file> <headers_csv> <data_csv>": "Add table (rows separated by ;)",
                 "doc-read-tables <file>": "Read all tables from document",
-                "doc-add-image <file> <image_path> [--width <in>] [--caption <text>]": "Add image with optional caption",
+                "doc-add-image <file> <image_path> [--width <in>] [--caption <text>] [--paragraph <index>] [--position before|after]": "Add image with optional caption near a paragraph",
                 "doc-add-hyperlink <file> <text> <url> [--paragraph <index>]": "Add hyperlink (-1 = new paragraph)",
                 "doc-add-page-break <file>": "Insert page break",
                 "doc-add-list <file> <items_csv> [--type bullet|number]": "Add bulleted or numbered list (items separated by ;)",
@@ -988,6 +988,7 @@ def cmd_help(json_output=False):
                 "doc-word-count <file>": "Word/character/paragraph counts",
                 "doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]": "Extract all embedded images from .docx",
                 "doc-to-pdf <file> [output_path]": "Convert .docx to PDF via OnlyOffice",
+                "doc-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]": "Render DOCX pages as images via OnlyOffice",
             },
             "SPREADSHEETS (.xlsx)": {
                 "xlsx-create <file> [sheet]": "Create new .xlsx spreadsheet",
@@ -1085,7 +1086,7 @@ def cmd_help(json_output=False):
             "python_pptx": PPTX_AVAILABLE,
             "rdflib": rdflib_available,
         },
-        "total_commands": 103,
+        "total_commands": 105,
         "examples": [
             "# Documents",
             "cli-anything-onlyoffice doc-create /tmp/essay.docx 'My Essay' 'Introduction paragraph here'",
@@ -1093,6 +1094,7 @@ def cmd_help(json_output=False):
             "cli-anything-onlyoffice doc-search /tmp/essay.docx 'introduction'",
             "cli-anything-onlyoffice doc-add-hyperlink /tmp/essay.docx 'Click here' 'https://example.com'",
             "cli-anything-onlyoffice doc-add-list /tmp/essay.docx 'First item;Second item;Third item' --type bullet",
+            "cli-anything-onlyoffice doc-preview /tmp/essay.docx /tmp/doc-preview --pages 1-2",
             "cli-anything-onlyoffice doc-word-count /tmp/essay.docx",
             "# Spreadsheets",
             "cli-anything-onlyoffice xlsx-write /tmp/data.xlsx 'Name,Score' 'Alice,90;Bob,85' --sheet Grades",
@@ -1324,13 +1326,15 @@ def main():
             print_result(
                 {
                     "success": False,
-                    "error": "Usage: doc-add-image <file> <image_path> [--width <inches>] [--caption <text>]",
+                    "error": "Usage: doc-add-image <file> <image_path> [--width <inches>] [--caption <text>] [--paragraph <index>] [--position before|after]",
                 },
                 json_output,
             )
         else:
             width = 5.5
             caption = None
+            paragraph_index = None
+            position = "after"
             i = 2
             while i < len(args.args):
                 if args.args[i] == "--width" and i + 1 < len(args.args):
@@ -1339,9 +1343,22 @@ def main():
                 elif args.args[i] == "--caption" and i + 1 < len(args.args):
                     caption = args.args[i + 1]
                     i += 2
+                elif args.args[i] == "--paragraph" and i + 1 < len(args.args):
+                    paragraph_index = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--position" and i + 1 < len(args.args):
+                    position = args.args[i + 1]
+                    i += 2
                 else:
                     i += 1
-            result = doc_server.add_image(args.args[0], args.args[1], width_inches=width, caption=caption)
+            result = doc_server.add_image(
+                args.args[0],
+                args.args[1],
+                width_inches=width,
+                caption=caption,
+                paragraph_index=paragraph_index,
+                position=position,
+            )
             print_result(result, json_output)
 
     elif args.command == "doc-layout":
@@ -2990,6 +3007,37 @@ def main():
         else:
             out_path = args.args[1] if len(args.args) >= 2 else None
             result = doc_server.doc_to_pdf(args.args[0], output_path=out_path)
+            print_result(result, json_output)
+
+    elif args.command == "doc-preview":
+        if len(args.args) < 2:
+            print_result(
+                {
+                    "success": False,
+                    "error": "Usage: doc-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]",
+                },
+                json_output,
+            )
+        else:
+            pages = None
+            dpi = 150
+            fmt = "png"
+            i = 2
+            while i < len(args.args):
+                if args.args[i] == "--pages" and i + 1 < len(args.args):
+                    pages = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--dpi" and i + 1 < len(args.args):
+                    dpi = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--format" and i + 1 < len(args.args):
+                    fmt = args.args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.preview_document(
+                args.args[0], args.args[1], pages=pages, dpi=dpi, fmt=fmt
+            )
             print_result(result, json_output)
 
     elif args.command == "pptx-extract-images":

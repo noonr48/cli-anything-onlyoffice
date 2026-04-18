@@ -1009,8 +1009,13 @@ class DocumentServerClient:
             return {"success": False, "error": str(e)}
 
     def add_image(
-        self, file_path: str, image_path: str,
-        width_inches: float = 5.5, caption: str = None
+        self,
+        file_path: str,
+        image_path: str,
+        width_inches: float = 5.5,
+        caption: str = None,
+        paragraph_index: int = None,
+        position: str = "after",
     ) -> Dict[str, Any]:
         """Add an image to a Word document with optional caption.
         Supports PNG, JPG, GIF, BMP, TIFF."""
@@ -1018,22 +1023,53 @@ class DocumentServerClient:
             return {"success": False, "error": "python-docx not installed"}
         if not os.path.exists(image_path):
             return {"success": False, "error": f"Image not found: {image_path}"}
+        position = position.lower()
+        if position not in {"before", "after"}:
+            return {"success": False, "error": "position must be 'before' or 'after'"}
         try:
             with self._file_lock(file_path):
                 backup = self._snapshot_backup(file_path)
                 doc = Document(file_path)
+                total = len(doc.paragraphs)
+                if paragraph_index is not None and (
+                    paragraph_index < 0 or paragraph_index >= total
+                ):
+                    return {
+                        "success": False,
+                        "error": f"Paragraph index {paragraph_index} out of range (0..{total - 1})",
+                    }
                 # Add image paragraph, centered
                 para = doc.add_paragraph()
                 para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                para.paragraph_format.space_before = Pt(0)
+                para.paragraph_format.space_after = Pt(0)
                 run = para.add_run()
                 run.add_picture(image_path, width=Inches(width_inches))
                 # Add caption below image if provided
+                cap_para = None
                 if caption:
+                    para.paragraph_format.keep_with_next = True
                     cap_para = doc.add_paragraph()
                     cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    cap_para.paragraph_format.space_before = Pt(0)
+                    cap_para.paragraph_format.space_after = Pt(0)
+                    cap_para.paragraph_format.keep_together = True
                     cap_run = cap_para.add_run(caption)
                     cap_run.italic = True
                     cap_run.font.size = Pt(10)
+                if paragraph_index is not None:
+                    body = doc.element.body
+                    ref = doc.paragraphs[paragraph_index]._element
+                    elements = [para._element]
+                    if cap_para is not None:
+                        elements.append(cap_para._element)
+                    for element in elements:
+                        body.remove(element)
+                    insert_at = body.index(ref)
+                    if position == "after":
+                        insert_at += 1
+                    for offset, element in enumerate(elements):
+                        body.insert(insert_at + offset, element)
                 self._safe_save(doc, file_path)
             return {
                 "success": True,
@@ -1041,6 +1077,8 @@ class DocumentServerClient:
                 "image": image_path,
                 "width_inches": width_inches,
                 "caption": caption,
+                "paragraph_index": paragraph_index,
+                "position": "append" if paragraph_index is None else position,
                 "backup": backup or None,
             }
         except Exception as e:
@@ -5551,6 +5589,52 @@ class DocumentServerClient:
             return {"success": False, "error": "Docker not found. Is it installed?"}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def preview_document(
+        self,
+        file_path: str,
+        output_dir: str,
+        pages: str = None,
+        dpi: int = 150,
+        fmt: str = "png",
+    ) -> Dict[str, Any]:
+        """Render DOCX pages as images via OnlyOffice conversion + PyMuPDF."""
+        pdf_path = None
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            fd, pdf_path = tempfile.mkstemp(
+                prefix=f".{Path(file_path).stem}_preview_",
+                suffix=".pdf",
+                dir=output_dir,
+            )
+            os.close(fd)
+
+            pdf_result = self.doc_to_pdf(file_path, output_path=pdf_path)
+            if not pdf_result.get("success"):
+                return pdf_result
+
+            render_result = self.pdf_page_to_image(
+                pdf_path, output_dir, pages=pages, dpi=dpi, fmt=fmt
+            )
+            if not render_result.get("success"):
+                return render_result
+
+            return {
+                "success": True,
+                "file": str(Path(file_path).resolve()),
+                "output_dir": output_dir,
+                "total_pages": render_result["total_pages"],
+                "pages_rendered": render_result["pages_rendered"],
+                "dpi": dpi,
+                "format": fmt,
+                "images": render_result["images"],
+            }
+        finally:
+            if pdf_path:
+                try:
+                    os.unlink(pdf_path)
+                except OSError:
+                    pass
 
     # ==================== RDF OPERATIONS ====================
 
