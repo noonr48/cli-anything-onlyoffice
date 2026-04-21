@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="cli-anything-onlyoffice",
-    version="4.1.0",
+    version="4.4.11",
     description="CLI for OnlyOffice Desktop Editors + RDF Knowledge Graphs",
     author="SLOANE OS",
     author_email="sloane@local",

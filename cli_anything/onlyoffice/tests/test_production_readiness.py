@@ -4,15 +4,25 @@ import os
 import subprocess
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
+from zipfile import ZipFile, ZIP_DEFLATED
 from contextlib import redirect_stdout
 from unittest import mock
 
 import fitz
 from docx import Document
+from docx.shared import Pt
 from openpyxl import Workbook, load_workbook
 from PIL import Image
 
 from cli_anything.onlyoffice.core import cli as cli_module
+from cli_anything.onlyoffice.core.command_registry import (
+    COMMAND_CATEGORIES,
+    HELP_EXAMPLES,
+    TOTAL_COMMANDS,
+    VERSION,
+    command_usage,
+)
 from cli_anything.onlyoffice.utils.docserver import get_client
 
 
@@ -198,6 +208,230 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
         self.assertEqual(result["format"], "jpg")
         self.assertFalse(os.path.exists(captured["pdf_path"]))
 
+    def test_doc_layout_supports_named_page_size(self):
+        path = self._path("layout_a4.docx")
+        self.client.create_document(path, "Title", "Body")
+
+        result = self.client.set_page_layout(path, page_size="A4")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["page_size"], "A4")
+
+        doc = Document(path)
+        section = doc.sections[0]
+        width_mm = round(section.page_width / 36000.0, 1)
+        height_mm = round(section.page_height / 36000.0, 1)
+        self.assertAlmostEqual(width_mm, 210.0, places=1)
+        self.assertAlmostEqual(height_mm, 297.0, places=1)
+
+    def test_doc_layout_preserves_existing_orientation_when_only_size_changes(self):
+        path = self._path("layout_preserve_orientation.docx")
+        self.client.create_document(path, "Title", "Body")
+        self.client.set_page_layout(path, orientation="landscape")
+
+        result = self.client.set_page_layout(path, page_size="A4")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["orientation"], "landscape")
+        doc = Document(path)
+        section = doc.sections[0]
+        self.assertGreater(section.page_width, section.page_height)
+
+    def test_doc_sanitize_removes_comments_and_clears_metadata(self):
+        path = self._path("sanitize_comments.docx")
+        self.client.create_document(path, "Title", "Body")
+        self.client.set_metadata(
+            path,
+            author="Original Author",
+            title="Assignment Draft",
+            subject="Research Methods",
+            keywords="draft,metadata",
+            comments="Internal note",
+            category="Assignments",
+        )
+        comment_result = self.client.add_comment(path, "Review note", 0)
+        self.assertTrue(comment_result["success"])
+
+        before = self.client.inspect_hidden_data(path)
+        self.assertTrue(before["success"])
+        self.assertTrue(before["comments_part_present"])
+        self.assertGreaterEqual(before["comments_count"], 1)
+        self.assertEqual(before["core_properties"]["author"], "Original Author")
+
+        result = self.client.sanitize_document(
+            path,
+            remove_comments=True,
+            clear_metadata=True,
+            author="benbi",
+        )
+
+        self.assertTrue(result["success"])
+        after = result["after"]
+        self.assertFalse(after["comments_part_present"])
+        self.assertEqual(after["comments_count"], 0)
+        self.assertEqual(after["comment_reference_count"], 0)
+        self.assertEqual(after["core_properties"]["author"], "benbi")
+        self.assertEqual(after["core_properties"]["title"], "")
+        self.assertTrue(after["remove_personal_information"])
+
+    def test_doc_sanitize_accepts_revisions_and_removes_custom_xml(self):
+        path = self._path("sanitize_revisions.docx")
+        self.client.create_document(path, "Title", "Keep")
+
+        with ZipFile(path, "r") as zin:
+            files = {name: zin.read(name) for name in zin.namelist()}
+
+        ns = {
+            "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+            "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
+            "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+        }
+        ET.register_namespace("w", ns["w"])
+        root = ET.fromstring(files["word/document.xml"])
+        body = root.find("w:body", ns)
+        para = body.find("w:p", ns)
+        run = para.find("w:r", ns)
+        para.remove(run)
+        ins = ET.Element(f"{{{ns['w']}}}ins")
+        ins.append(run)
+        para.append(ins)
+        deleted = ET.Element(f"{{{ns['w']}}}del")
+        del_run = ET.SubElement(deleted, f"{{{ns['w']}}}r")
+        del_text = ET.SubElement(del_run, f"{{{ns['w']}}}delText")
+        del_text.text = "RemoveMe"
+        para.append(deleted)
+        files["word/document.xml"] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+        files["customXml/item1.xml"] = b'<?xml version="1.0" encoding="UTF-8"?><root>secret</root>'
+        files["customXml/_rels/item1.xml.rels"] = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+        )
+        files["customXml/itemProps1.xml"] = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<ds:datastoreItem xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml"></ds:datastoreItem>'
+        )
+        ct_root = ET.fromstring(files["[Content_Types].xml"])
+        override = ET.SubElement(ct_root, f"{{{ns['ct']}}}Override")
+        override.set("PartName", "/customXml/item1.xml")
+        override.set("ContentType", "application/xml")
+        files["[Content_Types].xml"] = ET.tostring(ct_root, encoding="utf-8", xml_declaration=True)
+
+        with ZipFile(path, "w", compression=ZIP_DEFLATED) as zout:
+            for name, data in files.items():
+                zout.writestr(name, data)
+
+        before = self.client.inspect_hidden_data(path)
+        self.assertTrue(before["tracked_changes_present"])
+        self.assertGreater(before["custom_xml_part_count"], 0)
+
+        result = self.client.sanitize_document(
+            path,
+            accept_revisions=True,
+            remove_custom_xml=True,
+        )
+        self.assertTrue(result["success"])
+
+        after = result["after"]
+        self.assertFalse(after["tracked_changes_present"])
+        self.assertEqual(after["custom_xml_part_count"], 0)
+        self.assertEqual(after["custom_xml_support_part_count"], 0)
+        doc = Document(path)
+        self.assertEqual(doc.paragraphs[1].text, "Keep")
+
+    def test_pdf_sanitize_clears_metadata_and_xmp(self):
+        path = self._path("sanitize.pdf")
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "Submission copy")
+        doc.set_metadata(
+            {
+                "author": "Original Author",
+                "title": "Draft",
+                "subject": "Subject",
+                "keywords": "alpha,beta",
+                "creator": "OnlyOffice",
+                "producer": "OnlyOffice",
+            }
+        )
+        if hasattr(doc, "set_xml_metadata"):
+            doc.set_xml_metadata("<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'></rdf:RDF></x:xmpmeta>")
+        doc.save(path)
+        doc.close()
+
+        result = self.client.pdf_sanitize(
+            path,
+            clear_metadata=True,
+            remove_xml_metadata=True,
+            author="benbi",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["after"]["author"], "benbi")
+        self.assertEqual(result["after"]["title"], "")
+        self.assertFalse(result["has_xml_metadata"])
+
+    def test_doc_preflight_flags_mixed_fonts_and_metadata(self):
+        path = self._path("preflight.docx")
+        doc = Document()
+        first = doc.add_paragraph()
+        first.add_run("Times paragraph")
+        second = doc.add_paragraph()
+        run = second.add_run("Calibri paragraph")
+        run.font.name = "Calibri"
+        run.font.size = Pt(12)
+        doc.save(path)
+        self.client.set_page_layout(path, page_size="A4")
+        self.client.set_metadata(path, author="benbi", title="Draft")
+
+        result = self.client.document_preflight(
+            path,
+            expected_page_size="A4",
+            expected_font_name="Times New Roman",
+            expected_font_size=11,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["overall_status"], "warn")
+        check_status = {check["name"]: check["status"] for check in result["checks"]}
+        self.assertEqual(check_status["page_size"], "pass")
+        self.assertEqual(check_status["metadata"], "warn")
+        self.assertEqual(check_status["font_names"], "warn")
+        self.assertEqual(check_status["font_sizes"], "warn")
+        self.assertEqual(result["font_audit"]["unexpected_font_run_count"], 2)
+        self.assertEqual(result["font_audit"]["unexpected_size_run_count"], 2)
+
+    def test_pdf_inspect_hidden_data_reports_metadata_and_annotations(self):
+        path = self._path("inspect_hidden.pdf")
+        doc = fitz.open()
+        page = doc.new_page(width=595.0, height=842.0)
+        page.insert_text((72, 72), "Annotated")
+        page.add_highlight_annot(fitz.Rect(70, 60, 150, 84))
+        doc.set_metadata(
+            {
+                "author": "benbi",
+                "title": "Inspection",
+                "subject": "PDF hidden data",
+                "creator": "OnlyOffice CLI Tests",
+            }
+        )
+        if hasattr(doc, "set_xml_metadata"):
+            doc.set_xml_metadata(
+                "<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'></rdf:RDF></x:xmpmeta>"
+            )
+        doc.save(path)
+        doc.close()
+
+        result = self.client.inspect_pdf_hidden_data(path)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["pages"], 1)
+        self.assertEqual(result["page_size_labels"], ["A4"])
+        self.assertTrue(result["page_size_consistent"])
+        self.assertGreaterEqual(result["annotations_count"], 1)
+        self.assertEqual(result["nonempty_metadata"]["author"], "benbi")
+        self.assertTrue(result["has_xml_metadata"])
+
     def test_cli_help_exposes_hardened_commands(self):
         proc = subprocess.run(
             ["cli-anything-onlyoffice", "help", "--json"],
@@ -206,6 +440,11 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             check=True,
         )
         payload = json.loads(proc.stdout)
+        self.assertEqual(payload["version"], VERSION)
+        self.assertEqual(payload["total_commands"], TOTAL_COMMANDS)
+        self.assertEqual(payload["examples"], HELP_EXAMPLES)
+        self.assertEqual(payload["categories"]["DOCUMENTS (.docx)"], COMMAND_CATEGORIES["DOCUMENTS (.docx)"])
+        self.assertEqual(payload["categories"]["PDF (.pdf)"], COMMAND_CATEGORIES["PDF (.pdf)"])
         docs = payload["categories"]["DOCUMENTS (.docx)"]
         sheet = payload["categories"]["SPREADSHEETS (.xlsx)"]
         self.assertIn(
@@ -217,6 +456,19 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             docs,
         )
         self.assertIn("doc-render-map <file>", docs)
+        self.assertIn(
+            "doc-layout <file> [--size A4|Letter] [--orientation portrait|landscape] [--margin-* <in>] [--header <text>] [--page-numbers]",
+            docs,
+        )
+        self.assertIn("doc-inspect-hidden-data <file>", docs)
+        self.assertIn(
+            "doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--author <a>]",
+            docs,
+        )
+        self.assertIn(
+            "doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>]",
+            docs,
+        )
         self.assertIn(
             "xlsx-calc <file> <column> <op> [--sheet <name>] [--include-formulas] [--strict-formulas]",
             sheet,
@@ -234,6 +486,11 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             "pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]",
             pdf,
         )
+        self.assertIn(
+            "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>]",
+            pdf,
+        )
+        self.assertIn("pdf-inspect-hidden-data <file>", pdf)
         general = payload["categories"]["GENERAL"]
         self.assertIn(
             "editor-session <file> [--open] [--wait <sec>] [--activate]",
@@ -244,12 +501,42 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             general,
         )
 
+    def test_cli_status_reports_registry_version_and_count(self):
+        proc = subprocess.run(
+            ["cli-anything-onlyoffice", "status", "--json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["version"], VERSION)
+        self.assertEqual(payload["total_commands"], TOTAL_COMMANDS)
+
+    def test_cli_doc_usage_error_comes_from_registry(self):
+        stdout = io.StringIO()
+        with mock.patch("sys.argv", ["cli-anything-onlyoffice", "doc-create", "--json"]):
+            with redirect_stdout(stdout):
+                cli_module.main()
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error"], command_usage("doc-create"))
+
+    def test_cli_general_usage_error_comes_from_registry(self):
+        stdout = io.StringIO()
+        with mock.patch("sys.argv", ["cli-anything-onlyoffice", "open", "--json"]):
+            with redirect_stdout(stdout):
+                cli_module.main()
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error"], command_usage("open"))
+
     def test_agent_style_open_alias_opens_spreadsheet(self):
         path = self._path("alias.xlsx")
         Workbook().save(path)
         stdout = io.StringIO()
 
-        with mock.patch.object(cli_module.subprocess, "Popen") as popen:
+        with mock.patch("cli_anything.onlyoffice.core.general_cli.subprocess.Popen") as popen:
             with mock.patch(
                 "sys.argv", ["cli-anything-onlyoffice", "document.open", path, "--json"]
             ):
@@ -455,6 +742,154 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             case_sensitive=True,
             include_spans=True,
         )
+
+    def test_cli_doc_sanitize_dispatches_to_docserver(self):
+        path = self._path("dispatch.docx")
+        self.client.create_document(path, "Dispatch", "Body")
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "sanitize_document",
+            return_value={"success": True, "file": path, "after": {}},
+        ) as sanitize_document:
+            with mock.patch(
+                "sys.argv",
+                [
+                    "cli-anything-onlyoffice",
+                    "doc-sanitize",
+                    path,
+                    "--remove-comments",
+                    "--clear-metadata",
+                    "--author",
+                    "benbi",
+                    "--json",
+                ],
+            ):
+                with redirect_stdout(stdout):
+                    cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["success"])
+        sanitize_document.assert_called_once_with(
+            path,
+            output_path=None,
+            remove_comments=True,
+            accept_revisions=False,
+            clear_metadata=True,
+            remove_custom_xml=False,
+            set_remove_personal_information=False,
+            author="benbi",
+            title=None,
+            subject=None,
+            keywords=None,
+        )
+
+    def test_cli_doc_preflight_dispatches_to_docserver(self):
+        path = self._path("dispatch_preflight.docx")
+        self.client.create_document(path, "Dispatch", "Body")
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "document_preflight",
+            return_value={"success": True, "file": path, "overall_status": "pass", "checks": []},
+        ) as document_preflight:
+            with mock.patch(
+                "sys.argv",
+                [
+                    "cli-anything-onlyoffice",
+                    "doc-preflight",
+                    path,
+                    "--expected-page-size",
+                    "A4",
+                    "--expected-font",
+                    "Times New Roman",
+                    "--expected-font-size",
+                    "12",
+                    "--json",
+                ],
+            ):
+                with redirect_stdout(stdout):
+                    cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["success"])
+        document_preflight.assert_called_once_with(
+            path,
+            expected_page_size="A4",
+            expected_font_name="Times New Roman",
+            expected_font_size=12.0,
+        )
+
+    def test_cli_pdf_sanitize_dispatches_to_docserver(self):
+        path = self._path("dispatch_meta.pdf")
+        with open(path, "wb") as handle:
+            handle.write(b"%PDF-1.4")
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "pdf_sanitize",
+            return_value={"success": True, "file": path, "after": {}},
+        ) as pdf_sanitize:
+            with mock.patch(
+                "sys.argv",
+                [
+                    "cli-anything-onlyoffice",
+                    "pdf-sanitize",
+                    path,
+                    "--clear-metadata",
+                    "--remove-xml-metadata",
+                    "--author",
+                    "benbi",
+                    "--json",
+                ],
+            ):
+                with redirect_stdout(stdout):
+                    cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["success"])
+        pdf_sanitize.assert_called_once_with(
+            path,
+            output_path=None,
+            clear_metadata=True,
+            remove_xml_metadata=True,
+            author="benbi",
+            title=None,
+            subject=None,
+            keywords=None,
+            creator=None,
+            producer=None,
+        )
+
+    def test_cli_pdf_inspect_hidden_data_dispatches_to_docserver(self):
+        path = self._path("dispatch_hidden.pdf")
+        with open(path, "wb") as handle:
+            handle.write(b"%PDF-1.4")
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "inspect_pdf_hidden_data",
+            return_value={"success": True, "file": path, "pages": 1},
+        ) as inspect_pdf_hidden_data:
+            with mock.patch(
+                "sys.argv",
+                [
+                    "cli-anything-onlyoffice",
+                    "pdf-inspect-hidden-data",
+                    path,
+                    "--json",
+                ],
+            ):
+                with redirect_stdout(stdout):
+                    cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["success"])
+        inspect_pdf_hidden_data.assert_called_once_with(path)
 
     def test_preview_spreadsheet_reuses_pdf_render_pipeline(self):
         path = self._path("preview.xlsx")

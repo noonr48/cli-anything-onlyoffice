@@ -16,10 +16,18 @@ import fcntl
 import re
 import hashlib
 import threading
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from contextlib import contextmanager
+from zipfile import ZipFile, ZIP_DEFLATED
+
+from cli_anything.onlyoffice.utils.doc_ops import DocumentOperations
+from cli_anything.onlyoffice.utils.pdf_ops import PDFOperations
+from cli_anything.onlyoffice.utils.pptx_ops import PPTXOperations
+from cli_anything.onlyoffice.utils.rdf_ops import RDFOperations
+from cli_anything.onlyoffice.utils.xlsx_ops import XLSXOperations
 
 # Module-level per-path thread locks — serialises same-process threads before
 # flock takes over for cross-process serialisation.
@@ -58,10 +66,6 @@ except ImportError:
 
 try:
     from pptx import Presentation
-    from pptx.util import Inches, Pt, Emu
-    from pptx.enum.text import PP_ALIGN
-    from pptx.dml.color import RGBColor
-    from pptx.util import Inches, Pt
 
     PPTX_AVAILABLE = True
 except ImportError:
@@ -73,6 +77,22 @@ try:
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
+
+
+OOXML_NS = {
+    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+    "cp": "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "dcterms": "http://purl.org/dc/terms/",
+    "xsi": "http://www.w3.org/2001/XMLSchema-instance",
+    "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
+    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+}
+
+DOCX_PAGE_SIZES = {
+    "a4": ("A4", (210.0, 297.0)),
+    "letter": ("Letter", (215.9, 279.4)),
+}
 
 
 class DocumentServerClient:
@@ -91,6 +111,11 @@ class DocumentServerClient:
         self._lock_timeout_seconds = int(
             os.environ.get("ONLYOFFICE_LOCK_TIMEOUT", "15")
         )
+        self._doc_ops = DocumentOperations(self)
+        self._pdf_ops = PDFOperations(self)
+        self._pptx_ops = PPTXOperations(self)
+        self._rdf_ops = RDFOperations(self)
+        self._xlsx_ops = XLSXOperations(self)
         self.supported_formula_functions = {
             "SUM",
             "AVERAGE",
@@ -106,6 +131,10 @@ class DocumentServerClient:
     def _file_key(self, file_path: str) -> str:
         abs_path = str(Path(file_path).resolve())
         return hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:10]
+
+    def _lock_path(self, file_path: str) -> Path:
+        abs_path = str(Path(file_path).resolve())
+        return self.backup_dir / f"{self._file_key(abs_path)}.lock"
 
     @contextmanager
     def _file_lock(self, file_path: str):
@@ -124,7 +153,7 @@ class DocumentServerClient:
             tlock = _thread_lock_map[abs_path]
 
         with tlock:  # serialise threads within this process
-            lock_path = f"{file_path}.lock"
+            lock_path = str(self._lock_path(abs_path))
             lock_file = open(lock_path, "w")
             deadline = time.monotonic() + self._lock_timeout_seconds
             acquired = False
@@ -153,6 +182,292 @@ class DocumentServerClient:
                     os.unlink(lock_path)
                 except OSError:
                     pass
+
+    @staticmethod
+    def _current_orientation(section) -> str:
+        return "landscape" if section.page_width > section.page_height else "portrait"
+
+    @staticmethod
+    def _custom_xml_summary(names: List[str]) -> Dict[str, List[str]]:
+        all_parts = sorted(name for name in names if name.startswith("customXml/"))
+        payload_parts = sorted(
+            name
+            for name in all_parts
+            if name.count("/") == 1
+            and name.endswith(".xml")
+            and not Path(name).name.startswith("itemProps")
+        )
+        support_parts = sorted(name for name in all_parts if name not in payload_parts)
+        return {
+            "all_parts": all_parts,
+            "payload_parts": payload_parts,
+            "support_parts": support_parts,
+        }
+
+    @staticmethod
+    def _atomic_zip_write(files: Dict[str, bytes], target_path: str) -> None:
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        )
+        os.close(fd)
+        try:
+            with ZipFile(tmp_path, "w", compression=ZIP_DEFLATED) as zout:
+                for name, data in files.items():
+                    zout.writestr(name, data)
+            os.replace(tmp_path, str(target))
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    @staticmethod
+    def _resolve_page_size(page_size: Optional[str]) -> Optional[Tuple[str, int, int]]:
+        if not page_size:
+            return None
+        key = str(page_size).strip().lower()
+        if key not in DOCX_PAGE_SIZES:
+            raise ValueError(
+                f"Unsupported page size '{page_size}'. Supported: {', '.join(sorted(name.upper() for name in DOCX_PAGE_SIZES))}"
+            )
+        label, (width_mm, height_mm) = DOCX_PAGE_SIZES[key]
+        return label, Mm(width_mm), Mm(height_mm)
+
+    @staticmethod
+    def _label_page_size(width_emu: int, height_emu: int) -> str:
+        if not width_emu or not height_emu:
+            return "Unknown"
+        width_mm = round(float(width_emu) / 36000.0, 1)
+        height_mm = round(float(height_emu) / 36000.0, 1)
+        dims = sorted([width_mm, height_mm])
+        for label, (expected_w, expected_h) in DOCX_PAGE_SIZES.values():
+            expected_dims = sorted([expected_w, expected_h])
+            if all(abs(a - b) <= 1.5 for a, b in zip(dims, expected_dims)):
+                return label
+        return f"{width_mm}x{height_mm} mm"
+
+    @staticmethod
+    def _label_pdf_page_size(width_pts: float, height_pts: float) -> str:
+        width_mm = round(float(width_pts) * 25.4 / 72.0, 1)
+        height_mm = round(float(height_pts) * 25.4 / 72.0, 1)
+        dims = sorted([width_mm, height_mm])
+        for label, (expected_w, expected_h) in DOCX_PAGE_SIZES.values():
+            expected_dims = sorted([expected_w, expected_h])
+            if all(abs(a - b) <= 1.5 for a, b in zip(dims, expected_dims)):
+                return label
+        return f"{width_mm}x{height_mm} mm"
+
+    @staticmethod
+    def _normalized_font_name(name: Optional[str]) -> str:
+        text = str(name or "").strip()
+        return re.sub(r"\s+", " ", text).lower()
+
+    def _document_sections_summary(self, doc) -> List[Dict[str, Any]]:
+        sections = []
+        for idx, section in enumerate(doc.sections):
+            page_width_in = round(section.page_width.inches, 3)
+            page_height_in = round(section.page_height.inches, 3)
+            usable_width_in = round(
+                section.page_width.inches
+                - section.left_margin.inches
+                - section.right_margin.inches,
+                3,
+            )
+            usable_height_in = round(
+                section.page_height.inches
+                - section.top_margin.inches
+                - section.bottom_margin.inches,
+                3,
+            )
+            sections.append(
+                {
+                    "section_index": idx,
+                    "page_size": self._label_page_size(
+                        section.page_width, section.page_height
+                    ),
+                    "orientation": self._current_orientation(section),
+                    "page_width_in": page_width_in,
+                    "page_height_in": page_height_in,
+                    "usable_width_in": usable_width_in,
+                    "usable_height_in": usable_height_in,
+                    "margins_in": {
+                        "top": round(section.top_margin.inches, 3),
+                        "bottom": round(section.bottom_margin.inches, 3),
+                        "left": round(section.left_margin.inches, 3),
+                        "right": round(section.right_margin.inches, 3),
+                    },
+                }
+            )
+        return sections
+
+    def _collect_text_runs(self, doc) -> List[Dict[str, Any]]:
+        runs_payload = []
+        normal_style = doc.styles["Normal"] if "Normal" in [s.name for s in doc.styles] else None
+
+        def iter_paragraphs():
+            for idx, para in enumerate(doc.paragraphs):
+                yield ("paragraph", idx, para)
+            for ti, table in enumerate(doc.tables):
+                for ri, row in enumerate(table.rows):
+                    for ci, cell in enumerate(row.cells):
+                        for pi, para in enumerate(cell.paragraphs):
+                            yield (f"table_{ti}_r{ri}_c{ci}", pi, para)
+
+        for location, para_idx, para in iter_paragraphs():
+            style_font = para.style.font if para.style is not None else None
+            for run_idx, run in enumerate(para.runs):
+                text = str(run.text or "")
+                if not text.strip():
+                    continue
+                font_name = (
+                    run.font.name
+                    or (style_font.name if style_font is not None else None)
+                    or (normal_style.font.name if normal_style is not None else None)
+                )
+                font_size = (
+                    (run.font.size.pt if run.font.size else None)
+                    or (
+                        style_font.size.pt
+                        if style_font is not None and style_font.size is not None
+                        else None
+                    )
+                    or (
+                        normal_style.font.size.pt
+                        if normal_style is not None and normal_style.font.size is not None
+                        else None
+                    )
+                )
+                runs_payload.append(
+                    {
+                        "location": location,
+                        "paragraph_index": para_idx,
+                        "run_index": run_idx,
+                        "text_preview": text[:60],
+                        "font_name": font_name,
+                        "font_name_normalized": self._normalized_font_name(font_name),
+                        "font_size": round(float(font_size), 2) if font_size else None,
+                        "bold": bool(run.bold) if run.bold is not None else False,
+                        "italic": bool(run.italic) if run.italic is not None else False,
+                    }
+                )
+        return runs_payload
+
+    @staticmethod
+    def _docx_story_xml_parts(names: List[str]) -> List[str]:
+        return sorted(
+            [
+                name
+                for name in names
+                if name == "word/document.xml"
+                or re.fullmatch(r"word/header\d+\.xml", name)
+                or re.fullmatch(r"word/footer\d+\.xml", name)
+                or name in {"word/footnotes.xml", "word/endnotes.xml"}
+            ]
+        )
+
+    @staticmethod
+    def _xml_local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+    def _rewrite_story_tree(
+        self,
+        elem,
+        *,
+        remove_comment_nodes: bool = False,
+        accept_revisions: bool = False,
+        stats: Optional[Dict[str, int]] = None,
+    ) -> None:
+        if stats is None:
+            stats = {}
+
+        comment_nodes = {"commentRangeStart", "commentRangeEnd", "commentReference"}
+        unwrap_nodes = {"ins", "moveTo"} if accept_revisions else set()
+        drop_nodes = (
+            {
+                "del",
+                "moveFrom",
+                "moveFromRangeStart",
+                "moveFromRangeEnd",
+                "moveToRangeStart",
+                "moveToRangeEnd",
+                "customXmlDelRangeStart",
+                "customXmlDelRangeEnd",
+                "customXmlInsRangeStart",
+                "customXmlInsRangeEnd",
+                "customXmlMoveFromRangeStart",
+                "customXmlMoveFromRangeEnd",
+                "customXmlMoveToRangeStart",
+                "customXmlMoveToRangeEnd",
+                "cellDel",
+                "cellMerge",
+            }
+            if accept_revisions
+            else set()
+        )
+
+        new_children = []
+        for child in list(elem):
+            self._rewrite_story_tree(
+                child,
+                remove_comment_nodes=remove_comment_nodes,
+                accept_revisions=accept_revisions,
+                stats=stats,
+            )
+            local = self._xml_local_name(child.tag)
+            if remove_comment_nodes and local in comment_nodes:
+                stats["comment_nodes_removed"] = stats.get("comment_nodes_removed", 0) + 1
+                continue
+            if accept_revisions and local in unwrap_nodes:
+                stats[f"{local}_accepted"] = stats.get(f"{local}_accepted", 0) + 1
+                new_children.extend(list(child))
+                continue
+            if accept_revisions and local in drop_nodes:
+                stats[f"{local}_removed"] = stats.get(f"{local}_removed", 0) + 1
+                continue
+            new_children.append(child)
+        elem[:] = new_children
+
+    @staticmethod
+    def _strip_docx_relationship_targets(files: Dict[str, bytes], predicate) -> None:
+        rel_tag = f"{{{OOXML_NS['rel']}}}Relationship"
+        for name, blob in list(files.items()):
+            if not name.endswith(".rels"):
+                continue
+            try:
+                root = ET.fromstring(blob)
+            except ET.ParseError:
+                continue
+            changed = False
+            kept = []
+            for child in list(root):
+                target = child.get("Target", "")
+                rel_type = child.get("Type", "")
+                if child.tag == rel_tag and predicate(target, rel_type):
+                    changed = True
+                    continue
+                kept.append(child)
+            if changed:
+                root[:] = kept
+                files[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    @staticmethod
+    def _strip_docx_content_types(files: Dict[str, bytes], predicate) -> None:
+        name = "[Content_Types].xml"
+        if name not in files:
+            return
+        root = ET.fromstring(files[name])
+        override_tag = f"{{{OOXML_NS['ct']}}}Override"
+        default_tag = f"{{{OOXML_NS['ct']}}}Default"
+        changed = False
+        kept = []
+        for child in list(root):
+            if child.tag in {override_tag, default_tag} and predicate(child):
+                changed = True
+                continue
+            kept.append(child)
+        if changed:
+            root[:] = kept
+            files[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     def _get_sheet(self, wb, sheet_name: str):
         """Get a worksheet with a friendly error if not found."""
@@ -365,82 +680,13 @@ class DocumentServerClient:
     def create_document(
         self, output_path: str, title: str = "", content: str = ""
     ) -> Dict[str, Any]:
-        """Create a new .docx document"""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(output_path):
-                backup = self._snapshot_backup(output_path)
-                doc = Document()
-                # Page layout: A4, 1" margins all sides
-                section = doc.sections[0]
-                section.page_width = Mm(210)
-                section.page_height = Mm(297)
-                section.top_margin = Pt(72)     # 1 inch = 72pt
-                section.bottom_margin = Pt(72)
-                section.left_margin = Pt(72)
-                section.right_margin = Pt(72)
-                # Normal style: Calibri 11pt, double spacing, 0pt space-after
-                normal = doc.styles["Normal"]
-                normal.font.name = "Calibri"
-                normal.font.size = Pt(11)
-                normal.paragraph_format.line_spacing_rule = WD_LINE_SPACING.DOUBLE
-                normal.paragraph_format.space_after = Pt(0)
-                if title:
-                    heading = doc.add_heading(title, 0)
-                    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                if content:
-                    for paragraph in content.split("\n"):
-                        if paragraph.strip():
-                            doc.add_paragraph(paragraph)
-                self._safe_save(doc, output_path)
-            return {
-                "success": True,
-                "file": output_path,
-                "title": title,
-                "size": Path(output_path).stat().st_size,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.create_document(output_path, title, content)
 
     def read_document(self, file_path: str) -> Dict[str, Any]:
-        """Read and extract all text from a .docx document"""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            doc = Document(file_path)
-            paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
-            return {
-                "success": True,
-                "file": file_path,
-                "paragraphs": paragraphs,
-                "paragraph_count": len(paragraphs),
-                "full_text": "\n\n".join(paragraphs),
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.read_document(file_path)
 
     def append_to_document(self, file_path: str, content: str) -> Dict[str, Any]:
-        """Append content to a .docx document"""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                for paragraph in content.split("\n"):
-                    if paragraph.strip():
-                        doc.add_paragraph(paragraph)
-                self._safe_save(doc, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "appended_length": len(content),
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.append_to_document(file_path, content)
 
     def _replace_across_runs(self, paragraph, search_text: str, replace_text: str) -> int:
         """Replace text that may span multiple runs while preserving run-level formatting.
@@ -499,25 +745,7 @@ class DocumentServerClient:
     def search_replace_document(
         self, file_path: str, search_text: str, replace_text: str
     ) -> Dict[str, Any]:
-        """Find and replace text in a .docx document (handles cross-run text splits)"""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                replacements = 0
-                for para in doc.paragraphs:
-                    replacements += self._replace_across_runs(para, search_text, replace_text)
-                self._safe_save(doc, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "replacements": replacements,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.search_replace_document(file_path, search_text, replace_text)
 
     # ==================== ADVANCED FORMATTING ====================
 
@@ -533,231 +761,35 @@ class DocumentServerClient:
         color: str = None,
         alignment: str = None,
     ) -> Dict[str, Any]:
-        """Apply formatting to a specific paragraph"""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                if paragraph_index >= len(doc.paragraphs):
-                    return {
-                        "success": False,
-                        "error": f"Paragraph index {paragraph_index} out of range",
-                    }
-                para = doc.paragraphs[paragraph_index]
-                run = para.runs[0] if para.runs else para.add_run("")
-                if bold:
-                    run.bold = True
-                if italic:
-                    run.italic = True
-                if underline:
-                    run.underline = True
-                if font_name:
-                    run.font.name = font_name
-                if font_size:
-                    run.font.size = Pt(font_size)
-                if color:
-                    run.font.color.rgb = RGBColor(*self._hex_to_rgb(color))
-                if alignment:
-                    para.alignment = self._get_alignment(alignment)
-                self._safe_save(doc, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "paragraph": paragraph_index,
-                "formatted": True,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.format_paragraph(
+            file_path,
+            paragraph_index,
+            bold,
+            italic,
+            underline,
+            font_name,
+            font_size,
+            color,
+            alignment,
+        )
 
     def highlight_text(
         self, file_path: str, search_text: str, color: str = "yellow"
     ) -> Dict[str, Any]:
-        """Highlight all occurrences of text in a document"""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                highlights = 0
-                for para in doc.paragraphs:
-                    for run in para.runs:
-                        if search_text in run.text:
-                            rPr = run._element.get_or_add_rPr()
-                            highlight = rPr.find(qn("w:highlight"))
-                            if highlight is None:
-                                highlight = OxmlElement("w:highlight")
-                                rPr.append(highlight)
-                            valid_colors = {"yellow", "green", "cyan", "magenta", "blue", "red", "darkBlue", "darkCyan", "darkGreen", "darkMagenta", "darkRed", "darkYellow", "darkGray", "lightGray", "black", "white", "none"}
-                            color_val = color if color and color.lower() in valid_colors else "yellow"
-                            highlight.set(qn("w:val"), color_val)
-                            highlights += 1
-                self._safe_save(doc, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "highlights": highlights,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.highlight_text(file_path, search_text, color)
 
     def add_table(
         self, file_path: str, headers_csv: str, data_csv: str
     ) -> Dict[str, Any]:
-        """Add a formatted table to a Word document.
-        headers: comma-separated. data: rows separated by ';', columns by ','."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            headers = [h.strip() for h in headers_csv.split(",")]
-            rows = [
-                [c.strip() for c in row.split(",")]
-                for row in data_csv.split(";")
-                if row.strip()
-            ]
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                table = doc.add_table(rows=1 + len(rows), cols=len(headers))
-                table.style = "Table Grid"
-                # Header row
-                for i, h in enumerate(headers):
-                    cell = table.rows[0].cells[i]
-                    cell.text = h
-                    for run in cell.paragraphs[0].runs:
-                        run.bold = True
-                # Data rows
-                for ri, row in enumerate(rows, 1):
-                    for ci, val in enumerate(row):
-                        if ci < len(headers):
-                            table.rows[ri].cells[ci].text = val
-                self._safe_save(doc, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "rows": len(rows),
-                "columns": len(headers),
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.add_table(file_path, headers_csv, data_csv)
 
     def add_comment(
         self, file_path: str, comment_text: str, paragraph_index: int = 0,
         author: str = "SLOANE Agent"
     ) -> Dict[str, Any]:
-        """Add a real OOXML comment annotation to a specific paragraph.
-        The comment will be visible in Word/OnlyOffice as a margin annotation."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            from lxml import etree as ET
-            from docx.opc.part import Part
-            from docx.opc.packuri import PackURI
-
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                if paragraph_index >= len(doc.paragraphs):
-                    return {
-                        "success": False,
-                        "error": f"Paragraph index {paragraph_index} out of range (max {len(doc.paragraphs) - 1})",
-                    }
-
-                W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-                R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-                COMMENTS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
-                COMMENTS_CT = "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"
-
-                part = doc.part
-                # Find existing comments part or create new one
-                comments_el = None
-                comments_part = None
-                for rel in part.rels.values():
-                    if "comments" in rel.reltype:
-                        comments_part = rel.target_part
-                        break
-
-                if comments_part is not None:
-                    # Parse existing comments XML
-                    comments_el = ET.fromstring(comments_part.blob)
-                else:
-                    # Create fresh comments XML
-                    comments_el = ET.Element(
-                        f"{{{W_NS}}}comments",
-                        nsmap={"w": W_NS, "r": R_NS}
-                    )
-                    blob = ET.tostring(comments_el, xml_declaration=True, encoding="UTF-8", standalone=True)
-                    comments_part = Part(
-                        PackURI("/word/comments.xml"), COMMENTS_CT, blob, part.package
-                    )
-                    part.relate_to(comments_part, COMMENTS_REL)
-
-                # Determine next comment ID (scan ALL w:comment elements including nested)
-                existing_ids = []
-                for c in comments_el.iter(f"{{{W_NS}}}comment"):
-                    cid = c.get(f"{{{W_NS}}}id")
-                    if cid is not None:
-                        try:
-                            existing_ids.append(int(cid))
-                        except ValueError:
-                            pass
-                comment_id = str(max(existing_ids, default=-1) + 1)
-
-                # Build <w:comment> element
-                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                comment_elem = ET.SubElement(comments_el, f"{{{W_NS}}}comment")
-                comment_elem.set(f"{{{W_NS}}}id", comment_id)
-                comment_elem.set(f"{{{W_NS}}}author", author)
-                comment_elem.set(f"{{{W_NS}}}date", now_str)
-                cp = ET.SubElement(comment_elem, f"{{{W_NS}}}p")
-                cr = ET.SubElement(cp, f"{{{W_NS}}}r")
-                ct = ET.SubElement(cr, f"{{{W_NS}}}t")
-                ct.text = comment_text
-
-                # Serialize back to the part
-                comments_part._blob = ET.tostring(
-                    comments_el, xml_declaration=True, encoding="UTF-8", standalone=True
-                )
-
-                # Annotate the target paragraph with commentRangeStart/End + reference
-                para_el = doc.paragraphs[paragraph_index]._element
-
-                range_start = OxmlElement("w:commentRangeStart")
-                range_start.set(qn("w:id"), comment_id)
-                range_end = OxmlElement("w:commentRangeEnd")
-                range_end.set(qn("w:id"), comment_id)
-
-                ref_run = OxmlElement("w:r")
-                ref_rpr = OxmlElement("w:rPr")
-                ref_style = OxmlElement("w:rStyle")
-                ref_style.set(qn("w:val"), "CommentReference")
-                ref_rpr.append(ref_style)
-                ref_run.append(ref_rpr)
-                comment_ref = OxmlElement("w:commentReference")
-                comment_ref.set(qn("w:id"), comment_id)
-                ref_run.append(comment_ref)
-
-                para_el.insert(0, range_start)
-                para_el.append(range_end)
-                para_el.append(ref_run)
-
-                self._safe_save(doc, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "comment_id": int(comment_id),
-                "comment_text": comment_text,
-                "paragraph_index": paragraph_index,
-                "author": author,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.add_comment(
+            file_path, comment_text, paragraph_index, author
+        )
 
     # ==================== APA REFERENCE MANAGEMENT ====================
 
@@ -794,51 +826,7 @@ class DocumentServerClient:
     def add_reference(
         self, file_path: str, ref_json: str
     ) -> Dict[str, Any]:
-        """Add a reference to the sidecar .refs.json file for later formatting.
-        ref_json is a JSON string with keys: author, year, title, source, volume, issue, pages, doi, url, type.
-        type: journal|book|chapter|website|report (default: journal)"""
-        try:
-            ref = json.loads(ref_json)
-            required = ["author", "year", "title"]
-            missing = [k for k in required if not ref.get(k)]
-            if missing:
-                return {"success": False, "error": f"Missing required fields: {missing}"}
-
-            refs_path = file_path + ".refs.json"
-            refs = []
-            if os.path.exists(refs_path):
-                with open(refs_path, "r") as f:
-                    refs = json.load(f)
-
-            # Deduplicate by author+year+title
-            sig = (ref["author"].strip().lower(), str(ref["year"]).strip(), ref["title"].strip().lower())
-            for existing in refs:
-                esig = (existing["author"].strip().lower(), str(existing["year"]).strip(), existing["title"].strip().lower())
-                if esig == sig:
-                    return {
-                        "success": True,
-                        "file": refs_path,
-                        "action": "duplicate_skipped",
-                        "total_refs": len(refs),
-                        "note": f"Reference already exists: {ref['author']} ({ref['year']})",
-                    }
-
-            ref.setdefault("type", "journal")
-            refs.append(ref)
-            with open(refs_path, "w") as f:
-                json.dump(refs, f, indent=2)
-
-            return {
-                "success": True,
-                "file": refs_path,
-                "action": "added",
-                "total_refs": len(refs),
-                "in_text_citation": self._apa_in_text(ref['author'], ref['year']),
-            }
-        except json.JSONDecodeError as e:
-            return {"success": False, "error": f"Invalid JSON: {e}"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.add_reference(file_path, ref_json)
 
     def _format_apa7_reference(self, ref: dict):
         """Format a single reference in APA 7th edition style.
@@ -926,87 +914,7 @@ class DocumentServerClient:
             return [S(f"{author} ({year}). {title}.")]
 
     def build_references(self, file_path: str) -> Dict[str, Any]:
-        """Read the sidecar .refs.json, format all references in APA 7th edition,
-        and append a 'References' section to the Word document."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        refs_path = file_path + ".refs.json"
-        if not os.path.exists(refs_path):
-            return {"success": False, "error": f"No references file found at {refs_path}. Use doc-add-reference first."}
-        try:
-            with open(refs_path, "r") as f:
-                refs = json.load(f)
-            if not refs:
-                return {"success": False, "error": "References file is empty"}
-
-            # Sort alphabetically by author surname (APA requirement)
-            refs.sort(key=lambda r: r.get("author", "").split(",")[0].strip().lower())
-
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-
-                # Remove existing References section if present (idempotent)
-                ref_start_idx = None
-                for i, para in enumerate(doc.paragraphs):
-                    if para.text.strip() == "References" and any(r.bold for r in para.runs if r.bold):
-                        ref_start_idx = i
-                        break
-                if ref_start_idx is not None:
-                    # Delete from the References heading to end of document
-                    body = doc.element.body
-                    paras_to_remove = list(doc.paragraphs[ref_start_idx:])
-                    for p in paras_to_remove:
-                        body.remove(p._element)
-                    # Also remove the page break before it (last element before References)
-                    # It's typically a paragraph with a <w:br w:type="page"/> run
-                    if ref_start_idx > 0:
-                        prev = doc.paragraphs[ref_start_idx - 1] if ref_start_idx - 1 < len(doc.paragraphs) else None
-                        if prev and not prev.text.strip():
-                            # Check if it's a page break paragraph
-                            for run_el in prev._element.findall(qn("w:r")):
-                                for br in run_el.findall(qn("w:br")):
-                                    if br.get(qn("w:type")) == "page":
-                                        body.remove(prev._element)
-                                        break
-
-                # Add a page break before references
-                doc.add_page_break()
-
-                # "References" heading — centered, bold
-                heading = doc.add_paragraph()
-                heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                run = heading.add_run("References")
-                run.bold = True
-
-                # Each reference as a hanging-indent paragraph with italic spans
-                from docx.enum.text import WD_LINE_SPACING
-                for ref in refs:
-                    spans = self._format_apa7_reference(ref)
-                    para = doc.add_paragraph()
-                    for span in spans:
-                        run = para.add_run(span["text"])
-                        if span.get("italic"):
-                            run.italic = True
-                    # APA hanging indent: first line 0, rest 0.5 inches
-                    pf = para.paragraph_format
-                    pf.first_line_indent = -Inches(0.5)
-                    pf.left_indent = Inches(0.5)
-                    pf.space_after = Pt(0)
-                    pf.space_before = Pt(0)
-                    pf.line_spacing_rule = WD_LINE_SPACING.DOUBLE
-
-                self._safe_save(doc, file_path)
-
-            return {
-                "success": True,
-                "file": file_path,
-                "references_added": len(refs),
-                "refs_file": refs_path,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.build_references(file_path)
 
     def add_image(
         self,
@@ -1017,194 +925,37 @@ class DocumentServerClient:
         paragraph_index: int = None,
         position: str = "after",
     ) -> Dict[str, Any]:
-        """Add an image to a Word document with optional caption.
-        Supports PNG, JPG, GIF, BMP, TIFF."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        if not os.path.exists(image_path):
-            return {"success": False, "error": f"Image not found: {image_path}"}
-        position = position.lower()
-        if position not in {"before", "after"}:
-            return {"success": False, "error": "position must be 'before' or 'after'"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                total = len(doc.paragraphs)
-                if paragraph_index is not None and (
-                    paragraph_index < 0 or paragraph_index >= total
-                ):
-                    return {
-                        "success": False,
-                        "error": f"Paragraph index {paragraph_index} out of range (0..{total - 1})",
-                    }
-                # Add image paragraph, centered
-                para = doc.add_paragraph()
-                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                para.paragraph_format.space_before = Pt(0)
-                para.paragraph_format.space_after = Pt(0)
-                run = para.add_run()
-                run.add_picture(image_path, width=Inches(width_inches))
-                # Add caption below image if provided
-                cap_para = None
-                if caption:
-                    para.paragraph_format.keep_with_next = True
-                    cap_para = doc.add_paragraph()
-                    cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    cap_para.paragraph_format.space_before = Pt(0)
-                    cap_para.paragraph_format.space_after = Pt(0)
-                    cap_para.paragraph_format.keep_together = True
-                    cap_run = cap_para.add_run(caption)
-                    cap_run.italic = True
-                    cap_run.font.size = Pt(10)
-                if paragraph_index is not None:
-                    body = doc.element.body
-                    ref = doc.paragraphs[paragraph_index]._element
-                    elements = [para._element]
-                    if cap_para is not None:
-                        elements.append(cap_para._element)
-                    for element in elements:
-                        body.remove(element)
-                    insert_at = body.index(ref)
-                    if position == "after":
-                        insert_at += 1
-                    for offset, element in enumerate(elements):
-                        body.insert(insert_at + offset, element)
-                self._safe_save(doc, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "image": image_path,
-                "width_inches": width_inches,
-                "caption": caption,
-                "paragraph_index": paragraph_index,
-                "position": "append" if paragraph_index is None else position,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.add_image(
+            file_path,
+            image_path,
+            width_inches,
+            caption,
+            paragraph_index,
+            position,
+        )
 
     def set_paragraph_style(
         self, file_path: str, paragraph_index: int, style_name: str
     ) -> Dict[str, Any]:
-        """Set a paragraph's Word style (Heading 1, Heading 2, Normal, Title, etc.)"""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                if paragraph_index >= len(doc.paragraphs):
-                    return {
-                        "success": False,
-                        "error": f"Paragraph index {paragraph_index} out of range (max {len(doc.paragraphs) - 1})",
-                    }
-                para = doc.paragraphs[paragraph_index]
-                available_styles = [s.name for s in doc.styles if s.type == 1]  # paragraph styles
-                if style_name not in available_styles:
-                    return {
-                        "success": False,
-                        "error": f"Style '{style_name}' not found. Available: {available_styles[:20]}",
-                    }
-                para.style = doc.styles[style_name]
-                self._safe_save(doc, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "paragraph_index": paragraph_index,
-                "style_applied": style_name,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.set_paragraph_style(file_path, paragraph_index, style_name)
 
     def set_page_layout(
         self,
         file_path: str,
-        orientation: str = "portrait",
+        orientation: str = None,
         margins: Dict[str, float] = None,
         header_text: str = None,
         page_numbers: bool = False,
+        page_size: str = None,
     ) -> Dict[str, Any]:
-        """Set page layout (orientation, margins, running header, page numbers).
-        header_text: appears top-left on every page.
-        page_numbers: adds page number to bottom-center."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                section = doc.sections[0]
-                if orientation.lower() == "landscape":
-                    section.orientation = WD_ORIENT.LANDSCAPE
-                    # python-docx does NOT auto-swap dimensions — must do it explicitly
-                    if section.page_width < section.page_height:
-                        section.page_width, section.page_height = (
-                            section.page_height, section.page_width
-                        )
-                else:
-                    section.orientation = WD_ORIENT.PORTRAIT
-                    # Ensure portrait has height > width
-                    if section.page_width > section.page_height:
-                        section.page_width, section.page_height = (
-                            section.page_height, section.page_width
-                        )
-                if margins:
-                    for side, value in margins.items():
-                        if hasattr(section, f"{side}_margin"):
-                            setattr(section, f"{side}_margin", Inches(value))
-
-                # Running header
-                if header_text is not None:
-                    header = section.header
-                    header.is_linked_to_previous = False
-                    if header.paragraphs:
-                        hp = header.paragraphs[0]
-                    else:
-                        hp = header.add_paragraph()
-                    hp.text = ""
-                    run = hp.add_run(header_text)
-                    run.font.size = Pt(10)
-                    hp.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-                # Page numbers (bottom center)
-                if page_numbers:
-                    footer = section.footer
-                    footer.is_linked_to_previous = False
-                    if footer.paragraphs:
-                        fp = footer.paragraphs[0]
-                    else:
-                        fp = footer.add_paragraph()
-                    fp.text = ""
-                    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    # Insert PAGE field code via OOXML
-                    run = fp.add_run()
-                    run.font.size = Pt(10)
-                    fld_char_begin = OxmlElement("w:fldChar")
-                    fld_char_begin.set(qn("w:fldCharType"), "begin")
-                    run._element.append(fld_char_begin)
-                    instr_run = fp.add_run()
-                    instr_text = OxmlElement("w:instrText")
-                    instr_text.set(qn("xml:space"), "preserve")
-                    instr_text.text = " PAGE "
-                    instr_run._element.append(instr_text)
-                    fld_char_end_run = fp.add_run()
-                    fld_char_end = OxmlElement("w:fldChar")
-                    fld_char_end.set(qn("w:fldCharType"), "end")
-                    fld_char_end_run._element.append(fld_char_end)
-
-                self._safe_save(doc, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "layout_updated": True,
-                "header_text": header_text,
-                "page_numbers": page_numbers,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.set_page_layout(
+            file_path,
+            orientation,
+            margins,
+            header_text,
+            page_numbers,
+            page_size,
+        )
 
     def _parse_range(self, range_str: str):
         from openpyxl.utils.cell import range_boundaries
@@ -1336,153 +1087,10 @@ class DocumentServerClient:
         sheet_name: str = None,
         max_examples: int = 30,
     ) -> Dict[str, Any]:
-        """Audit workbook formulas for unsupported patterns and risk signals."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path, data_only=False)
-            sheets = (
-                [sheet_name]
-                if sheet_name and sheet_name in wb.sheetnames
-                else wb.sheetnames
-            )
-
-            has_vba = getattr(wb, "vba_archive", None) is not None
-            external_link_count = len(getattr(wb, "_external_links", []) or [])
-
-            formula_count = 0
-            unsupported_functions = {}
-            complex_formulas = []
-            external_ref_formulas = []
-            function_usage = {}
-
-            for sn in sheets:
-                ws = wb[sn]
-                for row in ws.iter_rows(
-                    min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column
-                ):
-                    for cell in row:
-                        val = cell.value
-                        if not (isinstance(val, str) and val.startswith("=")):
-                            continue
-                        formula_count += 1
-                        funcs = self._extract_formula_functions(val)
-                        for f in funcs:
-                            function_usage[f] = function_usage.get(f, 0) + 1
-                            if f not in self.supported_formula_functions:
-                                unsupported_functions[f] = (
-                                    unsupported_functions.get(f, 0) + 1
-                                )
-                        depth = self._formula_depth(val)
-                        if depth > 3 and len(complex_formulas) < max_examples:
-                            complex_formulas.append(
-                                {
-                                    "sheet": sn,
-                                    "cell": cell.coordinate,
-                                    "depth": depth,
-                                    "formula": val[:220],
-                                }
-                            )
-                        if (
-                            "[" in val
-                            or "http://" in val.lower()
-                            or "https://" in val.lower()
-                        ) and len(external_ref_formulas) < max_examples:
-                            external_ref_formulas.append(
-                                {
-                                    "sheet": sn,
-                                    "cell": cell.coordinate,
-                                    "formula": val[:220],
-                                }
-                            )
-
-            wb.close()
-
-            risks = []
-            if has_vba:
-                risks.append(
-                    "Workbook contains VBA/macros; CLI does not execute macros"
-                )
-            if external_link_count > 0 or external_ref_formulas:
-                risks.append(
-                    "Workbook contains external links/references that may not resolve in CLI"
-                )
-            if unsupported_functions:
-                risks.append(
-                    "Workbook uses formula functions outside CLI evaluator support"
-                )
-            if complex_formulas:
-                risks.append(
-                    "Workbook contains deeply nested formulas that can be error-prone"
-                )
-
-            safe = not risks
-            return {
-                "success": True,
-                "file": file_path,
-                "sheet_scope": sheets,
-                "formula_count": formula_count,
-                "has_vba": has_vba,
-                "external_link_count": external_link_count,
-                "function_usage": function_usage,
-                "unsupported_functions": unsupported_functions,
-                "complex_formula_examples": complex_formulas,
-                "external_reference_examples": external_ref_formulas,
-                "safe_for_cli_formula_eval": safe,
-                "risk_level": "low"
-                if safe
-                else ("high" if has_vba or unsupported_functions else "medium"),
-                "risks": risks,
-                "supported_functions": sorted(self.supported_formula_functions),
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.audit_spreadsheet_formulas(file_path, sheet_name, max_examples)
 
     def get_formatting_info(self, file_path: str) -> Dict[str, Any]:
-        """Get detailed formatting information"""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            doc = Document(file_path)
-            info = {
-                "success": True,
-                "file": file_path,
-                "sections": [],
-                "paragraphs": [],
-            }
-            for i, section in enumerate(doc.sections):
-                info["sections"].append(
-                    {
-                        "orientation": "landscape"
-                        if section.orientation == WD_ORIENT.LANDSCAPE
-                        else "portrait",
-                        "margins": {
-                            "top": round(section.top_margin.inches, 2),
-                            "bottom": round(section.bottom_margin.inches, 2),
-                            "left": round(section.left_margin.inches, 2),
-                            "right": round(section.right_margin.inches, 2),
-                        },
-                    }
-                )
-            for i, para in enumerate(doc.paragraphs[:10]):
-                para_info = {
-                    "index": i,
-                    "alignment": para.alignment,
-                    "text_preview": para.text[:50],
-                }
-                if para.runs:
-                    run = para.runs[0]
-                    para_info["font"] = {
-                        "name": run.font.name,
-                        "size": run.font.size.pt if run.font.size else None,
-                        "bold": run.bold,
-                        "italic": run.italic,
-                        "underline": run.underline,
-                    }
-                info["paragraphs"].append(para_info)
-            return info
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.get_formatting_info(file_path)
 
     def get_document_info(self, file_path: str) -> Dict[str, Any]:
         """Get file information for any supported format"""
@@ -1534,25 +1142,7 @@ class DocumentServerClient:
     def create_spreadsheet(
         self, output_path: str, sheet_name: str = "Sheet1"
     ) -> Dict[str, Any]:
-        """Create a new .xlsx spreadsheet"""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(output_path):
-                backup = self._snapshot_backup(output_path)
-                wb = Workbook()
-                ws = wb.active
-                ws.title = sheet_name
-                ws.page_setup.paperSize = 9  # A4
-                self._safe_save(wb, output_path)
-            return {
-                "success": True,
-                "file": output_path,
-                "sheets": [sheet_name],
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.create_spreadsheet(output_path, sheet_name)
 
     def write_spreadsheet(
         self,
@@ -1564,122 +1154,12 @@ class DocumentServerClient:
         coerce_rows: bool = False,
         text_columns: List[str] = None,
     ) -> Dict[str, Any]:
-        """Write headers/data to spreadsheet. Non-destructive by default; full overwrite only when explicitly requested.
-        text_columns: list of header names whose values should NOT be coerced to numbers (preserves leading zeros)."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            ok, err, data = self._validate_tabular_rows(
-                headers, data, coerce_rows=coerce_rows
-            )
-            if not ok:
-                return {"success": False, "error": err}
-
-            with self._file_lock(output_path):
-                backup = self._snapshot_backup(output_path)
-                if Path(output_path).exists() and not overwrite_workbook:
-                    wb = load_workbook(output_path)
-                    ws = (
-                        wb[sheet_name]
-                        if sheet_name in wb.sheetnames
-                        else wb.create_sheet(sheet_name)
-                    )
-                    ws.delete_rows(1, ws.max_row)
-                else:
-                    wb = Workbook()
-                    ws = wb.active
-                    ws.title = sheet_name
-
-                for col, header in enumerate(headers, 1):
-                    ws.cell(row=1, column=col, value=header)
-                # Build set of column indices that should stay as text
-                text_col_indices = set()
-                if text_columns:
-                    tc_lower = {tc.strip().lower() for tc in text_columns}
-                    for ci, h in enumerate(headers):
-                        if h.strip().lower() in tc_lower:
-                            text_col_indices.add(ci + 1)  # 1-indexed
-
-                for row_idx, row_data in enumerate(data, 2):
-                    for col_idx, value in enumerate(row_data, 1):
-                        if col_idx in text_col_indices:
-                            # Text column: write as string, preserve leading zeros
-                            cell = ws.cell(row=row_idx, column=col_idx, value=str(value))
-                            cell.data_type = "s"
-                        elif isinstance(value, str) and value.startswith("="):
-                            ws.cell(row=row_idx, column=col_idx, value=value)
-                        else:
-                            try:
-                                if isinstance(value, str):
-                                    if "." in value:
-                                        value = float(value)
-                                    else:
-                                        value = int(value)
-                            except (ValueError, TypeError):
-                                pass
-                            ws.cell(row=row_idx, column=col_idx, value=value)
-                # Auto-fit column widths based on content (min 12, max 50 chars)
-                for col in ws.columns:
-                    max_len = max((len(str(cell.value or "")) for cell in col), default=8)
-                    col_letter = openpyxl.utils.get_column_letter(col[0].column)
-                    ws.column_dimensions[col_letter].width = max(12, min(max_len + 2, 50))
-                # A4 paper size for printing
-                ws.page_setup.paperSize = 9  # 9 = A4
-                self._safe_save(wb, output_path)
-            return {
-                "success": True,
-                "file": output_path,
-                "rows_written": len(data),
-                "columns": len(headers),
-                "sheet": sheet_name,
-                "mode": "overwrite_workbook" if overwrite_workbook else "update_sheet",
-                "coerce_rows": bool(coerce_rows),
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.write_spreadsheet(output_path, headers, data, sheet_name, overwrite_workbook, coerce_rows, text_columns)
 
     def read_spreadsheet(
         self, file_path: str, sheet_name: str = None
     ) -> Dict[str, Any]:
-        """Read all data from a spreadsheet"""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            if sheet_name and sheet_name not in wb.sheetnames:
-                wb.close()
-                return {
-                    "success": False,
-                    "error": f"Sheet '{sheet_name}' not found. Available: {list(wb.sheetnames)}",
-                }
-            sheets_to_read = [sheet_name] if sheet_name else list(wb.sheetnames)
-            result = {
-                "success": True,
-                "file": file_path,
-                "sheets": wb.sheetnames,
-                "data": {},
-            }
-            for sn in sheets_to_read:
-                ws = wb[sn]
-                rows_data = []
-                headers = None
-                for row in ws.iter_rows(values_only=True):
-                    if all(cell is None for cell in row):
-                        continue
-                    if headers is None:
-                        headers = [str(cell) if cell else "" for cell in row]
-                    else:
-                        rows_data.append([str(cell) if cell else "" for cell in row])
-                result["data"][sn] = {
-                    "headers": headers,
-                    "rows": rows_data,
-                    "row_count": len(rows_data),
-                }
-            wb.close()
-            return result
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.read_spreadsheet(file_path, sheet_name)
 
     def calculate_column(
         self,
@@ -1690,132 +1170,7 @@ class DocumentServerClient:
         include_formulas: bool = False,
         strict_formula_safety: bool = False,
     ) -> Dict[str, Any]:
-        """Calculate column statistics (sum, avg, min, max)"""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            # Must use read_only=False for column access
-            wb = load_workbook(file_path)
-            ws = self._get_sheet(wb, sheet_name)
-
-            # Get column index from letter
-            col_idx = openpyxl.utils.column_index_from_string(column_letter.upper())
-
-            # Extract numeric values from the column (skip header row)
-            values = []
-            formula_rows_total = 0
-            formula_rows_evaluated = 0
-            formula_rows_failed = 0
-            formula_failure_examples = []
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if col_idx <= len(row):
-                    val = row[col_idx - 1]
-                    if val is not None and isinstance(val, (int, float)):
-                        values.append(val)
-                    elif (
-                        include_formulas
-                        and isinstance(val, str)
-                        and val.startswith("=")
-                    ):
-                        formula_rows_total += 1
-                        funcs = self._extract_formula_functions(val)
-                        unsupported = sorted(
-                            [
-                                f
-                                for f in funcs
-                                if f not in self.supported_formula_functions
-                            ]
-                        )
-                        if unsupported:
-                            formula_rows_failed += 1
-                            if len(formula_failure_examples) < 8:
-                                formula_failure_examples.append(
-                                    {
-                                        "formula": val[:220],
-                                        "reason": f"unsupported_functions:{','.join(unsupported)}",
-                                    }
-                                )
-                            continue
-                        resolved = self._resolve_formula_value(ws, val[1:])
-                        if isinstance(resolved, (int, float)):
-                            values.append(float(resolved))
-                            formula_rows_evaluated += 1
-                        else:
-                            formula_rows_failed += 1
-                            if len(formula_failure_examples) < 8:
-                                formula_failure_examples.append(
-                                    {
-                                        "formula": val[:220],
-                                        "reason": "evaluation_failed",
-                                    }
-                                )
-
-            wb.close()
-
-            if not values:
-                return {
-                    "success": False,
-                    "error": f"No numeric values in column {column_letter}",
-                }
-
-            op_name = (operation or "all").lower()
-            if op_name not in {"sum", "avg", "average", "min", "max", "all"}:
-                return {
-                    "success": False,
-                    "error": f"Unsupported operation '{operation}'. Use sum|avg|min|max|all",
-                }
-
-            result = {
-                "success": True,
-                "column": column_letter,
-                "sheet": sheet_name,
-                "count": len(values),
-                "sum": sum(values),
-                "average": sum(values) / len(values),
-                "min": min(values),
-                "max": max(values),
-                "formula_mode": bool(include_formulas),
-                "operation": op_name,
-                "formula_rows_total": formula_rows_total,
-                "formula_rows_evaluated": formula_rows_evaluated,
-                "formula_rows_failed": formula_rows_failed,
-                "formula_failure_examples": formula_failure_examples,
-            }
-            if op_name == "sum":
-                result["value"] = result["sum"]
-            elif op_name in {"avg", "average"}:
-                result["value"] = result["average"]
-            elif op_name == "min":
-                result["value"] = result["min"]
-            elif op_name == "max":
-                result["value"] = result["max"]
-
-            if include_formulas:
-                formula_eval_rate = (
-                    (formula_rows_evaluated / formula_rows_total)
-                    if formula_rows_total > 0
-                    else 1.0
-                )
-                result["formula_eval_rate"] = formula_eval_rate
-                result["formula_reliability"] = (
-                    "high"
-                    if formula_eval_rate >= 0.95
-                    else ("medium" if formula_eval_rate >= 0.7 else "low")
-                )
-                if strict_formula_safety and formula_rows_failed > 0:
-                    return {
-                        "success": False,
-                        "error": "Strict formula safety failed: unresolved/unsupported formulas present",
-                        "details": {
-                            "formula_rows_total": formula_rows_total,
-                            "formula_rows_evaluated": formula_rows_evaluated,
-                            "formula_rows_failed": formula_rows_failed,
-                            "examples": formula_failure_examples,
-                        },
-                    }
-            return result
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.calculate_column(file_path, column_letter, operation, sheet_name, include_formulas, strict_formula_safety)
 
     def _cell_to_float(self, value):
         if value is None:
@@ -1868,68 +1223,7 @@ class DocumentServerClient:
         sheet_name: str = "Sheet1",
         allowed_values: List[str] = None,
     ) -> Dict[str, Any]:
-        """Frequency table for one column (counts + percentages)."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            ws = self._get_sheet(wb, sheet_name)
-            col_idx = openpyxl.utils.column_index_from_string(column_letter.upper())
-
-            counts = {}
-            missing = 0
-            excluded = 0
-
-            def _allowed(cat):
-                if not allowed_values:
-                    return True
-                return any(self._value_matches_group(cat, t) for t in allowed_values)
-
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                if col_idx > len(row):
-                    missing += 1
-                    continue
-                cat = self._category_value(row[col_idx - 1])
-                if cat is None:
-                    missing += 1
-                    continue
-                if not _allowed(cat):
-                    excluded += 1
-                    continue
-                counts[cat] = counts.get(cat, 0) + 1
-
-            wb.close()
-
-            total_valid = sum(counts.values())
-            total_rows = total_valid + missing + excluded
-            freq_rows = []
-            for k in sorted(counts.keys(), key=lambda x: (str(type(x)), str(x))):
-                c = counts[k]
-                freq_rows.append(
-                    {
-                        "category": k,
-                        "count": c,
-                        "percent_valid": (c / total_valid * 100)
-                        if total_valid
-                        else 0.0,
-                        "percent_total": (c / total_rows * 100) if total_rows else 0.0,
-                    }
-                )
-
-            return {
-                "success": True,
-                "file": file_path,
-                "sheet": sheet_name,
-                "column": column_letter.upper(),
-                "valid_n": total_valid,
-                "missing_n": missing,
-                "excluded_n": excluded,
-                "total_n": total_rows,
-                "allowed_values": allowed_values or [],
-                "frequencies": freq_rows,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.frequencies(file_path, column_letter, sheet_name, allowed_values)
 
     def correlation_test(
         self,
@@ -1939,84 +1233,7 @@ class DocumentServerClient:
         sheet_name: str = "Sheet1",
         method: str = "pearson",
     ) -> Dict[str, Any]:
-        """Correlation between two numeric columns."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        if not SCIPY_AVAILABLE:
-            return {"success": False, "error": "scipy not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            ws = self._get_sheet(wb, sheet_name)
-            x_idx = openpyxl.utils.column_index_from_string(x_column.upper())
-            y_idx = openpyxl.utils.column_index_from_string(y_column.upper())
-
-            x_vals, y_vals = [], []
-            dropped = 0
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                xv = row[x_idx - 1] if x_idx <= len(row) else None
-                yv = row[y_idx - 1] if y_idx <= len(row) else None
-                x_num = self._cell_to_float(xv)
-                y_num = self._cell_to_float(yv)
-                if x_num is None or y_num is None:
-                    dropped += 1
-                    continue
-                x_vals.append(x_num)
-                y_vals.append(y_num)
-            wb.close()
-
-            if len(x_vals) < 3:
-                return {
-                    "success": False,
-                    "error": "Need at least 3 paired numeric observations",
-                }
-
-            m = (method or "pearson").lower()
-            if m == "pearson":
-                stat, p = scipy_stats.pearsonr(x_vals, y_vals)
-            elif m == "spearman":
-                stat, p = scipy_stats.spearmanr(x_vals, y_vals)
-            else:
-                return {
-                    "success": False,
-                    "error": "Unsupported method. Use pearson|spearman",
-                }
-
-            abs_r = abs(float(stat))
-            strength = (
-                "negligible"
-                if abs_r < 0.1
-                else (
-                    "small" if abs_r < 0.3 else ("moderate" if abs_r < 0.5 else "large")
-                )
-            )
-            significant = float(p) < 0.05
-            direction = (
-                "positive"
-                if float(stat) > 0
-                else ("negative" if float(stat) < 0 else "none")
-            )
-
-            return {
-                "success": True,
-                "file": file_path,
-                "sheet": sheet_name,
-                "method": m,
-                "x_column": x_column.upper(),
-                "y_column": y_column.upper(),
-                "n": len(x_vals),
-                "dropped_rows": dropped,
-                "statistic": float(stat),
-                "p_value": float(p),
-                "interpretation": {
-                    "alpha": 0.05,
-                    "significant": significant,
-                    "direction": direction,
-                    "strength": strength,
-                },
-                "apa": f"{m.title()} correlation between {x_column.upper()} and {y_column.upper()} was {'ρ' if m == 'spearman' else 'r'} = {float(stat):.3f}, p = {float(p):.4g}, n = {len(x_vals)}.",
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.correlation_test(file_path, x_column, y_column, sheet_name, method)
 
     def ttest_independent(
         self,
@@ -2028,111 +1245,7 @@ class DocumentServerClient:
         sheet_name: str = "Sheet1",
         equal_var: bool = False,
     ) -> Dict[str, Any]:
-        """Independent samples t-test (Welch default)."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        if not SCIPY_AVAILABLE:
-            return {"success": False, "error": "scipy not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            ws = self._get_sheet(wb, sheet_name)
-            v_idx = openpyxl.utils.column_index_from_string(value_column.upper())
-            g_idx = openpyxl.utils.column_index_from_string(group_column.upper())
-
-            group_a_vals = []
-            group_b_vals = []
-            dropped = 0
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                gv = row[g_idx - 1] if g_idx <= len(row) else None
-                vv = row[v_idx - 1] if v_idx <= len(row) else None
-                v_num = self._cell_to_float(vv)
-                if v_num is None:
-                    dropped += 1
-                    continue
-                if self._value_matches_group(gv, group_a):
-                    group_a_vals.append(v_num)
-                elif self._value_matches_group(gv, group_b):
-                    group_b_vals.append(v_num)
-            wb.close()
-
-            if len(group_a_vals) < 2 or len(group_b_vals) < 2:
-                return {
-                    "success": False,
-                    "error": "Need at least 2 numeric observations in each group",
-                }
-
-            t_stat, p_val = scipy_stats.ttest_ind(
-                group_a_vals,
-                group_b_vals,
-                equal_var=bool(equal_var),
-                nan_policy="omit",
-            )
-
-            mean_a = float(sum(group_a_vals) / len(group_a_vals))
-            mean_b = float(sum(group_b_vals) / len(group_b_vals))
-            sd_a = float(scipy_stats.tstd(group_a_vals))
-            sd_b = float(scipy_stats.tstd(group_b_vals))
-
-            # Degrees of freedom
-            n_a, n_b = len(group_a_vals), len(group_b_vals)
-            if equal_var:
-                df = n_a + n_b - 2
-            else:
-                # Welch-Satterthwaite df
-                va, vb = sd_a**2 / n_a, sd_b**2 / n_b
-                df = (va + vb)**2 / (va**2 / (n_a - 1) + vb**2 / (n_b - 1)) if (va + vb) > 0 else n_a + n_b - 2
-
-            # Cohen's d (pooled SD)
-            pooled_var = (
-                ((n_a - 1) * (sd_a**2))
-                + ((n_b - 1) * (sd_b**2))
-            ) / (n_a + n_b - 2)
-            pooled_sd = pooled_var**0.5 if pooled_var > 0 else 0.0
-            cohens_d = (mean_a - mean_b) / pooled_sd if pooled_sd else 0.0
-
-            abs_d = abs(float(cohens_d))
-            d_mag = (
-                "negligible"
-                if abs_d < 0.2
-                else (
-                    "small" if abs_d < 0.5 else ("medium" if abs_d < 0.8 else "large")
-                )
-            )
-            significant = float(p_val) < 0.05
-
-            return {
-                "success": True,
-                "file": file_path,
-                "sheet": sheet_name,
-                "value_column": value_column.upper(),
-                "group_column": group_column.upper(),
-                "group_a": str(group_a),
-                "group_b": str(group_b),
-                "n_a": n_a,
-                "n_b": n_b,
-                "mean_a": mean_a,
-                "mean_b": mean_b,
-                "sd_a": sd_a,
-                "sd_b": sd_b,
-                "df": round(float(df), 2),
-                "difference": mean_a - mean_b,
-                "equal_var": bool(equal_var),
-                "statistic": float(t_stat),
-                "p_value": float(p_val),
-                "cohens_d": float(cohens_d),
-                "dropped_rows": dropped,
-                "interpretation": {
-                    "alpha": 0.05,
-                    "significant": significant,
-                    "effect_size_magnitude": d_mag,
-                    "higher_group": str(group_a)
-                    if mean_a > mean_b
-                    else (str(group_b) if mean_b > mean_a else "equal"),
-                },
-                "apa": f"{'Welch' if not equal_var else 'Student'}'s independent-samples t-test on {value_column.upper()} by {group_column.upper()} ({group_a} vs {group_b}) found t({df:.1f}) = {float(t_stat):.3f}, p = {float(p_val):.4g}, d = {float(cohens_d):.3f}; M{group_a} = {mean_a:.3f}, M{group_b} = {mean_b:.3f}.",
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.ttest_independent(file_path, value_column, group_column, group_a, group_b, sheet_name, equal_var)
 
     def mann_whitney_test(
         self,
@@ -2143,77 +1256,7 @@ class DocumentServerClient:
         group_b: str,
         sheet_name: str = "Sheet1",
     ) -> Dict[str, Any]:
-        """Mann-Whitney U test — non-parametric alternative to independent t-test.
-        Appropriate for ordinal (Likert) data."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        if not SCIPY_AVAILABLE:
-            return {"success": False, "error": "scipy not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            ws = self._get_sheet(wb, sheet_name)
-            val_idx = openpyxl.utils.column_index_from_string(value_column.upper())
-            grp_idx = openpyxl.utils.column_index_from_string(group_column.upper())
-            group_a_vals, group_b_vals = [], []
-            dropped = 0
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                val = row[val_idx - 1] if val_idx - 1 < len(row) else None
-                grp = row[grp_idx - 1] if grp_idx - 1 < len(row) else None
-                if val is None or grp is None:
-                    dropped += 1
-                    continue
-                try:
-                    v = float(val)
-                except (ValueError, TypeError):
-                    dropped += 1
-                    continue
-                g = str(grp).strip()
-                if g == str(group_a).strip():
-                    group_a_vals.append(v)
-                elif g == str(group_b).strip():
-                    group_b_vals.append(v)
-            wb.close()
-            if len(group_a_vals) < 2 or len(group_b_vals) < 2:
-                return {"success": False, "error": f"Insufficient data: group {group_a} n={len(group_a_vals)}, group {group_b} n={len(group_b_vals)}. Need >= 2 per group."}
-            u_stat, p_val = scipy_stats.mannwhitneyu(
-                group_a_vals, group_b_vals, alternative="two-sided"
-            )
-            # Rank-biserial r as effect size
-            n1, n2 = len(group_a_vals), len(group_b_vals)
-            r_rb = 1 - (2 * float(u_stat)) / (n1 * n2)
-            abs_r = abs(r_rb)
-            r_mag = "negligible" if abs_r < 0.1 else ("small" if abs_r < 0.3 else ("medium" if abs_r < 0.5 else "large"))
-            significant = float(p_val) < 0.05
-            import numpy as np
-            median_a = float(np.median(group_a_vals))
-            median_b = float(np.median(group_b_vals))
-            return {
-                "success": True,
-                "file": file_path,
-                "sheet": sheet_name,
-                "test": "Mann-Whitney U",
-                "value_column": value_column.upper(),
-                "group_column": group_column.upper(),
-                "group_a": str(group_a),
-                "group_b": str(group_b),
-                "n_a": n1,
-                "n_b": n2,
-                "median_a": median_a,
-                "median_b": median_b,
-                "statistic": float(u_stat),
-                "p_value": float(p_val),
-                "rank_biserial_r": float(r_rb),
-                "dropped_rows": dropped,
-                "interpretation": {
-                    "alpha": 0.05,
-                    "significant": significant,
-                    "effect_size_magnitude": r_mag,
-                    "higher_group": str(group_a) if median_a > median_b else (str(group_b) if median_b > median_a else "equal"),
-                },
-                "apa": f"Mann-Whitney U test on {value_column.upper()} by {group_column.upper()} ({group_a} vs {group_b}) found U = {float(u_stat):.1f}, p = {float(p_val):.4g}, r = {float(r_rb):.3f}; Mdn{group_a} = {median_a:.1f}, Mdn{group_b} = {median_b:.1f}.",
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.mann_whitney_test(file_path, value_column, group_column, group_a, group_b, sheet_name)
 
     def chi_square_test(
         self,
@@ -2224,102 +1267,7 @@ class DocumentServerClient:
         row_allowed_values: List[str] = None,
         col_allowed_values: List[str] = None,
     ) -> Dict[str, Any]:
-        """Chi-square test of independence for two categorical columns."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        if not SCIPY_AVAILABLE:
-            return {"success": False, "error": "scipy not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            ws = self._get_sheet(wb, sheet_name)
-            r_idx = openpyxl.utils.column_index_from_string(row_column.upper())
-            c_idx = openpyxl.utils.column_index_from_string(col_column.upper())
-
-            pairs = []
-            excluded = 0
-
-            def _allowed(cat, allowed):
-                if not allowed:
-                    return True
-                return any(self._value_matches_group(cat, t) for t in allowed)
-
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                rv = row[r_idx - 1] if r_idx <= len(row) else None
-                cv = row[c_idx - 1] if c_idx <= len(row) else None
-                r_cat = self._category_value(rv)
-                c_cat = self._category_value(cv)
-                if r_cat is None or c_cat is None:
-                    continue
-                if not _allowed(r_cat, row_allowed_values) or not _allowed(
-                    c_cat, col_allowed_values
-                ):
-                    excluded += 1
-                    continue
-                pairs.append((r_cat, c_cat))
-            wb.close()
-
-            if len(pairs) < 2:
-                return {"success": False, "error": "Not enough valid categorical pairs"}
-
-            row_levels = sorted(
-                {p[0] for p in pairs}, key=lambda x: (str(type(x)), str(x))
-            )
-            col_levels = sorted(
-                {p[1] for p in pairs}, key=lambda x: (str(type(x)), str(x))
-            )
-
-            counts = {r: {c: 0 for c in col_levels} for r in row_levels}
-            for r, c in pairs:
-                counts[r][c] += 1
-
-            observed = [[counts[r][c] for c in col_levels] for r in row_levels]
-            chi2, p, dof, expected = scipy_stats.chi2_contingency(observed)
-
-            n = len(pairs)
-            min_dim = min(len(row_levels) - 1, len(col_levels) - 1)
-            if min_dim == 0:
-                return {
-                    "success": False,
-                    "error": f"Cramer's V undefined: one variable has only 1 level (rows={len(row_levels)}, cols={len(col_levels)}). Check --row-valid / --col-valid filters.",
-                }
-            cramers_v = ((chi2 / (n * min_dim)) ** 0.5)
-            abs_v = abs(float(cramers_v))
-            v_mag = (
-                "negligible"
-                if abs_v < 0.1
-                else (
-                    "small" if abs_v < 0.3 else ("medium" if abs_v < 0.5 else "large")
-                )
-            )
-            significant = float(p) < 0.05
-
-            return {
-                "success": True,
-                "file": file_path,
-                "sheet": sheet_name,
-                "row_column": row_column.upper(),
-                "col_column": col_column.upper(),
-                "n": n,
-                "excluded_n": excluded,
-                "row_allowed_values": row_allowed_values or [],
-                "col_allowed_values": col_allowed_values or [],
-                "rows": row_levels,
-                "cols": col_levels,
-                "observed": observed,
-                "expected": [list(map(float, r)) for r in expected.tolist()],
-                "degrees_of_freedom": int(dof),
-                "statistic": float(chi2),
-                "p_value": float(p),
-                "cramers_v": float(cramers_v),
-                "interpretation": {
-                    "alpha": 0.05,
-                    "significant": significant,
-                    "association_strength": v_mag,
-                },
-                "apa": f"Chi-square test of {row_column.upper()} by {col_column.upper()} was χ²({int(dof)}) = {float(chi2):.3f}, p = {float(p):.4g}, Cramer's V = {float(cramers_v):.3f}, n = {n}.",
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.chi_square_test(file_path, row_column, col_column, sheet_name, row_allowed_values, col_allowed_values)
 
     def open_text_extract(
         self,
@@ -2329,50 +1277,7 @@ class DocumentServerClient:
         limit: int = 20,
         min_length: int = 20,
     ) -> Dict[str, Any]:
-        """Extract non-empty open-text responses from a column for qualitative analysis."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            ws = self._get_sheet(wb, sheet_name)
-            col_idx = openpyxl.utils.column_index_from_string(column_letter.upper())
-
-            responses = []
-            all_non_empty = 0
-            for r in range(2, (ws.max_row or 0) + 1):
-                val = ws.cell(r, col_idx).value
-                if val is None:
-                    continue
-                text = str(val).strip()
-                if not text:
-                    continue
-                all_non_empty += 1
-                if len(text) < int(min_length):
-                    continue
-                responses.append(
-                    {
-                        "row": r,
-                        "cell": f"{column_letter.upper()}{r}",
-                        "text": text,
-                        "length": len(text),
-                    }
-                )
-
-            wb.close()
-            responses = responses[: max(1, int(limit))]
-            return {
-                "success": True,
-                "file": file_path,
-                "sheet": sheet_name,
-                "column": column_letter.upper(),
-                "total_non_empty": all_non_empty,
-                "returned": len(responses),
-                "limit": int(limit),
-                "min_length": int(min_length),
-                "responses": responses,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.open_text_extract(file_path, column_letter, sheet_name, limit, min_length)
 
     def open_text_keywords(
         self,
@@ -2382,117 +1287,7 @@ class DocumentServerClient:
         top_n: int = 15,
         min_word_length: int = 4,
     ) -> Dict[str, Any]:
-        """Get keyword frequency summary from an open-text column for theme seeding."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            ws = self._get_sheet(wb, sheet_name)
-            col_idx = openpyxl.utils.column_index_from_string(column_letter.upper())
-
-            stopwords = {
-                "that",
-                "this",
-                "with",
-                "have",
-                "from",
-                "more",
-                "would",
-                "their",
-                "they",
-                "what",
-                "before",
-                "into",
-                "about",
-                "being",
-                "because",
-                "through",
-                "there",
-                "where",
-                "when",
-                "which",
-                "just",
-                "also",
-                "will",
-                "than",
-                "then",
-                "your",
-                "them",
-                "some",
-                "very",
-                "much",
-                "need",
-                "skills",
-                "health",
-                "experience",
-                "placement",
-                "clinical",
-                "students",
-                "student",
-                "graduate",
-                "university",
-                "degree",
-                "work",
-                "working",
-                "field",
-                "practical",
-                "able",
-                "feel",
-                "think",
-                "would",
-                "could",
-                "like",
-                "more",
-                "been",
-                "have",
-                "being",
-                "really",
-                "well",
-            }
-
-            token_counts = {}
-            response_count = 0
-            for r in range(2, (ws.max_row or 0) + 1):
-                val = ws.cell(r, col_idx).value
-                if val is None:
-                    continue
-                text = str(val).strip().lower()
-                if not text:
-                    continue
-                response_count += 1
-                tokens = re.findall(r"[a-zA-Z][a-zA-Z\-']+", text)
-                for t in tokens:
-                    if len(t) < int(min_word_length):
-                        continue
-                    if t in stopwords:
-                        continue
-                    token_counts[t] = token_counts.get(t, 0) + 1
-            wb.close()
-
-            top = sorted(token_counts.items(), key=lambda kv: kv[1], reverse=True)[
-                : max(1, int(top_n))
-            ]
-            return {
-                "success": True,
-                "file": file_path,
-                "sheet": sheet_name,
-                "column": column_letter.upper(),
-                "response_count": response_count,
-                "top_n": int(top_n),
-                "min_word_length": int(min_word_length),
-                "keywords": [
-                    {
-                        "keyword": k,
-                        "count": c,
-                        "percent_responses": (c / response_count * 100)
-                        if response_count
-                        else 0.0,
-                    }
-                    for k, c in top
-                ],
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.open_text_keywords(file_path, column_letter, sheet_name, top_n, min_word_length)
 
     def research_analysis_pack(
         self,
@@ -2501,386 +1296,22 @@ class DocumentServerClient:
         profile: str = "hlth3112",
         require_formula_safe: bool = False,
     ) -> Dict[str, Any]:
-        """Run a standardized spreadsheet analysis bundle for research assignments."""
-        profile_key = (profile or "hlth3112").lower()
-        if profile_key != "hlth3112":
-            return {
-                "success": False,
-                "error": "Unsupported profile. Use: hlth3112",
-            }
-
-        result = {
-            "success": True,
-            "file": file_path,
-            "sheet": sheet_name,
-            "profile": profile_key,
-            "steps": {
-                "formula_audit": [],
-                "frequencies": [],
-                "descriptives": [],
-                "correlations": [],
-                "ttests": [],
-                "chi2": [],
-                "qualitative": [],
-            },
-            "summary": {},
-        }
-
-        # Profile configuration tuned for HLTH3112/HLTH3011 survey structure.
-        freq_specs = [
-            {"column": "A", "valid": ["1", "2"], "label": "Gender"},
-            {
-                "column": "F",
-                "valid": ["1", "2", "3", "4", "5"],
-                "label": "Professional_placement",
-            },
-            {
-                "column": "AL",
-                "valid": ["1", "2", "3", "4", "5"],
-                "label": "More_experience",
-            },
-        ]
-        descriptive_specs = [
-            {"column": "M", "op": "all", "label": "Confident_job"},
-            {"column": "R", "op": "all", "label": "Overall_prepared"},
-            {"column": "AL", "op": "all", "label": "More_experience"},
-            {"column": "AM", "op": "all", "label": "More_training"},
-        ]
-        corr_specs = [
-            {
-                "x": "M",
-                "y": "R",
-                "method": "spearman",
-                "label": "Confident_job_vs_Overall_prepared",
-            },
-            {
-                "x": "Y",
-                "y": "M",
-                "method": "spearman",
-                "label": "Interpret_statistics_vs_Confident_job",
-            },
-        ]
-        # Mann-Whitney U (non-parametric) for ordinal Likert data
-        mannwhitney_specs = [
-            {
-                "value": "M",
-                "group": "F",
-                "a": "1",
-                "b": "4",
-                "label": "Confident_job_by_placement_1_vs_4",
-            },
-            {
-                "value": "R",
-                "group": "F",
-                "a": "1",
-                "b": "4",
-                "label": "Overall_prepared_by_placement_1_vs_4",
-            },
-        ]
-        # Parametric t-test (kept for reference/comparison — agent can run separately)
-        ttest_specs = []
-        chi_specs = [
-            {
-                "row": "A",
-                "col": "AL",
-                "row_valid": ["1", "2"],
-                "col_valid": ["1", "2", "3", "4", "5"],
-                "label": "Gender_vs_More_experience",
-            }
-        ]
-        qualitative_specs = [
-            {"column": "AN", "label": "Strongest_skill"},
-            {"column": "AO", "label": "Underprepared_skill"},
-            {"column": "AP", "label": "Employers_value"},
-            {"column": "AQ", "label": "Improve_employability"},
-        ]
-
-        def _capture(bucket: str, payload: Dict[str, Any], meta: Dict[str, Any]):
-            entry = {"meta": meta, "result": payload}
-            result["steps"][bucket].append(entry)
-
-        audit = self.audit_spreadsheet_formulas(
-            file_path=file_path,
-            sheet_name=sheet_name,
-            max_examples=20,
-        )
-        _capture("formula_audit", audit, {"sheet": sheet_name})
-
-        if require_formula_safe:
-            if not audit.get("success"):
-                return {
-                    "success": False,
-                    "file": file_path,
-                    "sheet": sheet_name,
-                    "profile": profile_key,
-                    "steps": result["steps"],
-                    "summary": {
-                        "total_analyses": 1,
-                        "succeeded": 0,
-                        "failed": 1,
-                        "completion_rate": 0.0,
-                        "formula_audit_safe": None,
-                    },
-                    "error": "Formula safety audit failed and strict policy is enabled",
-                }
-            if not audit.get("safe_for_cli_formula_eval", False):
-                return {
-                    "success": False,
-                    "file": file_path,
-                    "sheet": sheet_name,
-                    "profile": profile_key,
-                    "steps": result["steps"],
-                    "summary": {
-                        "total_analyses": 1,
-                        "succeeded": 0,
-                        "failed": 1,
-                        "completion_rate": 0.0,
-                        "formula_audit_safe": False,
-                    },
-                    "error": "Formula safety policy blocked execution: workbook is not safe_for_cli_formula_eval",
-                    "formula_audit": audit,
-                }
-
-        for spec in freq_specs:
-            payload = self.frequencies(
-                file_path=file_path,
-                column_letter=spec["column"],
-                sheet_name=sheet_name,
-                allowed_values=spec.get("valid"),
-            )
-            _capture("frequencies", payload, spec)
-
-        for spec in descriptive_specs:
-            payload = self.calculate_column(
-                file_path=file_path,
-                column_letter=spec["column"],
-                operation=spec.get("op", "all"),
-                sheet_name=sheet_name,
-                include_formulas=False,
-            )
-            _capture("descriptives", payload, spec)
-
-        for spec in corr_specs:
-            payload = self.correlation_test(
-                file_path=file_path,
-                x_column=spec["x"],
-                y_column=spec["y"],
-                sheet_name=sheet_name,
-                method=spec.get("method", "pearson"),
-            )
-            _capture("correlations", payload, spec)
-
-        for spec in ttest_specs:
-            payload = self.ttest_independent(
-                file_path=file_path,
-                value_column=spec["value"],
-                group_column=spec["group"],
-                group_a=spec["a"],
-                group_b=spec["b"],
-                sheet_name=sheet_name,
-                equal_var=False,
-            )
-            _capture("ttests", payload, spec)
-
-        # Mann-Whitney U tests (non-parametric, appropriate for ordinal/Likert)
-        if "mannwhitney" not in result["steps"]:
-            result["steps"]["mannwhitney"] = []
-        for spec in mannwhitney_specs:
-            payload = self.mann_whitney_test(
-                file_path=file_path,
-                value_column=spec["value"],
-                group_column=spec["group"],
-                group_a=spec["a"],
-                group_b=spec["b"],
-                sheet_name=sheet_name,
-            )
-            _capture("mannwhitney", payload, spec)
-
-        for spec in chi_specs:
-            payload = self.chi_square_test(
-                file_path=file_path,
-                row_column=spec["row"],
-                col_column=spec["col"],
-                sheet_name=sheet_name,
-                row_allowed_values=spec.get("row_valid"),
-                col_allowed_values=spec.get("col_valid"),
-            )
-            _capture("chi2", payload, spec)
-
-        for spec in qualitative_specs:
-            kw = self.open_text_keywords(
-                file_path=file_path,
-                column_letter=spec["column"],
-                sheet_name=sheet_name,
-                top_n=12,
-                min_word_length=4,
-            )
-            ex = self.open_text_extract(
-                file_path=file_path,
-                column_letter=spec["column"],
-                sheet_name=sheet_name,
-                limit=6,
-                min_length=35,
-            )
-            payload = {
-                "success": bool(kw.get("success") and ex.get("success")),
-                "keywords": kw,
-                "quotes": ex,
-            }
-            if not payload["success"]:
-                payload["error"] = kw.get("error") or ex.get("error")
-            _capture("qualitative", payload, spec)
-
-        all_results = []
-        for bucket in result["steps"].values():
-            all_results.extend(bucket)
-        ok = sum(1 for x in all_results if x["result"].get("success"))
-        fail = len(all_results) - ok
-
-        sig_corr = 0
-        for item in result["steps"].get("correlations", []):
-            if item["result"].get("interpretation", {}).get("significant"):
-                sig_corr += 1
-        sig_t = 0
-        for item in result["steps"].get("ttests", []):
-            if item["result"].get("interpretation", {}).get("significant"):
-                sig_t += 1
-        sig_chi = 0
-        for item in result["steps"].get("chi2", []):
-            if item["result"].get("interpretation", {}).get("significant"):
-                sig_chi += 1
-
-        result["summary"] = {
-            "total_analyses": len(all_results),
-            "succeeded": ok,
-            "failed": fail,
-            "completion_rate": (ok / len(all_results)) if all_results else 0.0,
-            "significant": {
-                "correlations": sig_corr,
-                "ttests": sig_t,
-                "chi2": sig_chi,
-            },
-            "formula_audit_safe": bool(audit.get("safe_for_cli_formula_eval"))
-            if audit.get("success")
-            else None,
-            "require_formula_safe": bool(require_formula_safe),
-        }
-        if ok == 0:
-            result["success"] = False
-            result["error"] = (
-                "All analyses failed. Check sheet name and dataset structure."
-            )
-
-        return result
+        return self._xlsx_ops.research_analysis_pack(file_path, sheet_name, profile, require_formula_safe)
 
     def append_to_spreadsheet(
         self, file_path: str, row_data: List[Any], sheet_name: str = None
     ) -> Dict[str, Any]:
-        """Append a row to an existing spreadsheet"""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-
-                # Find the next empty row
-                next_row = ws.max_row + 1
-
-                for col_idx, value in enumerate(row_data, 1):
-                    try:
-                        if (
-                            isinstance(value, str)
-                            and value.replace(".", "", 1).replace("-", "", 1).isdigit()
-                        ):
-                            value = float(value) if "." in value else int(value)
-                    except Exception:
-                        pass
-                    ws.cell(row=next_row, column=col_idx, value=value)
-
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True,
-                "file": file_path,
-                "row_added": next_row,
-                "columns": len(row_data),
-                "sheet": ws.title,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.append_to_spreadsheet(file_path, row_data, sheet_name)
 
     def search_spreadsheet(
         self, file_path: str, search_text: str, sheet_name: str = None
     ) -> Dict[str, Any]:
-        """Search for text in a spreadsheet"""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            sheets_to_search = (
-                [sheet_name]
-                if sheet_name and sheet_name in wb.sheetnames
-                else wb.sheetnames
-            )
-
-            results = []
-            for sn in sheets_to_search:
-                ws = wb[sn]
-                for row_idx, row in enumerate(ws.iter_rows(values_only=False), 1):
-                    for col_idx, cell in enumerate(row, 1):
-                        if (
-                            cell.value is not None
-                            and search_text.lower() in str(cell.value).lower()
-                        ):
-                            col_letter = openpyxl.utils.get_column_letter(col_idx)
-                            results.append(
-                                {
-                                    "sheet": sn,
-                                    "cell": f"{col_letter}{row_idx}",
-                                    "value": str(cell.value),
-                                    "row": row_idx,
-                                    "column": col_letter,
-                                }
-                            )
-
-            wb.close()
-            return {
-                "success": True,
-                "file": file_path,
-                "search_text": search_text,
-                "matches": len(results),
-                "results": results,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.search_spreadsheet(file_path, search_text, sheet_name)
 
     def add_formula(
         self, file_path: str, cell: str, formula: str, sheet_name: str = "Sheet1"
     ) -> Dict[str, Any]:
-        """Add formula to a specific cell"""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name)
-                ws[cell] = formula
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True,
-                "file": file_path,
-                "cell": cell,
-                "formula": formula,
-                "sheet": sheet_name,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.add_formula(file_path, cell, formula, sheet_name)
 
     # ==================== CHART OPERATIONS ====================
 
@@ -2900,135 +1331,7 @@ class DocumentServerClient:
         legend_pos: str = "right",
         colors: List[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Create a chart in a spreadsheet.
-
-        Args:
-            file_path: Path to the Excel file
-            chart_type: Type of chart ('bar', 'line', 'pie', 'scatter')
-            data_range: Cell range for data values (e.g., 'B2:D5')
-            categories_range: Cell range for category labels (e.g., 'A2:A5')
-            title: Chart title
-            sheet_name: Source sheet name (default: active sheet)
-            output_sheet: Sheet to place chart (default: same as source)
-            x_label: X-axis label
-            y_label: Y-axis label
-            show_data_labels: Show data labels on chart
-            show_legend: Show legend
-            legend_pos: Legend position ('right', 'top', 'bottom', 'left')
-            colors: List of hex colors for chart series
-
-        Returns:
-            Dict with success status and chart details
-        """
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-
-                # Validate ranges before creating chart
-                _ = self._parse_range(data_range)
-                if categories_range:
-                    _ = self._parse_range(categories_range)
-                if not self._range_has_data(ws, data_range):
-                    return {
-                        "success": False,
-                        "error": f"Data range {data_range} contains no usable values",
-                    }
-                if categories_range and not self._range_has_data(ws, categories_range):
-                    return {
-                        "success": False,
-                        "error": f"Category range {categories_range} contains no usable values",
-                    }
-
-                # Create the appropriate chart type
-                chart = self._create_chart_object(chart_type)
-
-                # Parse ranges and create references
-                if categories_range:
-                    min_col, min_row, max_col, max_row = self._parse_range(
-                        categories_range
-                    )
-                    cat_ref = Reference(
-                        ws,
-                        min_col=min_col,
-                        min_row=min_row,
-                        max_col=max_col,
-                        max_row=max_row,
-                    )
-                else:
-                    # Default: use first column of data range
-                    dmin_col, dmin_row, dmax_col, dmax_row = self._parse_range(
-                        data_range
-                    )
-                    cat_ref = Reference(
-                        ws,
-                        min_col=dmin_col,
-                        min_row=dmin_row + 1,
-                        max_col=dmin_col,
-                        max_row=dmax_row,
-                    )
-
-                # Data values (Y-axis)
-                min_col, min_row, max_col, max_row = self._parse_range(data_range)
-                data_ref = Reference(
-                    ws,
-                    min_col=min_col,
-                    min_row=min_row,
-                    max_col=max_col,
-                    max_row=max_row,
-                )
-
-                chart.add_data(data_ref, titles_from_data=True)
-                chart.set_categories(cat_ref)
-
-                chart.title = title
-
-                if not show_legend:
-                    chart.has_legend = False
-                else:
-                    chart.legend.pos = legend_pos
-
-                if x_label:
-                    chart.x_axis.title = x_label
-                if y_label:
-                    chart.y_axis.title = y_label
-
-                if show_data_labels:
-                    chart.dataLabels = DataLabelList()
-                    chart.dataLabels.show_val = True
-
-                if colors:
-                    self._apply_chart_colors(chart, colors)
-
-                if output_sheet and output_sheet != ws.title:
-                    if output_sheet not in wb.sheetnames:
-                        out_ws = wb.create_sheet(output_sheet)
-                    else:
-                        out_ws = wb[output_sheet]
-                    out_ws.add_chart(chart, "A2")
-                else:
-                    ws.add_chart(chart, "A10")
-
-                self._safe_save(wb, file_path)
-                wb.close()
-
-            return {
-                "success": True,
-                "file": file_path,
-                "chart_type": chart_type,
-                "title": title,
-                "sheet": ws.title,
-                "data_range": data_range,
-                "categories_range": categories_range,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.create_chart(file_path, chart_type, data_range, categories_range, title, sheet_name, output_sheet, x_label, y_label, show_data_labels, show_legend, legend_pos, colors)
 
     def _create_chart_object(self, chart_type: str):
         """Create the appropriate chart object based on type"""
@@ -3076,103 +1379,7 @@ class DocumentServerClient:
         show_data_labels: bool = False,
         show_legend: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Create a chart from structured data in a spreadsheet.
-
-        Args:
-            file_path: Path to the Excel file
-            chart_type: Type of chart ('bar', 'line', 'pie', 'scatter')
-            sheet_name: Source sheet name
-            title: Chart title
-            start_row: Starting row of data (1-indexed, usually 2 to skip header)
-            start_col: Starting column of data (1-indexed)
-            num_categories: Number of category rows (default: auto-detect)
-            num_series: Number of data series (columns)
-            category_col: Column containing category labels (1-indexed)
-            value_cols: List of columns containing values (1-indexed)
-            output_cell: Cell where chart should be placed
-            show_data_labels: Show data labels
-            show_legend: Show legend
-
-        Returns:
-            Dict with success status and chart details
-        """
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-
-                # Auto-detect ranges if not specified
-                if num_categories is None:
-                    num_categories = ws.max_row - start_row + 1
-                if num_categories <= 0:
-                    return {
-                        "success": False,
-                        "error": "No category rows found for chart",
-                    }
-
-                if value_cols is None:
-                    value_cols = list(range(start_col + 1, ws.max_column + 1))
-                if not value_cols:
-                    return {
-                        "success": False,
-                        "error": "No value columns found for chart",
-                    }
-
-                if num_series is None:
-                    num_series = len(value_cols)
-
-                chart = self._create_chart_object(chart_type)
-
-                cat_min_row = start_row
-                cat_max_row = start_row + num_categories - 1
-                cat_ref = Reference(
-                    ws,
-                    min_col=category_col,
-                    min_row=cat_min_row,
-                    max_col=category_col,
-                    max_row=cat_max_row,
-                )
-
-                for col in value_cols:
-                    data_ref = Reference(
-                        ws,
-                        min_col=col,
-                        min_row=cat_min_row,
-                        max_col=col,
-                        max_row=cat_max_row,
-                    )
-                    chart.add_data(data_ref, titles_from_data=True)
-
-                chart.set_categories(cat_ref)
-                chart.title = title
-                chart.has_legend = show_legend
-
-                if show_data_labels:
-                    chart.dataLabels = DataLabelList()
-                    chart.dataLabels.show_val = True
-
-                ws.add_chart(chart, output_cell)
-                self._safe_save(wb, file_path)
-                wb.close()
-
-            return {
-                "success": True,
-                "file": file_path,
-                "chart_type": chart_type,
-                "title": title,
-                "sheet": ws.title,
-                "categories": num_categories,
-                "series": num_series,
-                "output_cell": output_cell,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.create_comparison_chart(file_path, chart_type, sheet_name, title, start_row, start_col, num_categories, num_series, category_col, value_cols, output_cell, show_data_labels, show_legend)
 
     def create_grade_distribution_chart(
         self,
@@ -3182,98 +1389,7 @@ class DocumentServerClient:
         title: str = "Grade Distribution",
         output_cell: str = "F2",
     ) -> Dict[str, Any]:
-        """
-        Create a pie chart showing grade distribution.
-
-        Args:
-            file_path: Path to the Excel file
-            sheet_name: Sheet name
-            grade_column: Column letter containing grades
-            title: Chart title
-            output_cell: Cell where chart should be placed
-
-        Returns:
-            Dict with success status and chart details
-        """
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-
-                col_idx = openpyxl.utils.column_index_from_string(grade_column)
-                grade_counts = {}
-                total_rows = 0
-
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    if col_idx <= len(row) and row[col_idx - 1]:
-                        grade = str(row[col_idx - 1]).strip().upper()
-                        grade_counts[grade] = grade_counts.get(grade, 0) + 1
-                        total_rows += 1
-
-                if not grade_counts:
-                    return {
-                        "success": False,
-                        "error": "No grades found in column " + grade_column,
-                    }
-
-                chart = PieChart()
-                chart.title = title
-                # Write chart helper data to a separate sheet to avoid corrupting the data sheet
-                helper_name = "_chart_data"
-                if helper_name not in wb.sheetnames:
-                    helper_ws = wb.create_sheet(helper_name)
-                else:
-                    helper_ws = wb[helper_name]
-                # Find next free row in helper sheet
-                base_row = (helper_ws.max_row or 0) + 2
-                helper_ws.cell(row=base_row, column=1, value="Grade")
-                helper_ws.cell(row=base_row, column=2, value="Count")
-                for i, (grade, count) in enumerate(sorted(grade_counts.items()), 1):
-                    helper_ws.cell(row=base_row + i, column=1, value=grade)
-                    helper_ws.cell(row=base_row + i, column=2, value=count)
-
-                cat_ref = Reference(
-                    helper_ws,
-                    min_col=1,
-                    min_row=base_row + 1,
-                    max_col=1,
-                    max_row=base_row + len(grade_counts),
-                )
-                data_ref = Reference(
-                    helper_ws,
-                    min_col=2,
-                    min_row=base_row + 1,
-                    max_col=2,
-                    max_row=base_row + len(grade_counts),
-                )
-
-                chart.add_data(data_ref, titles_from_data=False)
-                chart.set_categories(cat_ref)
-                chart.dataLabels = DataLabelList()
-                chart.dataLabels.show_val = True
-                chart.dataLabels.show_pct = True
-
-                ws.add_chart(chart, output_cell)
-                self._safe_save(wb, file_path)
-                wb.close()
-
-            return {
-                "success": True,
-                "file": file_path,
-                "chart_type": "pie",
-                "title": title,
-                "sheet": ws.title,
-                "total_grades": total_rows,
-                "distribution": grade_counts,
-                "output_cell": output_cell,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.create_grade_distribution_chart(file_path, sheet_name, grade_column, title, output_cell)
 
     def create_progress_chart(
         self,
@@ -3285,267 +1401,38 @@ class DocumentServerClient:
         output_cell: str = "D2",
         show_data_labels: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Create a bar chart showing individual student grades.
-
-        Args:
-            file_path: Path to the Excel file
-            student_column: Column letter with student names
-            grade_column: Column letter with grades
-            sheet_name: Sheet name
-            title: Chart title
-            output_cell: Cell where chart should be placed
-            show_data_labels: Show data labels on bars
-
-        Returns:
-            Dict with success status and chart details
-        """
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-
-                student_col_idx = openpyxl.utils.column_index_from_string(
-                    student_column
-                )
-                grade_col_idx = openpyxl.utils.column_index_from_string(grade_column)
-                num_rows = ws.max_row - 1
-
-                if num_rows <= 0:
-                    return {"success": False, "error": "No data found"}
-
-                chart = BarChart()
-                chart.type = "bar"
-                chart.title = title
-
-                cat_ref = Reference(
-                    ws,
-                    min_col=student_col_idx,
-                    min_row=2,
-                    max_col=student_col_idx,
-                    max_row=num_rows + 1,
-                )
-
-                data_ref = Reference(
-                    ws,
-                    min_col=grade_col_idx,
-                    min_row=2,
-                    max_col=grade_col_idx,
-                    max_row=num_rows + 1,
-                )
-
-                chart.add_data(data_ref, titles_from_data=False)
-                chart.set_categories(cat_ref)
-                chart.x_axis.title = "Grade"
-                chart.y_axis.title = "Student"
-
-                if show_data_labels:
-                    chart.dataLabels = DataLabelList()
-                    chart.dataLabels.show_val = True
-
-                ws.add_chart(chart, output_cell)
-                self._safe_save(wb, file_path)
-                wb.close()
-
-            return {
-                "success": True,
-                "file": file_path,
-                "chart_type": "bar_horizontal",
-                "title": title,
-                "sheet": ws.title,
-                "students": num_rows,
-                "output_cell": output_cell,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.create_progress_chart(file_path, student_column, grade_column, sheet_name, title, output_cell, show_data_labels)
 
     # ==================== PRESENTATION OPERATIONS ====================
 
     def create_presentation(
         self, output_path: str, title: str = "", subtitle: str = ""
     ) -> Dict[str, Any]:
-        """Create a new .pptx presentation with title slide"""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            with self._file_lock(output_path):
-                backup = self._snapshot_backup(output_path)
-                prs = Presentation()
-                prs.slide_width = Inches(13.333)   # 16:9 widescreen
-                prs.slide_height = Inches(7.5)
-                slide_layout = prs.slide_layouts[0]  # Title slide
-                slide = prs.slides.add_slide(slide_layout)
-                if title:
-                    slide.shapes.title.text = title
-                if subtitle:
-                    slide.placeholders[1].text = subtitle
-                self._safe_save(prs, output_path)
-            return {
-                "success": True,
-                "file": output_path,
-                "title": title,
-                "slides": 1,
-                "size": Path(output_path).stat().st_size,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.create_presentation(
+            output_path, title=title, subtitle=subtitle
+        )
 
     def add_slide(
         self, file_path: str, title: str, content: str = "", layout: str = "content"
     ) -> Dict[str, Any]:
-        """Add a slide. Layouts: title_only, content, blank, two_content"""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                prs = Presentation(file_path)
-                layout_map = {
-                    "title_only": 5,
-                    "content": 1,
-                    "blank": 6,
-                    "two_content": 3,
-                    "comparison": 4,
-                }
-                layout_idx = layout_map.get(layout.lower(), 1)
-                slide_layout = prs.slide_layouts[layout_idx]
-                slide = prs.slides.add_slide(slide_layout)
-
-                if slide.shapes.title:
-                    slide.shapes.title.text = title
-
-                if content and len(slide.placeholders) > 1:
-                    slide.placeholders[1].text = content
-
-                self._safe_save(prs, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "title": title,
-                "total_slides": len(prs.slides),
-                "layout": layout,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.add_slide(
+            file_path, title=title, content=content, layout=layout
+        )
 
     def add_bullet_slide(
         self, file_path: str, title: str, bullets: str
     ) -> Dict[str, Any]:
-        """Add a slide with bullet points. Bullets separated by newlines."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                prs = Presentation(file_path)
-                slide_layout = prs.slide_layouts[1]  # Title and Content
-                slide = prs.slides.add_slide(slide_layout)
-
-                if slide.shapes.title:
-                    slide.shapes.title.text = title
-
-                if bullets.strip():
-                    tf = slide.placeholders[1].text_frame
-                    tf.clear()
-                    bullet_count = 0
-                    for bullet in bullets.split("\n"):
-                        bullet = bullet.strip()
-                        if not bullet:
-                            continue
-                        if bullet_count == 0:
-                            p = tf.paragraphs[0]
-                        else:
-                            p = tf.add_paragraph()
-                        p.text = bullet
-                        p.level = 0
-                        bullet_count += 1
-
-                self._safe_save(prs, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "title": title,
-                "total_slides": len(prs.slides),
-                "bullets": len([b for b in bullets.split("\n") if b.strip()]),
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.add_bullet_slide(file_path, title=title, bullets=bullets)
 
     def read_presentation(self, file_path: str) -> Dict[str, Any]:
-        """Read all slides and content from a presentation"""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            prs = Presentation(file_path)
-            slides_data = []
-            for i, slide in enumerate(prs.slides, 1):
-                slide_info = {"slide_number": i, "title": "", "content": []}
-                for shape in slide.shapes:
-                    if shape.has_text_frame:
-                        text = shape.text_frame.text.strip()
-                        if text:
-                            is_title = shape == slide.shapes.title
-                            if not is_title:
-                                try:
-                                    pf = shape.placeholder_format
-                                    if pf is not None and pf.idx == 0:
-                                        is_title = True
-                                except Exception:
-                                    pass
-                            if is_title:
-                                slide_info["title"] = text
-                            else:
-                                slide_info["content"].append(text)
-                slides_data.append(slide_info)
-
-            return {
-                "success": True,
-                "file": file_path,
-                "slide_count": len(slides_data),
-                "slides": slides_data,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.read_presentation(file_path)
 
     def add_image_slide(
         self, file_path: str, title: str, image_path: str
     ) -> Dict[str, Any]:
-        """Add a slide with an image"""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                prs = Presentation(file_path)
-                slide_layout = prs.slide_layouts[5]  # Title Only
-                slide = prs.slides.add_slide(slide_layout)
-
-                if slide.shapes.title:
-                    slide.shapes.title.text = title
-
-                slide.shapes.add_picture(
-                    image_path, Inches(1), Inches(1.5), width=Inches(8)
-                )
-
-                self._safe_save(prs, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "title": title,
-                "total_slides": len(prs.slides),
-                "image": image_path,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.add_image_slide(
+            file_path, title=title, image_path=image_path
+        )
 
     def add_table_slide(
         self,
@@ -3555,59 +1442,13 @@ class DocumentServerClient:
         data_csv: str,
         coerce_rows: bool = False,
     ) -> Dict[str, Any]:
-        """Add a slide with a table. Headers comma-separated, rows semicolon-separated."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                prs = Presentation(file_path)
-                slide_layout = prs.slide_layouts[5]  # Title Only
-                slide = prs.slides.add_slide(slide_layout)
-
-                if slide.shapes.title:
-                    slide.shapes.title.text = title
-
-                headers = [h.strip() for h in headers_csv.split(",")]
-                rows = []
-                for row_str in data_csv.split(";"):
-                    if row_str.strip():
-                        rows.append([c.strip() for c in row_str.split(",")])
-
-                ok, err, rows = self._validate_tabular_rows(
-                    headers, rows, coerce_rows=coerce_rows
-                )
-                if not ok:
-                    return {"success": False, "error": err}
-
-                num_rows = len(rows) + 1
-                num_cols = len(headers)
-
-                table_shape = slide.shapes.add_table(
-                    num_rows, num_cols, Inches(0.5), Inches(1.5), Inches(9), Inches(5)
-                )
-                table = table_shape.table
-
-                for i, header in enumerate(headers):
-                    table.cell(0, i).text = header
-
-                for row_idx, row_data in enumerate(rows, 1):
-                    for col_idx, value in enumerate(row_data):
-                        table.cell(row_idx, col_idx).text = value
-
-                self._safe_save(prs, file_path)
-            return {
-                "success": True,
-                "file": file_path,
-                "title": title,
-                "total_slides": len(prs.slides),
-                "rows": len(rows),
-                "columns": num_cols,
-                "coerce_rows": bool(coerce_rows),
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.add_table_slide(
+            file_path,
+            title=title,
+            headers_csv=headers_csv,
+            data_csv=data_csv,
+            coerce_rows=coerce_rows,
+        )
 
     # Helper methods
     def _hex_to_rgb(self, hex_color: str) -> tuple:
@@ -3628,742 +1469,181 @@ class DocumentServerClient:
     def insert_paragraph(
         self, file_path: str, text: str, index: int, style: str = None
     ) -> Dict[str, Any]:
-        """Insert a paragraph at a specific index (0 = before first paragraph)."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                total = len(doc.paragraphs)
-                if index < 0 or index > total:
-                    return {"success": False, "error": f"Index {index} out of range (0..{total})"}
-                body = doc.element.body
-                new_para = OxmlElement("w:p")
-                run = OxmlElement("w:r")
-                t = OxmlElement("w:t")
-                t.text = text
-                t.set(qn("xml:space"), "preserve")
-                run.append(t)
-                new_para.append(run)
-                if index < total:
-                    ref = doc.paragraphs[index]._element
-                    body.insert(body.index(ref), new_para)
-                else:
-                    body.append(new_para)
-                # Apply style if requested
-                if style:
-                    from docx.text.paragraph import Paragraph
-                    p = Paragraph(new_para, doc)
-                    available = [s.name for s in doc.styles if s.type == 1]
-                    if style in available:
-                        p.style = doc.styles[style]
-                self._safe_save(doc, file_path)
-            return {
-                "success": True, "file": file_path,
-                "inserted_at": index, "text": text[:100],
-                "style": style, "total_paragraphs": total + 1,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.insert_paragraph(file_path, text, index, style)
 
     def delete_paragraph(
         self, file_path: str, index: int
     ) -> Dict[str, Any]:
-        """Delete a paragraph by index."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                total = len(doc.paragraphs)
-                if index < 0 or index >= total:
-                    return {"success": False, "error": f"Index {index} out of range (0..{total - 1})"}
-                para = doc.paragraphs[index]
-                deleted_text = para.text[:200]
-                body = doc.element.body
-                body.remove(para._element)
-                self._safe_save(doc, file_path)
-            return {
-                "success": True, "file": file_path,
-                "deleted_index": index, "deleted_text": deleted_text,
-                "remaining_paragraphs": total - 1,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.delete_paragraph(file_path, index)
 
     def search_document(
         self, file_path: str, search_text: str, case_sensitive: bool = False
     ) -> Dict[str, Any]:
-        """Search for text in a document and return all locations."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            doc = Document(file_path)
-            results = []
-            # Define query once — used in both paragraph and table search
-            query = search_text if case_sensitive else search_text.lower()
-            for i, para in enumerate(doc.paragraphs):
-                text = para.text
-                target = text if case_sensitive else text.lower()
-                start = 0
-                while True:
-                    idx = target.find(query, start)
-                    if idx == -1:
-                        break
-                    results.append({
-                        "paragraph_index": i,
-                        "char_offset": idx,
-                        "context": text[max(0, idx - 30):idx + len(search_text) + 30],
-                        "style": para.style.name if para.style else None,
-                    })
-                    start = idx + len(search_text)
-            # Also search in tables
-            table_results = []
-            for ti, table in enumerate(doc.tables):
-                for ri, row in enumerate(table.rows):
-                    for ci, cell in enumerate(row.cells):
-                        text = cell.text
-                        target = text if case_sensitive else text.lower()
-                        if query in target:
-                            table_results.append({
-                                "table_index": ti,
-                                "row": ri, "col": ci,
-                                "text": text[:200],
-                            })
-            return {
-                "success": True, "file": file_path,
-                "search_text": search_text,
-                "matches": len(results),
-                "table_matches": len(table_results),
-                "results": results,
-                "table_results": table_results,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.search_document(file_path, search_text, case_sensitive)
 
     def read_tables(self, file_path: str) -> Dict[str, Any]:
-        """Read all tables from a document."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            doc = Document(file_path)
-            tables = []
-            for ti, table in enumerate(doc.tables):
-                rows_data = []
-                for ri, row in enumerate(table.rows):
-                    row_data = [cell.text for cell in row.cells]
-                    rows_data.append(row_data)
-                headers = rows_data[0] if rows_data else []
-                data = rows_data[1:] if len(rows_data) > 1 else []
-                tables.append({
-                    "table_index": ti,
-                    "headers": headers,
-                    "rows": data,
-                    "row_count": len(data),
-                    "col_count": len(headers),
-                })
-            return {
-                "success": True, "file": file_path,
-                "table_count": len(tables),
-                "tables": tables,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.read_tables(file_path)
 
     def add_hyperlink(
         self, file_path: str, text: str, url: str, paragraph_index: int = -1
     ) -> Dict[str, Any]:
-        """Add a hyperlink to the document. paragraph_index=-1 appends a new paragraph."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                if paragraph_index == -1:
-                    para = doc.add_paragraph()
-                else:
-                    if paragraph_index >= len(doc.paragraphs):
-                        return {"success": False, "error": f"Paragraph index {paragraph_index} out of range"}
-                    para = doc.paragraphs[paragraph_index]
-                # Build hyperlink via OOXML
-                part = doc.part
-                r_id = part.relate_to(
-                    url,
-                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
-                    is_external=True,
-                )
-                hyperlink = OxmlElement("w:hyperlink")
-                hyperlink.set(qn("r:id"), r_id)
-                run = OxmlElement("w:r")
-                rPr = OxmlElement("w:rPr")
-                rStyle = OxmlElement("w:rStyle")
-                rStyle.set(qn("w:val"), "Hyperlink")
-                rPr.append(rStyle)
-                color = OxmlElement("w:color")
-                color.set(qn("w:val"), "0563C1")
-                rPr.append(color)
-                u = OxmlElement("w:u")
-                u.set(qn("w:val"), "single")
-                rPr.append(u)
-                run.append(rPr)
-                t = OxmlElement("w:t")
-                t.text = text
-                t.set(qn("xml:space"), "preserve")
-                run.append(t)
-                hyperlink.append(run)
-                para._element.append(hyperlink)
-                self._safe_save(doc, file_path)
-            return {
-                "success": True, "file": file_path,
-                "text": text, "url": url,
-                "paragraph_index": paragraph_index,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.add_hyperlink(file_path, text, url, paragraph_index)
 
     def add_page_break(self, file_path: str) -> Dict[str, Any]:
-        """Add a page break at the end of the document."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                doc.add_page_break()
-                self._safe_save(doc, file_path)
-            return {"success": True, "file": file_path, "action": "page_break_added", "backup": backup or None}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.add_page_break(file_path)
 
     def list_styles(self, file_path: str) -> Dict[str, Any]:
-        """List all available paragraph styles in the document."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            doc = Document(file_path)
-            para_styles = []
-            char_styles = []
-            for s in doc.styles:
-                entry = {"name": s.name, "builtin": s.builtin}
-                if s.type == 1:  # paragraph
-                    para_styles.append(entry)
-                elif s.type == 2:  # character
-                    char_styles.append(entry)
-            return {
-                "success": True, "file": file_path,
-                "paragraph_styles": para_styles,
-                "character_styles": char_styles,
-                "paragraph_style_count": len(para_styles),
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.list_styles(file_path)
 
     def set_metadata(
         self, file_path: str, author: str = None, title: str = None,
         subject: str = None, keywords: str = None, comments: str = None,
         category: str = None,
     ) -> Dict[str, Any]:
-        """Set document core properties (metadata)."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                cp = doc.core_properties
-                if author is not None:
-                    cp.author = author
-                if title is not None:
-                    cp.title = title
-                if subject is not None:
-                    cp.subject = subject
-                if keywords is not None:
-                    cp.keywords = keywords
-                if comments is not None:
-                    cp.comments = comments
-                if category is not None:
-                    cp.category = category
-                self._safe_save(doc, file_path)
-            return {
-                "success": True, "file": file_path,
-                "metadata_set": {k: v for k, v in {
-                    "author": author, "title": title, "subject": subject,
-                    "keywords": keywords, "comments": comments, "category": category,
-                }.items() if v is not None},
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.set_metadata(
+            file_path, author, title, subject, keywords, comments, category
+        )
 
     def get_metadata(self, file_path: str) -> Dict[str, Any]:
-        """Read document core properties (metadata)."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            doc = Document(file_path)
-            cp = doc.core_properties
-            return {
-                "success": True, "file": file_path,
-                "author": cp.author, "title": cp.title,
-                "subject": cp.subject, "keywords": cp.keywords,
-                "comments": cp.comments, "category": cp.category,
-                "created": cp.created.isoformat() if cp.created else None,
-                "modified": cp.modified.isoformat() if cp.modified else None,
-                "last_modified_by": cp.last_modified_by,
-                "revision": cp.revision,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.get_metadata(file_path)
+
+    def inspect_hidden_data(self, file_path: str) -> Dict[str, Any]:
+        return self._doc_ops.inspect_hidden_data(file_path)
+
+    def inspect_pdf_hidden_data(self, file_path: str) -> Dict[str, Any]:
+        return self._pdf_ops.inspect_hidden_data(file_path)
+
+    def audit_document_fonts(
+        self,
+        file_path: str,
+        expected_font_name: str = None,
+        expected_font_size: float = None,
+    ) -> Dict[str, Any]:
+        return self._doc_ops.audit_document_fonts(
+            file_path,
+            expected_font_name=expected_font_name,
+            expected_font_size=expected_font_size,
+        )
+
+    def audit_document_images(self, file_path: str) -> Dict[str, Any]:
+        return self._doc_ops.audit_document_images(file_path)
+
+    def document_preflight(
+        self,
+        file_path: str,
+        expected_page_size: str = None,
+        expected_font_name: str = None,
+        expected_font_size: float = None,
+    ) -> Dict[str, Any]:
+        return self._doc_ops.document_preflight(
+            file_path,
+            expected_page_size=expected_page_size,
+            expected_font_name=expected_font_name,
+            expected_font_size=expected_font_size,
+        )
+
+    def sanitize_document(
+        self,
+        file_path: str,
+        *,
+        remove_comments: bool = False,
+        accept_revisions: bool = False,
+        clear_metadata: bool = False,
+        remove_custom_xml: bool = False,
+        set_remove_personal_information: bool = False,
+        author: Optional[str] = None,
+        title: Optional[str] = None,
+        subject: Optional[str] = None,
+        keywords: Optional[str] = None,
+        output_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._doc_ops.sanitize_document(
+            file_path,
+            remove_comments=remove_comments,
+            accept_revisions=accept_revisions,
+            clear_metadata=clear_metadata,
+            remove_custom_xml=remove_custom_xml,
+            set_remove_personal_information=set_remove_personal_information,
+            author=author,
+            title=title,
+            subject=subject,
+            keywords=keywords,
+            output_path=output_path,
+        )
 
     def add_list(
         self, file_path: str, items: List[str], list_type: str = "bullet"
     ) -> Dict[str, Any]:
-        """Add a bulleted or numbered list. list_type: bullet|number"""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            style_name = "List Bullet" if list_type == "bullet" else "List Number"
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                doc = Document(file_path)
-                available = [s.name for s in doc.styles if s.type == 1]
-                if style_name not in available:
-                    style_name = "Normal"
-                for item in items:
-                    para = doc.add_paragraph(item, style=style_name)
-                self._safe_save(doc, file_path)
-            return {
-                "success": True, "file": file_path,
-                "list_type": list_type, "items_added": len(items),
-                "style_used": style_name, "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.add_list(file_path, items, list_type)
 
     def word_count(self, file_path: str) -> Dict[str, Any]:
-        """Get word, character, paragraph, and page estimate counts."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            doc = Document(file_path)
-            full_text = "\n".join(p.text for p in doc.paragraphs)
-            words = len(full_text.split())
-            chars = len(full_text)
-            chars_no_spaces = len(full_text.replace(" ", "").replace("\n", ""))
-            paras = len([p for p in doc.paragraphs if p.text.strip()])
-            # Rough page estimate (250 words per page)
-            pages_est = max(1, round(words / 250))
-            return {
-                "success": True, "file": file_path,
-                "words": words, "characters": chars,
-                "characters_no_spaces": chars_no_spaces,
-                "paragraphs": paras, "pages_estimate": pages_est,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.word_count(file_path)
 
     # ==================== EXTENDED SPREADSHEET OPERATIONS ====================
 
     def cell_read(
         self, file_path: str, cell_ref: str, sheet_name: str = None
     ) -> Dict[str, Any]:
-        """Read a single cell value by reference (e.g., 'B5')."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path, data_only=True)
-            ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-            cell = ws[cell_ref]
-            value = cell.value
-            wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "cell": cell_ref,
-                "value": value, "type": type(value).__name__,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.cell_read(file_path, cell_ref, sheet_name)
 
     def cell_write(
         self, file_path: str, cell_ref: str, value: str,
         sheet_name: str = None, as_text: bool = False,
     ) -> Dict[str, Any]:
-        """Write a value to a single cell."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-                if as_text:
-                    c = ws[cell_ref]
-                    c.value = str(value)
-                    c.data_type = "s"
-                elif isinstance(value, str) and value.startswith("="):
-                    ws[cell_ref] = value
-                else:
-                    try:
-                        if "." in str(value):
-                            value = float(value)
-                        else:
-                            value = int(value)
-                    except (ValueError, TypeError):
-                        pass
-                    ws[cell_ref] = value
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "cell": cell_ref,
-                "value": value, "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.cell_write(file_path, cell_ref, value, sheet_name, as_text)
 
     def range_read(
         self, file_path: str, range_ref: str, sheet_name: str = None
     ) -> Dict[str, Any]:
-        """Read a range of cells (e.g., 'A1:D10')."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path, data_only=True)
-            ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-            min_col, min_row, max_col, max_row = self._parse_range(range_ref)
-            rows = []
-            for row in ws.iter_rows(min_row=min_row, max_row=max_row,
-                                     min_col=min_col, max_col=max_col, values_only=True):
-                rows.append([str(c) if c is not None else "" for c in row])
-            wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "range": range_ref,
-                "rows": rows, "row_count": len(rows),
-                "col_count": max_col - min_col + 1,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.range_read(file_path, range_ref, sheet_name)
 
     def delete_rows(
         self, file_path: str, start_row: int, count: int = 1, sheet_name: str = None
     ) -> Dict[str, Any]:
-        """Delete rows from spreadsheet. start_row is 1-indexed."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-                ws.delete_rows(start_row, count)
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "deleted_from_row": start_row,
-                "rows_deleted": count, "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.delete_rows(file_path, start_row, count, sheet_name)
 
     def delete_columns(
         self, file_path: str, start_col: int, count: int = 1, sheet_name: str = None
     ) -> Dict[str, Any]:
-        """Delete columns from spreadsheet. start_col is 1-indexed."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-                ws.delete_cols(start_col, count)
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "deleted_from_col": start_col,
-                "cols_deleted": count, "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.delete_columns(file_path, start_col, count, sheet_name)
 
     def sort_sheet(
         self, file_path: str, column_letter: str, sheet_name: str = None,
         descending: bool = False, numeric: bool = False,
     ) -> Dict[str, Any]:
-        """Sort sheet data by a column. Preserves header row."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-                col_idx = openpyxl.utils.column_index_from_string(column_letter.upper()) - 1
-                # Read all data
-                all_rows = list(ws.iter_rows(values_only=True))
-                if len(all_rows) < 2:
-                    wb.close()
-                    return {"success": False, "error": "Not enough data to sort (need header + data)"}
-                header = all_rows[0]
-                data = all_rows[1:]
-
-                def sort_key(row):
-                    val = row[col_idx] if col_idx < len(row) else None
-                    if val is None:
-                        return (1, "")
-                    if numeric:
-                        try:
-                            return (0, float(val))
-                        except (ValueError, TypeError):
-                            return (1, str(val).lower())
-                    return (0, str(val).lower())
-
-                data.sort(key=sort_key, reverse=descending)
-                # Clear and rewrite
-                for row_cells in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
-                    for cell in row_cells:
-                        cell.value = None
-                for ci, h in enumerate(header, 1):
-                    ws.cell(row=1, column=ci, value=h)
-                for ri, row in enumerate(data, 2):
-                    for ci, val in enumerate(row, 1):
-                        ws.cell(row=ri, column=ci, value=val)
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "sorted_by": column_letter.upper(),
-                "descending": descending, "rows_sorted": len(data),
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.sort_sheet(file_path, column_letter, sheet_name, descending, numeric)
 
     def filter_rows(
         self, file_path: str, column_letter: str, operator: str, value: str,
         sheet_name: str = None,
     ) -> Dict[str, Any]:
-        """Filter/query rows. Returns matching rows without modifying the file.
-        operator: eq|ne|gt|lt|ge|le|contains|startswith|endswith"""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        valid_operators = {"eq", "ne", "gt", "lt", "ge", "le", "contains", "startswith", "endswith"}
-        if operator not in valid_operators:
-            return {
-                "success": False,
-                "error": f"Unknown operator '{operator}'. Valid: {' | '.join(sorted(valid_operators))}",
-            }
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-            col_idx = openpyxl.utils.column_index_from_string(column_letter.upper()) - 1
-            all_rows = list(ws.iter_rows(values_only=True))
-            wb.close()
-            if not all_rows:
-                return {"success": False, "error": "Empty sheet"}
-            header = [str(h) if h else "" for h in all_rows[0]]
-            data = all_rows[1:]
-
-            def compare(cell_val):
-                if cell_val is None:
-                    return False
-                cv = str(cell_val)
-                if operator in ("gt", "lt", "ge", "le"):
-                    try:
-                        nv = float(cv)
-                        tv = float(value)
-                        if operator == "gt": return nv > tv
-                        if operator == "lt": return nv < tv
-                        if operator == "ge": return nv >= tv
-                        if operator == "le": return nv <= tv
-                    except (ValueError, TypeError):
-                        return False
-                if operator == "eq":
-                    try:
-                        return float(cv) == float(value)
-                    except (ValueError, TypeError):
-                        return cv.lower() == value.lower()
-                if operator == "ne":
-                    try:
-                        return float(cv) != float(value)
-                    except (ValueError, TypeError):
-                        return cv.lower() != value.lower()
-                if operator == "contains": return value.lower() in cv.lower()
-                if operator == "startswith": return cv.lower().startswith(value.lower())
-                if operator == "endswith": return cv.lower().endswith(value.lower())
-                return False
-
-            matched = []
-            for ri, row in enumerate(data, 2):
-                cell_val = row[col_idx] if col_idx < len(row) else None
-                if compare(cell_val):
-                    matched.append({
-                        "row_number": ri,
-                        "values": [str(c) if c is not None else "" for c in row],
-                    })
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "filter": f"{column_letter.upper()} {operator} {value}",
-                "headers": header, "total_rows": len(data),
-                "matched_rows": len(matched),
-                "rows": matched[:500],
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.filter_rows(file_path, column_letter, operator, value, sheet_name)
 
     def sheet_list(self, file_path: str) -> Dict[str, Any]:
-        """List all sheets in a workbook with row/column counts."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path, read_only=True)
-            sheets = []
-            for name in wb.sheetnames:
-                ws = wb[name]
-                sheets.append({
-                    "name": name,
-                    "max_row": ws.max_row,
-                    "max_column": ws.max_column,
-                })
-            wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet_count": len(sheets), "sheets": sheets,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.sheet_list(file_path)
 
     def sheet_add(
         self, file_path: str, sheet_name: str, position: int = None
     ) -> Dict[str, Any]:
-        """Add a new sheet to the workbook."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                if sheet_name in wb.sheetnames:
-                    wb.close()
-                    return {"success": False, "error": f"Sheet '{sheet_name}' already exists"}
-                if position is not None:
-                    wb.create_sheet(sheet_name, position)
-                else:
-                    wb.create_sheet(sheet_name)
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet_added": sheet_name,
-                "sheets": wb.sheetnames if hasattr(wb, 'sheetnames') else [sheet_name],
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.sheet_add(file_path, sheet_name, position)
 
     def sheet_delete(self, file_path: str, sheet_name: str) -> Dict[str, Any]:
-        """Delete a sheet from the workbook."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                if sheet_name not in wb.sheetnames:
-                    wb.close()
-                    return {"success": False, "error": f"Sheet '{sheet_name}' not found. Available: {wb.sheetnames}"}
-                if len(wb.sheetnames) == 1:
-                    wb.close()
-                    return {"success": False, "error": "Cannot delete the only sheet in the workbook"}
-                del wb[sheet_name]
-                self._safe_save(wb, file_path)
-                remaining = wb.sheetnames
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet_deleted": sheet_name,
-                "remaining_sheets": remaining,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.sheet_delete(file_path, sheet_name)
 
     def sheet_rename(
         self, file_path: str, old_name: str, new_name: str
     ) -> Dict[str, Any]:
-        """Rename a sheet."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                if old_name not in wb.sheetnames:
-                    wb.close()
-                    return {"success": False, "error": f"Sheet '{old_name}' not found. Available: {wb.sheetnames}"}
-                wb[old_name].title = new_name
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "old_name": old_name, "new_name": new_name,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.sheet_rename(file_path, old_name, new_name)
 
     def merge_cells(
         self, file_path: str, range_ref: str, sheet_name: str = None
     ) -> Dict[str, Any]:
-        """Merge a range of cells."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-                ws.merge_cells(range_ref)
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "merged_range": range_ref,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.merge_cells(file_path, range_ref, sheet_name)
 
     def unmerge_cells(
         self, file_path: str, range_ref: str, sheet_name: str = None
     ) -> Dict[str, Any]:
-        """Unmerge a range of cells."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-                ws.unmerge_cells(range_ref)
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "unmerged_range": range_ref,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.unmerge_cells(file_path, range_ref, sheet_name)
 
     def format_cells(
         self, file_path: str, range_ref: str, sheet_name: str = None,
@@ -4371,122 +1651,19 @@ class DocumentServerClient:
         font_size: int = None, color: str = None, bg_color: str = None,
         number_format: str = None, alignment: str = None, wrap_text: bool = False,
     ) -> Dict[str, Any]:
-        """Apply formatting to a range of cells."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            from openpyxl.styles import Font, PatternFill, Alignment, numbers
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-                min_col, min_row, max_col, max_row = self._parse_range(range_ref)
-                count = 0
-                for row in ws.iter_rows(min_row=min_row, max_row=max_row,
-                                         min_col=min_col, max_col=max_col):
-                    for cell in row:
-                        if bold or italic or font_name or font_size or color:
-                            f = cell.font.copy(
-                                bold=bold if bold else cell.font.bold,
-                                italic=italic if italic else cell.font.italic,
-                                name=font_name if font_name else cell.font.name,
-                                size=font_size if font_size else cell.font.size,
-                                color=color.lstrip("#") if color else cell.font.color,
-                            )
-                            cell.font = f
-                        if bg_color:
-                            cell.fill = PatternFill(
-                                start_color=bg_color.lstrip("#"),
-                                end_color=bg_color.lstrip("#"),
-                                fill_type="solid",
-                            )
-                        if number_format:
-                            cell.number_format = number_format
-                        if alignment or wrap_text:
-                            h_align = alignment if alignment else None
-                            cell.alignment = Alignment(
-                                horizontal=h_align,
-                                wrap_text=wrap_text,
-                            )
-                        count += 1
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "range": range_ref,
-                "cells_formatted": count, "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.format_cells(file_path, range_ref, sheet_name, bold, italic, font_name, font_size, color, bg_color, number_format, alignment, wrap_text)
 
     def csv_import(
         self, file_path: str, csv_path: str, sheet_name: str = "Sheet1",
         delimiter: str = ",",
     ) -> Dict[str, Any]:
-        """Import a CSV file into an xlsx spreadsheet."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            import csv as csv_module
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                if Path(file_path).exists():
-                    wb = load_workbook(file_path)
-                    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.create_sheet(sheet_name)
-                    ws.delete_rows(1, ws.max_row)
-                else:
-                    wb = Workbook()
-                    ws = wb.active
-                    ws.title = sheet_name
-                with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
-                    reader = csv_module.reader(f, delimiter=delimiter)
-                    row_count = 0
-                    for ri, row in enumerate(reader, 1):
-                        for ci, val in enumerate(row, 1):
-                            try:
-                                if "." in val:
-                                    val = float(val)
-                                else:
-                                    val = int(val)
-                            except (ValueError, TypeError):
-                                pass
-                            ws.cell(row=ri, column=ci, value=val)
-                        row_count += 1
-                self._safe_save(wb, file_path)
-                wb.close()
-            return {
-                "success": True, "file": file_path,
-                "csv_source": csv_path, "sheet": sheet_name,
-                "rows_imported": row_count, "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.csv_import(file_path, csv_path, sheet_name, delimiter)
 
     def csv_export(
         self, file_path: str, csv_path: str, sheet_name: str = None,
         delimiter: str = ",",
     ) -> Dict[str, Any]:
-        """Export a spreadsheet sheet to CSV."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            import csv as csv_module
-            wb = load_workbook(file_path, read_only=True)
-            ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-            row_count = 0
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv_module.writer(f, delimiter=delimiter)
-                for row in ws.iter_rows(values_only=True):
-                    writer.writerow([str(c) if c is not None else "" for c in row])
-                    row_count += 1
-            wb.close()
-            return {
-                "success": True, "file": file_path,
-                "csv_output": csv_path, "sheet": ws.title,
-                "rows_exported": row_count,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.csv_export(file_path, csv_path, sheet_name, delimiter)
 
     # ==================== SPREADSHEET DATA VALIDATION ====================
 
@@ -4499,221 +1676,31 @@ class DocumentServerClient:
         prompt_message: str = None, prompt_title: str = None,
         error_style: str = "stop",
     ) -> Dict[str, Any]:
-        """Add a data validation rule to a cell range.
-        Types: list, whole, decimal, date, time, textLength, custom.
-        Operators: between, notBetween, equal, notEqual, lessThan,
-                   lessThanOrEqual, greaterThan, greaterThanOrEqual.
-        For list type: formula1 is comma-separated values (e.g. 'Yes,No,Maybe').
-        error_style: stop (reject), warning (warn+allow), information (info+allow)."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        valid_types = {"list", "whole", "decimal", "date", "time", "textLength", "custom"}
-        if validation_type not in valid_types:
-            return {"success": False, "error": f"Unknown type '{validation_type}'. Valid: {sorted(valid_types)}"}
-        valid_ops = {"between", "notBetween", "equal", "notEqual", "lessThan",
-                     "lessThanOrEqual", "greaterThan", "greaterThanOrEqual"}
-        if operator and operator not in valid_ops:
-            return {"success": False, "error": f"Unknown operator '{operator}'. Valid: {sorted(valid_ops)}"}
-        try:
-            from openpyxl.worksheet.datavalidation import DataValidation
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-
-                # Build formula1 for list type
-                f1 = formula1
-                if validation_type == "list" and f1 and not f1.startswith('"') and not f1.startswith("="):
-                    f1 = f'"{f1}"'
-
-                dv = DataValidation(
-                    type=validation_type,
-                    operator=operator,
-                    formula1=f1,
-                    formula2=formula2,
-                    allow_blank=allow_blank,
-                )
-                if error_message:
-                    dv.error = error_message
-                    dv.showErrorMessage = True
-                if error_title:
-                    dv.errorTitle = error_title
-                    dv.showErrorMessage = True
-                if prompt_message:
-                    dv.prompt = prompt_message
-                    dv.showInputMessage = True
-                if prompt_title:
-                    dv.promptTitle = prompt_title
-                    dv.showInputMessage = True
-                if error_style:
-                    dv.errorStyle = error_style
-
-                dv.add(cell_range)
-                ws.add_data_validation(dv)
-                self._safe_save(wb, file_path)
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title, "range": cell_range,
-                "type": validation_type, "operator": operator,
-                "formula1": f1, "formula2": formula2,
-                "error_style": error_style,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.add_validation(file_path, cell_range, validation_type, operator, formula1, formula2, allow_blank, sheet_name, error_message, error_title, prompt_message, prompt_title, error_style)
 
     def add_dropdown(
         self, file_path: str, cell_range: str, options: str,
         allow_blank: bool = True, sheet_name: str = None,
         prompt: str = None, error_message: str = None,
     ) -> Dict[str, Any]:
-        """Shortcut: add a dropdown list validation. Options are comma-separated."""
-        return self.add_validation(
-            file_path, cell_range, validation_type="list",
-            formula1=options, allow_blank=allow_blank,
-            sheet_name=sheet_name,
-            prompt_message=prompt, prompt_title="Select",
-            error_message=error_message or f"Must be one of: {options}",
-            error_title="Invalid Selection",
-        )
+        return self._xlsx_ops.add_dropdown(file_path, cell_range, options, allow_blank, sheet_name, prompt, error_message)
 
     def list_validations(
         self, file_path: str, sheet_name: str = None,
     ) -> Dict[str, Any]:
-        """List all data validation rules on a sheet."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path)
-            ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-            rules = []
-            for dv in ws.data_validations.dataValidation:
-                rule = {
-                    "range": str(dv.sqref),
-                    "type": dv.type,
-                    "operator": dv.operator,
-                    "formula1": dv.formula1,
-                    "formula2": dv.formula2,
-                    "allow_blank": dv.allowBlank,
-                    "error_style": dv.errorStyle,
-                    "error_message": dv.error,
-                    "error_title": dv.errorTitle,
-                    "prompt": dv.prompt,
-                    "prompt_title": dv.promptTitle,
-                }
-                # For list type, parse the allowed values
-                if dv.type == "list" and dv.formula1:
-                    raw = dv.formula1.strip('"')
-                    rule["allowed_values"] = [v.strip() for v in raw.split(",")]
-                rules.append(rule)
-            wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title,
-                "validation_count": len(rules),
-                "validations": rules,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.list_validations(file_path, sheet_name)
 
     def remove_validation(
         self, file_path: str, cell_range: str = None,
         sheet_name: str = None, remove_all: bool = False,
     ) -> Dict[str, Any]:
-        """Remove data validation from a range or all validations on a sheet."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        if not cell_range and not remove_all:
-            return {"success": False, "error": "Provide --range <range> or --all to remove validations"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                wb = load_workbook(file_path)
-                ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-                removed = 0
-                if remove_all:
-                    removed = len(ws.data_validations.dataValidation)
-                    ws.data_validations.dataValidation.clear()
-                else:
-                    target = cell_range.upper()
-                    to_keep = []
-                    for dv in ws.data_validations.dataValidation:
-                        if str(dv.sqref).upper() == target:
-                            removed += 1
-                        else:
-                            to_keep.append(dv)
-                    ws.data_validations.dataValidation.clear()
-                    for dv in to_keep:
-                        ws.add_data_validation(dv)
-                self._safe_save(wb, file_path)
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title,
-                "removed": removed,
-                "remaining": len(ws.data_validations.dataValidation),
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.remove_validation(file_path, cell_range, sheet_name, remove_all)
 
     def validate_data(
         self, file_path: str, sheet_name: str = None,
         max_rows: int = 1000,
     ) -> Dict[str, Any]:
-        """Audit existing cell data against validation rules. Returns pass/fail per cell."""
-        if not OPENPYXL_AVAILABLE:
-            return {"success": False, "error": "openpyxl not installed"}
-        try:
-            wb = load_workbook(file_path)
-            ws = self._get_sheet(wb, sheet_name) if sheet_name else wb.active
-            results = []
-            total_checked = 0
-            total_pass = 0
-            total_fail = 0
-            for dv in ws.data_validations.dataValidation:
-                for cell_range_str in str(dv.sqref).split():
-                    min_col, min_row, max_col, max_row = openpyxl.utils.range_boundaries(cell_range_str)
-                    max_row = min(max_row, min_row + max_rows - 1)
-                    for row in range(min_row, max_row + 1):
-                        for col in range(min_col, max_col + 1):
-                            cell = ws.cell(row=row, column=col)
-                            if cell.value is None:
-                                if not dv.allowBlank:
-                                    total_checked += 1
-                                    total_fail += 1
-                                    results.append({
-                                        "cell": cell.coordinate,
-                                        "value": None,
-                                        "valid": False,
-                                        "reason": "Blank not allowed",
-                                        "rule_type": dv.type,
-                                    })
-                                continue
-                            total_checked += 1
-                            valid, reason = self._check_validation(cell.value, dv)
-                            if valid:
-                                total_pass += 1
-                            else:
-                                total_fail += 1
-                                results.append({
-                                    "cell": cell.coordinate,
-                                    "value": str(cell.value)[:100],
-                                    "valid": False,
-                                    "reason": reason,
-                                    "rule_type": dv.type,
-                                    "rule_range": str(dv.sqref),
-                                })
-            wb.close()
-            return {
-                "success": True, "file": file_path,
-                "sheet": ws.title,
-                "cells_checked": total_checked,
-                "cells_passed": total_pass,
-                "cells_failed": total_fail,
-                "failures": results,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._xlsx_ops.validate_data(file_path, sheet_name, max_rows)
 
     @staticmethod
     def _check_validation(value, dv) -> tuple:
@@ -4791,130 +1778,25 @@ class DocumentServerClient:
     # ==================== EXTENDED PRESENTATION OPERATIONS ====================
 
     def delete_slide(self, file_path: str, slide_index: int) -> Dict[str, Any]:
-        """Delete a slide by index (0-based)."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                prs = Presentation(file_path)
-                total = len(prs.slides)
-                if slide_index < 0 or slide_index >= total:
-                    return {"success": False, "error": f"Slide index {slide_index} out of range (0..{total - 1})"}
-                if total <= 1:
-                    return {"success": False, "error": "Cannot delete the only slide"}
-                rId = prs.slides._sldIdLst[slide_index].get(qn("r:id"))
-                prs.part.drop_rel(rId)
-                del prs.slides._sldIdLst[slide_index]
-                self._safe_save(prs, file_path)
-            return {
-                "success": True, "file": file_path,
-                "deleted_slide": slide_index,
-                "remaining_slides": total - 1,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.delete_slide(file_path, slide_index=slide_index)
 
     def speaker_notes(
         self, file_path: str, slide_index: int, notes_text: str = None
     ) -> Dict[str, Any]:
-        """Read or set speaker notes for a slide. If notes_text is None, reads notes."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            if notes_text is None:
-                # Read mode
-                prs = Presentation(file_path)
-                total = len(prs.slides)
-                if slide_index < 0 or slide_index >= total:
-                    return {"success": False, "error": f"Slide index {slide_index} out of range"}
-                slide = prs.slides[slide_index]
-                if slide.has_notes_slide:
-                    text = slide.notes_slide.notes_text_frame.text
-                else:
-                    text = ""
-                return {
-                    "success": True, "file": file_path,
-                    "slide_index": slide_index, "has_notes": slide.has_notes_slide,
-                    "notes": text, "mode": "read",
-                }
-            else:
-                # Write mode
-                with self._file_lock(file_path):
-                    backup = self._snapshot_backup(file_path)
-                    prs = Presentation(file_path)
-                    total = len(prs.slides)
-                    if slide_index < 0 or slide_index >= total:
-                        return {"success": False, "error": f"Slide index {slide_index} out of range"}
-                    slide = prs.slides[slide_index]
-                    notes_slide = slide.notes_slide
-                    notes_slide.notes_text_frame.text = notes_text
-                    self._safe_save(prs, file_path)
-                return {
-                    "success": True, "file": file_path,
-                    "slide_index": slide_index,
-                    "notes": notes_text[:200],
-                    "mode": "write", "backup": backup or None,
-                }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.speaker_notes(
+            file_path, slide_index=slide_index, notes_text=notes_text
+        )
 
     def update_slide_text(
         self, file_path: str, slide_index: int,
         title: str = None, body: str = None,
     ) -> Dict[str, Any]:
-        """Update the title and/or body text of an existing slide."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                prs = Presentation(file_path)
-                total = len(prs.slides)
-                if slide_index < 0 or slide_index >= total:
-                    return {"success": False, "error": f"Slide index {slide_index} out of range"}
-                slide = prs.slides[slide_index]
-                updated = []
-                if title is not None and slide.shapes.title:
-                    slide.shapes.title.text = title
-                    updated.append("title")
-                if body is not None:
-                    for shape in slide.shapes:
-                        if shape.has_text_frame and shape != slide.shapes.title:
-                            shape.text_frame.text = body
-                            updated.append("body")
-                            break
-                self._safe_save(prs, file_path)
-            return {
-                "success": True, "file": file_path,
-                "slide_index": slide_index,
-                "updated_fields": updated,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.update_slide_text(
+            file_path, slide_index=slide_index, title=title, body=body
+        )
 
     def slide_count(self, file_path: str) -> Dict[str, Any]:
-        """Get the number of slides in a presentation."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            prs = Presentation(file_path)
-            count = len(prs.slides)
-            titles = []
-            for slide in prs.slides:
-                t = ""
-                if slide.shapes.title:
-                    t = slide.shapes.title.text
-                titles.append(t)
-            return {
-                "success": True, "file": file_path,
-                "slide_count": count,
-                "slide_titles": titles,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.slide_count(file_path)
 
     # ==================== IMAGE EXTRACTION ====================
 
@@ -4922,218 +1804,31 @@ class DocumentServerClient:
         self, file_path: str, output_dir: str,
         fmt: str = "png", prefix: str = "image",
     ) -> Dict[str, Any]:
-        """Extract all embedded images from a .docx file."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            from PIL import Image as PILImage
-            import io
-            os.makedirs(output_dir, exist_ok=True)
-            doc = Document(file_path)
-            extracted = []
-            idx = 0
-            for rel in doc.part.rels.values():
-                if "image" in rel.reltype:
-                    try:
-                        image_part = rel.target_part
-                        image_bytes = image_part.blob
-                        content_type = image_part.content_type
-                        # Determine source extension
-                        ext_map = {
-                            "image/png": "png", "image/jpeg": "jpg",
-                            "image/gif": "gif", "image/bmp": "bmp",
-                            "image/tiff": "tiff", "image/x-emf": "emf",
-                            "image/x-wmf": "wmf",
-                        }
-                        src_ext = ext_map.get(content_type, "png")
-                        out_name = f"{prefix}_{idx:03d}.{fmt}"
-                        out_path = os.path.join(output_dir, out_name)
-                        # Convert format if needed (skip EMF/WMF — save raw)
-                        if src_ext in ("emf", "wmf"):
-                            raw_name = f"{prefix}_{idx:03d}.{src_ext}"
-                            raw_path = os.path.join(output_dir, raw_name)
-                            with open(raw_path, "wb") as f:
-                                f.write(image_bytes)
-                            extracted.append({
-                                "index": idx, "file": raw_path,
-                                "format": src_ext, "size_bytes": len(image_bytes),
-                                "note": f"Vector format saved as .{src_ext} (cannot convert to {fmt})",
-                            })
-                        else:
-                            img = PILImage.open(io.BytesIO(image_bytes))
-                            if fmt.lower() == "jpg":
-                                img = img.convert("RGB")
-                                img.save(out_path, "JPEG", quality=90)
-                            else:
-                                img.save(out_path, fmt.upper())
-                            extracted.append({
-                                "index": idx, "file": out_path,
-                                "format": fmt, "width": img.width,
-                                "height": img.height,
-                                "size_bytes": os.path.getsize(out_path),
-                            })
-                        idx += 1
-                    except Exception as img_err:
-                        extracted.append({
-                            "index": idx, "error": str(img_err),
-                        })
-                        idx += 1
-            return {
-                "success": True, "file": file_path,
-                "output_dir": output_dir,
-                "images_extracted": len(extracted),
-                "images": extracted,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.extract_images_from_docx(
+            file_path, output_dir, fmt=fmt, prefix=prefix
+        )
 
     def extract_images_from_pptx(
         self, file_path: str, output_dir: str,
         slide_index: int = None, fmt: str = "png", prefix: str = "slide",
     ) -> Dict[str, Any]:
-        """Extract all images from a .pptx presentation (or a single slide)."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            from PIL import Image as PILImage
-            import io
-            os.makedirs(output_dir, exist_ok=True)
-            prs = Presentation(file_path)
-            extracted = []
-            idx = 0
-            slides_to_scan = []
-            if slide_index is not None:
-                if slide_index < 0 or slide_index >= len(prs.slides):
-                    return {"success": False, "error": f"Slide index {slide_index} out of range (0-{len(prs.slides)-1})"}
-                slides_to_scan = [(slide_index, prs.slides[slide_index])]
-            else:
-                slides_to_scan = list(enumerate(prs.slides))
-
-            for si, slide in slides_to_scan:
-                for shape in slide.shapes:
-                    if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
-                        try:
-                            image = shape.image
-                            image_bytes = image.blob
-                            content_type = image.content_type
-                            ext_map = {
-                                "image/png": "png", "image/jpeg": "jpg",
-                                "image/gif": "gif", "image/bmp": "bmp",
-                                "image/tiff": "tiff",
-                            }
-                            src_ext = ext_map.get(content_type, "png")
-                            out_name = f"{prefix}_{si:02d}_{idx:03d}.{fmt}"
-                            out_path = os.path.join(output_dir, out_name)
-                            img = PILImage.open(io.BytesIO(image_bytes))
-                            if fmt.lower() == "jpg":
-                                img = img.convert("RGB")
-                                img.save(out_path, "JPEG", quality=90)
-                            else:
-                                img.save(out_path, fmt.upper())
-                            extracted.append({
-                                "index": idx, "slide": si, "file": out_path,
-                                "format": fmt, "width": img.width,
-                                "height": img.height,
-                                "size_bytes": os.path.getsize(out_path),
-                                "shape_name": shape.name,
-                            })
-                            idx += 1
-                        except Exception as img_err:
-                            extracted.append({
-                                "index": idx, "slide": si,
-                                "error": str(img_err),
-                            })
-                            idx += 1
-            return {
-                "success": True, "file": file_path,
-                "output_dir": output_dir,
-                "images_extracted": len(extracted),
-                "images": extracted,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.extract_images(
+            file_path,
+            output_dir,
+            slide_index=slide_index,
+            fmt=fmt,
+            prefix=prefix,
+        )
 
     def pdf_extract_images(
         self, file_path: str, output_dir: str,
         fmt: str = "png", pages: str = None,
     ) -> Dict[str, Any]:
-        """Extract embedded image objects from a PDF using PyMuPDF."""
-        try:
-            import fitz
-            from PIL import Image as PILImage
-            import io
-        except ImportError:
-            return {"success": False, "error": "PyMuPDF (fitz) not installed. Run: pip install PyMuPDF"}
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            doc = fitz.open(file_path)
-            total_pages = len(doc)
-            # Parse page range
-            page_indices = self._parse_page_range(pages, total_pages)
-            extracted = []
-            seen_xrefs = set()
-            idx = 0
-            for pi in page_indices:
-                page = doc[pi]
-                image_list = page.get_images(full=True)
-                for img_info in image_list:
-                    xref = img_info[0]
-                    if xref in seen_xrefs:
-                        continue
-                    seen_xrefs.add(xref)
-                    try:
-                        base_image = doc.extract_image(xref)
-                        if not base_image:
-                            continue
-                        image_bytes = base_image["image"]
-                        img_ext = base_image.get("ext", "png")
-                        out_name = f"pdf_img_{pi:03d}_{idx:03d}.{fmt}"
-                        out_path = os.path.join(output_dir, out_name)
-                        img = PILImage.open(io.BytesIO(image_bytes))
-                        if fmt.lower() == "jpg":
-                            img = img.convert("RGB")
-                            img.save(out_path, "JPEG", quality=90)
-                        else:
-                            img.save(out_path, fmt.upper())
-                        extracted.append({
-                            "index": idx, "page": pi, "xref": xref,
-                            "file": out_path, "format": fmt,
-                            "width": img.width, "height": img.height,
-                            "size_bytes": os.path.getsize(out_path),
-                            "original_format": img_ext,
-                        })
-                        idx += 1
-                    except Exception as img_err:
-                        extracted.append({
-                            "index": idx, "page": pi, "xref": xref,
-                            "error": str(img_err),
-                        })
-                        idx += 1
-            doc.close()
-            return {
-                "success": True, "file": file_path,
-                "output_dir": output_dir,
-                "total_pages": total_pages,
-                "pages_scanned": len(page_indices),
-                "images_extracted": len([e for e in extracted if "file" in e]),
-                "images": extracted,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pdf_ops.extract_images(file_path, output_dir, fmt=fmt, pages=pages)
 
     @staticmethod
     def _normalize_pdf_bbox(bbox) -> Dict[str, Any]:
-        if not bbox or len(bbox) < 4:
-            return None
-        left, top, right, bottom = [float(value) for value in bbox[:4]]
-        return {
-            "left": left,
-            "top": top,
-            "right": right,
-            "bottom": bottom,
-            "width": max(0.0, right - left),
-            "height": max(0.0, bottom - top),
-        }
+        return PDFOperations.normalize_bbox(bbox)
 
     def pdf_read_blocks(
         self,
@@ -5143,122 +1838,13 @@ class DocumentServerClient:
         include_images: bool = True,
         include_empty: bool = False,
     ) -> Dict[str, Any]:
-        """Read native PDF text blocks, lines, and spans with bounding boxes via PyMuPDF."""
-        try:
-            import fitz
-        except ImportError:
-            return {"success": False, "error": "PyMuPDF (fitz) not installed. Run: pip install PyMuPDF"}
-
-        try:
-            doc = fitz.open(file_path)
-            total_pages = len(doc)
-            page_indices = self._parse_page_range(pages, total_pages)
-            pages_payload = []
-            text_block_count = 0
-            image_block_count = 0
-            span_count = 0
-
-            for pi in page_indices:
-                page = doc[pi]
-                page_dict = page.get_text("dict", sort=True)
-                page_blocks = []
-
-                for bi, block in enumerate(page_dict.get("blocks", [])):
-                    block_type = int(block.get("type", 0))
-                    block_bbox = self._normalize_pdf_bbox(block.get("bbox"))
-                    block_id = f"page_{pi}_block_{bi}"
-
-                    if block_type == 0:
-                        lines_payload = []
-                        block_text_parts = []
-
-                        for li, line in enumerate(block.get("lines", [])):
-                            line_bbox = self._normalize_pdf_bbox(line.get("bbox"))
-                            line_id = f"{block_id}_line_{li}"
-                            line_spans = []
-                            line_text_parts = []
-
-                            for si, span in enumerate(line.get("spans", [])):
-                                span_text = str(span.get("text", "") or "")
-                                if not include_empty and not span_text.strip():
-                                    continue
-                                span_id = f"{line_id}_span_{si}"
-                                span_payload = {
-                                    "span_id": span_id,
-                                    "text": span_text,
-                                    "bbox": self._normalize_pdf_bbox(span.get("bbox")),
-                                    "font": span.get("font"),
-                                    "size": float(span.get("size")) if span.get("size") is not None else None,
-                                    "flags": int(span.get("flags", 0)) if span.get("flags") is not None else None,
-                                    "color": int(span.get("color", 0)) if span.get("color") is not None else None,
-                                    "origin": list(span.get("origin", [])) if isinstance(span.get("origin"), (list, tuple)) else None,
-                                }
-                                span_count += 1
-                                line_spans.append(span_payload)
-                                if span_text.strip():
-                                    line_text_parts.append(span_text)
-
-                            line_text = re.sub(r"\s+", " ", " ".join(line_text_parts)).strip()
-                            if line_spans or include_empty or line_text:
-                                line_payload = {
-                                    "line_id": line_id,
-                                    "bbox": line_bbox,
-                                    "text": line_text,
-                                }
-                                if include_spans:
-                                    line_payload["spans"] = line_spans
-                                lines_payload.append(line_payload)
-                                if line_text:
-                                    block_text_parts.append(line_text)
-
-                        block_text = "\n".join([entry for entry in block_text_parts if entry]).strip()
-                        if block_text or lines_payload or include_empty:
-                            text_block_count += 1
-                            page_blocks.append({
-                                "block_id": block_id,
-                                "block_index": bi,
-                                "type": "text",
-                                "bbox": block_bbox,
-                                "text": block_text,
-                                "line_count": len(lines_payload),
-                                "span_count": sum(len(line.get("spans", [])) for line in lines_payload),
-                                "lines": lines_payload,
-                            })
-                    elif block_type == 1 and include_images:
-                        image_block_count += 1
-                        page_blocks.append({
-                            "block_id": block_id,
-                            "block_index": bi,
-                            "type": "image",
-                            "bbox": block_bbox,
-                            "width": block.get("width"),
-                            "height": block.get("height"),
-                            "ext": block.get("ext"),
-                            "transform": list(block.get("transform", [])) if isinstance(block.get("transform"), (list, tuple)) else None,
-                        })
-
-                pages_payload.append({
-                    "page_index": pi,
-                    "page_number": pi + 1,
-                    "width": float(page.rect.width),
-                    "height": float(page.rect.height),
-                    "block_count": len(page_blocks),
-                    "blocks": page_blocks,
-                })
-
-            doc.close()
-            return {
-                "success": True,
-                "file": file_path,
-                "total_pages": total_pages,
-                "pages_scanned": len(page_indices),
-                "text_block_count": text_block_count,
-                "image_block_count": image_block_count,
-                "span_count": span_count,
-                "pages": pages_payload,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pdf_ops.read_blocks(
+            file_path,
+            pages=pages,
+            include_spans=include_spans,
+            include_images=include_images,
+            include_empty=include_empty,
+        )
 
     def pdf_search_blocks(
         self,
@@ -5268,338 +1854,58 @@ class DocumentServerClient:
         case_sensitive: bool = False,
         include_spans: bool = True,
     ) -> Dict[str, Any]:
-        """Search native PDF text blocks/spans and return exact block/span anchors with bounding boxes."""
-        if not str(query or "").strip():
-            return {"success": False, "error": "query is required"}
-
-        payload = self.pdf_read_blocks(
+        return self._pdf_ops.search_blocks(
             file_path,
+            query,
             pages=pages,
+            case_sensitive=case_sensitive,
             include_spans=include_spans,
-            include_images=False,
-            include_empty=False,
         )
-        if not payload.get("success"):
-            return payload
-
-        query_text = str(query)
-        haystack_query = query_text if case_sensitive else query_text.lower()
-        matches = []
-
-        for page in payload.get("pages", []):
-            for block in page.get("blocks", []):
-                if block.get("type") != "text":
-                    continue
-
-                block_text = str(block.get("text", "") or "")
-                block_cmp = block_text if case_sensitive else block_text.lower()
-                if haystack_query in block_cmp:
-                    matches.append({
-                        "page_index": page.get("page_index"),
-                        "page_number": page.get("page_number"),
-                        "block_id": block.get("block_id"),
-                        "line_id": None,
-                        "span_id": None,
-                        "scope": "block",
-                        "bbox": block.get("bbox"),
-                        "text": block_text,
-                        "match_text": query_text,
-                    })
-
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        span_text = str(span.get("text", "") or "")
-                        span_cmp = span_text if case_sensitive else span_text.lower()
-                        if haystack_query not in span_cmp:
-                            continue
-                        matches.append({
-                            "page_index": page.get("page_index"),
-                            "page_number": page.get("page_number"),
-                            "block_id": block.get("block_id"),
-                            "line_id": line.get("line_id"),
-                            "span_id": span.get("span_id"),
-                            "scope": "span",
-                            "bbox": span.get("bbox"),
-                            "text": span_text,
-                            "match_text": query_text,
-                            "font": span.get("font"),
-                            "size": span.get("size"),
-                            "flags": span.get("flags"),
-                        })
-
-        return {
-            "success": True,
-            "file": file_path,
-            "query": query_text,
-            "case_sensitive": bool(case_sensitive),
-            "match_count": len(matches),
-            "matches": matches,
-            "pages_scanned": payload.get("pages_scanned", 0),
-            "total_pages": payload.get("total_pages", 0),
-        }
 
     def pdf_page_to_image(
         self, file_path: str, output_dir: str,
         pages: str = None, dpi: int = 150, fmt: str = "png",
     ) -> Dict[str, Any]:
-        """Render full PDF pages as images using PyMuPDF."""
-        try:
-            import fitz
-        except ImportError:
-            return {"success": False, "error": "PyMuPDF (fitz) not installed. Run: pip install PyMuPDF"}
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            doc = fitz.open(file_path)
-            total_pages = len(doc)
-            page_indices = self._parse_page_range(pages, total_pages)
-            rendered = []
-            for pi in page_indices:
-                page = doc[pi]
-                pix = page.get_pixmap(dpi=dpi)
-                if fmt.lower() == "jpg":
-                    out_name = f"page_{pi:03d}.jpg"
-                    out_path = os.path.join(output_dir, out_name)
-                    pix.pil_save(out_path, format="JPEG", quality=90)
-                else:
-                    out_name = f"page_{pi:03d}.png"
-                    out_path = os.path.join(output_dir, out_name)
-                    pix.save(out_path)
-                rendered.append({
-                    "page": pi, "file": out_path, "format": fmt,
-                    "width": pix.width, "height": pix.height,
-                    "dpi": dpi, "size_bytes": os.path.getsize(out_path),
-                })
-            doc.close()
-            return {
-                "success": True, "file": file_path,
-                "output_dir": output_dir,
-                "total_pages": total_pages,
-                "pages_rendered": len(rendered),
-                "dpi": dpi, "images": rendered,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pdf_ops.page_to_image(file_path, output_dir, pages=pages, dpi=dpi, fmt=fmt)
+
+    def pdf_sanitize(
+        self,
+        file_path: str,
+        output_path: str = None,
+        *,
+        clear_metadata: bool = False,
+        remove_xml_metadata: bool = False,
+        author: Optional[str] = None,
+        title: Optional[str] = None,
+        subject: Optional[str] = None,
+        keywords: Optional[str] = None,
+        creator: Optional[str] = None,
+        producer: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return self._pdf_ops.sanitize(
+            file_path,
+            output_path=output_path,
+            clear_metadata=clear_metadata,
+            remove_xml_metadata=remove_xml_metadata,
+            author=author,
+            title=title,
+            subject=subject,
+            keywords=keywords,
+            creator=creator,
+            producer=producer,
+        )
 
     @staticmethod
     def _parse_page_range(pages_str: str, total: int) -> List[int]:
-        """Parse a page range string like '0-3', '1,3,5', or None (= all)."""
-        if not pages_str:
-            return list(range(total))
-        result = []
-        for part in pages_str.split(","):
-            part = part.strip()
-            if "-" in part:
-                a, b = part.split("-", 1)
-                a = max(0, int(a))
-                b = min(total - 1, int(b))
-                result.extend(range(a, b + 1))
-            else:
-                idx = int(part)
-                if 0 <= idx < total:
-                    result.append(idx)
-        return sorted(set(result))
+        return PDFOperations.parse_page_range(pages_str, total)
 
     def doc_render_map(self, file_path: str) -> Dict[str, Any]:
-        """Build deterministic paragraph/table-cell to rendered PDF page/bbox mappings."""
-        if not DOCX_AVAILABLE:
-            return {"success": False, "error": "python-docx not installed"}
-        try:
-            abs_path = str(Path(file_path).resolve())
-            if not os.path.exists(abs_path):
-                return {"success": False, "error": f"File not found: {file_path}"}
-
-            with tempfile.TemporaryDirectory(prefix="onlyoffice-doc-render-map-") as tmpdir:
-                temp_docx = os.path.join(tmpdir, Path(abs_path).name)
-                temp_pdf = os.path.join(tmpdir, f"{Path(abs_path).stem}.pdf")
-                shutil.copy2(abs_path, temp_docx)
-
-                doc = Document(temp_docx)
-                paragraph_anchors = []
-                table_cell_anchors = []
-
-                paragraph_index = 0
-                for paragraph in doc.paragraphs:
-                    original_text = re.sub(r"\s+", " ", paragraph.text or "").strip()
-                    if not original_text:
-                        continue
-                    paragraph_index += 1
-                    anchor_id = f"SLOANE_P_{paragraph_index:04d}"
-                    paragraph.text = f"{anchor_id} {original_text}"
-                    paragraph_anchors.append({
-                        "anchor_id": anchor_id,
-                        "paragraph_index": paragraph_index,
-                        "text_preview": original_text[:220],
-                    })
-
-                for table_number, table in enumerate(doc.tables, start=1):
-                    for row_number, row in enumerate(table.rows, start=1):
-                        for column_number, cell in enumerate(row.cells, start=1):
-                            cell_text = re.sub(
-                                r"\s+",
-                                " ",
-                                " ".join(paragraph.text or "" for paragraph in cell.paragraphs),
-                            ).strip()
-                            if not cell_text:
-                                continue
-                            anchor_id = f"SLOANE_T{table_number}R{row_number}C{column_number}"
-                            cell.text = f"{anchor_id} {cell_text}"
-                            table_cell_anchors.append({
-                                "anchor_id": anchor_id,
-                                "table_number": table_number,
-                                "row_number": row_number,
-                                "column_number": column_number,
-                                "cell_ref": f"T{table_number}R{row_number}C{column_number}",
-                                "text_preview": cell_text[:220],
-                            })
-
-                doc.save(temp_docx)
-
-                pdf_result = self.doc_to_pdf(temp_docx, output_path=temp_pdf)
-                if not pdf_result.get("success"):
-                    return pdf_result
-
-                block_payload = self.pdf_read_blocks(
-                    temp_pdf,
-                    include_spans=True,
-                    include_images=False,
-                    include_empty=False,
-                )
-                if not block_payload.get("success"):
-                    return block_payload
-
-                marker_hits = {}
-                marker_pattern = re.compile(r"SLOANE_(?:P_\d{4}|T\d+R\d+C\d+)")
-
-                for page in block_payload.get("pages", []):
-                    for block in page.get("blocks", []):
-                        if block.get("type") != "text":
-                            continue
-                        for line in block.get("lines", []):
-                            for span in line.get("spans", []):
-                                span_text = str(span.get("text", "") or "")
-                                for match in marker_pattern.finditer(span_text):
-                                    anchor_id = match.group(0)
-                                    if anchor_id in marker_hits:
-                                        continue
-                                    marker_hits[anchor_id] = {
-                                        "page_index": page.get("page_index"),
-                                        "page_number": page.get("page_number"),
-                                        "block_id": block.get("block_id"),
-                                        "line_id": line.get("line_id"),
-                                        "span_id": span.get("span_id"),
-                                        "bbox": span.get("bbox") or block.get("bbox"),
-                                        "block_bbox": block.get("bbox"),
-                                        "text": block.get("text"),
-                                    }
-
-                paragraph_mappings = []
-                table_cell_mappings = []
-                unresolved_anchor_ids = []
-
-                for anchor in paragraph_anchors:
-                    hit = marker_hits.get(anchor["anchor_id"])
-                    if not hit:
-                        unresolved_anchor_ids.append(anchor["anchor_id"])
-                        continue
-                    paragraph_mappings.append({
-                        **anchor,
-                        **hit,
-                    })
-
-                for anchor in table_cell_anchors:
-                    hit = marker_hits.get(anchor["anchor_id"])
-                    if not hit:
-                        unresolved_anchor_ids.append(anchor["anchor_id"])
-                        continue
-                    table_cell_mappings.append({
-                        **anchor,
-                        **hit,
-                    })
-
-                return {
-                    "success": True,
-                    "file": abs_path,
-                    "paragraph_count": len(paragraph_anchors),
-                    "table_cell_count": len(table_cell_anchors),
-                    "mapped_paragraph_count": len(paragraph_mappings),
-                    "mapped_table_cell_count": len(table_cell_mappings),
-                    "pages": block_payload.get("pages_scanned", 0),
-                    "paragraphs": paragraph_mappings,
-                    "table_cells": table_cell_mappings,
-                    "unresolved_anchor_ids": unresolved_anchor_ids,
-                }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._doc_ops.doc_render_map(file_path)
 
     # ==================== PPTX SPATIAL / TEXTBOX ====================
 
     def list_shapes(self, file_path: str, slide_index: int = None) -> Dict[str, Any]:
-        """List all shapes on slides with full spatial info (position, size, type, text)."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            prs = Presentation(file_path)
-            slide_width_emu = prs.slide_width
-            slide_height_emu = prs.slide_height
-            slides_data = []
-            slides_to_scan = []
-            if slide_index is not None:
-                if slide_index < 0 or slide_index >= len(prs.slides):
-                    return {"success": False, "error": f"Slide index {slide_index} out of range (0-{len(prs.slides)-1})"}
-                slides_to_scan = [(slide_index, prs.slides[slide_index])]
-            else:
-                slides_to_scan = list(enumerate(prs.slides))
-
-            for si, slide in slides_to_scan:
-                shapes_info = []
-                for shape in slide.shapes:
-                    info = {
-                        "shape_id": shape.shape_id,
-                        "name": shape.name,
-                        "shape_type": str(shape.shape_type),
-                        "left_inches": round(shape.left / 914400, 3) if shape.left is not None else None,
-                        "top_inches": round(shape.top / 914400, 3) if shape.top is not None else None,
-                        "width_inches": round(shape.width / 914400, 3) if shape.width is not None else None,
-                        "height_inches": round(shape.height / 914400, 3) if shape.height is not None else None,
-                        "rotation": shape.rotation,
-                        "has_text": shape.has_text_frame,
-                    }
-                    if shape.has_text_frame:
-                        tf = shape.text_frame
-                        info["text"] = tf.text[:200]
-                        info["word_wrap"] = tf.word_wrap
-                        info["auto_size"] = str(tf.auto_size) if tf.auto_size else None
-                        info["margin_left"] = round(tf.margin_left / 914400, 3) if tf.margin_left is not None else None
-                        info["margin_right"] = round(tf.margin_right / 914400, 3) if tf.margin_right is not None else None
-                        info["margin_top"] = round(tf.margin_top / 914400, 3) if tf.margin_top is not None else None
-                        info["margin_bottom"] = round(tf.margin_bottom / 914400, 3) if tf.margin_bottom is not None else None
-                    # Check if it's a placeholder
-                    try:
-                        pf = shape.placeholder_format
-                        if pf is not None:
-                            info["placeholder_idx"] = pf.idx
-                            info["placeholder_type"] = str(pf.type)
-                    except Exception:
-                        pass
-                    # Right/bottom edge (for overlap detection)
-                    if info["left_inches"] is not None and info["width_inches"] is not None:
-                        info["right_inches"] = round(info["left_inches"] + info["width_inches"], 3)
-                    if info["top_inches"] is not None and info["height_inches"] is not None:
-                        info["bottom_inches"] = round(info["top_inches"] + info["height_inches"], 3)
-                    shapes_info.append(info)
-                slides_data.append({
-                    "slide_index": si,
-                    "shape_count": len(shapes_info),
-                    "shapes": shapes_info,
-                })
-            return {
-                "success": True, "file": file_path,
-                "slide_width_inches": round(slide_width_emu / 914400, 3),
-                "slide_height_inches": round(slide_height_emu / 914400, 3),
-                "slides": slides_data,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.list_shapes(file_path, slide_index=slide_index)
 
     def add_textbox(
         self, file_path: str, slide_index: int,
@@ -5610,60 +1916,22 @@ class DocumentServerClient:
         color: str = None, align: str = None,
         word_wrap: bool = True,
     ) -> Dict[str, Any]:
-        """Add a textbox at a specific position on a slide (all units in inches)."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                prs = Presentation(file_path)
-                total = len(prs.slides)
-                if slide_index < 0 or slide_index >= total:
-                    return {"success": False, "error": f"Slide index {slide_index} out of range (0-{total-1})"}
-                slide = prs.slides[slide_index]
-                txBox = slide.shapes.add_textbox(
-                    Inches(left), Inches(top),
-                    Inches(width), Inches(height),
-                )
-                tf = txBox.text_frame
-                tf.word_wrap = word_wrap
-                p = tf.paragraphs[0]
-                p.text = text
-                # Apply formatting
-                if font_size or font_name or bold or italic or color:
-                    run = p.runs[0] if p.runs else p.add_run()
-                    if not p.runs:
-                        run.text = text
-                        p.clear()
-                        p._p.append(run._r)
-                    if font_size:
-                        run.font.size = Pt(font_size)
-                    if font_name:
-                        run.font.name = font_name
-                    run.font.bold = bold if bold else None
-                    run.font.italic = italic if italic else None
-                    if color:
-                        c = color.lstrip("#")
-                        from pptx.dml.color import RGBColor as PptxRGB
-                        run.font.color.rgb = PptxRGB(int(c[:2], 16), int(c[2:4], 16), int(c[4:6], 16))
-                if align:
-                    align_map = {
-                        "left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER,
-                        "right": PP_ALIGN.RIGHT, "justify": PP_ALIGN.JUSTIFY,
-                    }
-                    if align.lower() in align_map:
-                        p.alignment = align_map[align.lower()]
-                self._safe_save(prs, file_path)
-            return {
-                "success": True, "file": file_path,
-                "slide_index": slide_index,
-                "shape_name": txBox.name,
-                "position": {"left": left, "top": top, "width": width, "height": height},
-                "text": text[:100],
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.add_textbox(
+            file_path,
+            slide_index=slide_index,
+            text=text,
+            left=left,
+            top=top,
+            width=width,
+            height=height,
+            font_size=font_size,
+            font_name=font_name,
+            bold=bold,
+            italic=italic,
+            color=color,
+            align=align,
+            word_wrap=word_wrap,
+        )
 
     def modify_shape(
         self, file_path: str, slide_index: int, shape_name: str,
@@ -5672,165 +1940,26 @@ class DocumentServerClient:
         text: str = None, font_size: float = None,
         rotation: float = None,
     ) -> Dict[str, Any]:
-        """Modify position, size, text, or rotation of an existing shape by name."""
-        if not PPTX_AVAILABLE:
-            return {"success": False, "error": "python-pptx not installed"}
-        try:
-            with self._file_lock(file_path):
-                backup = self._snapshot_backup(file_path)
-                prs = Presentation(file_path)
-                total = len(prs.slides)
-                if slide_index < 0 or slide_index >= total:
-                    return {"success": False, "error": f"Slide index {slide_index} out of range (0-{total-1})"}
-                slide = prs.slides[slide_index]
-                target = None
-                for shape in slide.shapes:
-                    if shape.name == shape_name:
-                        target = shape
-                        break
-                if target is None:
-                    available = [s.name for s in slide.shapes]
-                    return {"success": False, "error": f"Shape '{shape_name}' not found. Available: {available}"}
-                changes = []
-                if left is not None:
-                    target.left = Inches(left)
-                    changes.append(f"left={left}in")
-                if top is not None:
-                    target.top = Inches(top)
-                    changes.append(f"top={top}in")
-                if width is not None:
-                    target.width = Inches(width)
-                    changes.append(f"width={width}in")
-                if height is not None:
-                    target.height = Inches(height)
-                    changes.append(f"height={height}in")
-                if rotation is not None:
-                    target.rotation = rotation
-                    changes.append(f"rotation={rotation}°")
-                if text is not None and target.has_text_frame:
-                    target.text_frame.text = text
-                    changes.append(f"text='{text[:50]}'")
-                if font_size is not None and target.has_text_frame:
-                    for paragraph in target.text_frame.paragraphs:
-                        for run in paragraph.runs:
-                            run.font.size = Pt(font_size)
-                    changes.append(f"font_size={font_size}pt")
-                self._safe_save(prs, file_path)
-            return {
-                "success": True, "file": file_path,
-                "slide_index": slide_index,
-                "shape_name": shape_name,
-                "changes": changes,
-                "backup": backup or None,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.modify_shape(
+            file_path,
+            slide_index=slide_index,
+            shape_name=shape_name,
+            left=left,
+            top=top,
+            width=width,
+            height=height,
+            text=text,
+            font_size=font_size,
+            rotation=rotation,
+        )
 
     def preview_slide(
         self, file_path: str, output_dir: str,
         slide_index: int = None, dpi: int = 150,
     ) -> Dict[str, Any]:
-        """Render presentation slides as images via OnlyOffice x2t + PyMuPDF.
-        Requires: Docker container 'onlyoffice-documentserver' running, PyMuPDF on system."""
-        try:
-            import subprocess
-            import uuid
-            os.makedirs(output_dir, exist_ok=True)
-
-            # Step 1: Copy pptx into Docker container
-            abs_path = str(Path(file_path).resolve())
-            tmp_id = uuid.uuid4().hex[:8]
-            container_pptx = f"/tmp/preview_{tmp_id}.pptx"
-            container_pdf = f"/tmp/preview_{tmp_id}.pdf"
-            container_xml = f"/tmp/preview_{tmp_id}.xml"
-
-            subprocess.run(
-                ["docker", "cp", abs_path, f"onlyoffice-documentserver:{container_pptx}"],
-                check=True, capture_output=True, timeout=30,
-            )
-
-            # Step 2: Create x2t conversion XML
-            x2t_xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<TaskQueueDataConvert>
-  <m_sFileFrom>{container_pptx}</m_sFileFrom>
-  <m_sFileTo>{container_pdf}</m_sFileTo>
-  <m_nFormatTo>513</m_nFormatTo>
-  <m_sFontDir>/usr/share/fonts</m_sFontDir>
-  <m_sThemeDir>/var/www/onlyoffice/documentserver/server/FileConverter/bin/empty/themes</m_sThemeDir>
-</TaskQueueDataConvert>"""
-            subprocess.run(
-                ["docker", "exec", "-i", "onlyoffice-documentserver", "bash", "-c",
-                 f"cat > {container_xml} << 'XMLEOF'\n{x2t_xml}\nXMLEOF"],
-                check=True, capture_output=True, timeout=15,
-            )
-
-            # Step 3: Run x2t conversion
-            subprocess.run(
-                ["docker", "exec", "onlyoffice-documentserver",
-                 "/var/www/onlyoffice/documentserver/server/FileConverter/bin/x2t",
-                 container_xml],
-                check=True, capture_output=True, timeout=60,
-            )
-
-            # Step 4: Copy PDF back
-            local_pdf = os.path.join(output_dir, f"preview_{tmp_id}.pdf")
-            subprocess.run(
-                ["docker", "cp", f"onlyoffice-documentserver:{container_pdf}", local_pdf],
-                check=True, capture_output=True, timeout=30,
-            )
-
-            # Step 5: Render PDF pages to images with PyMuPDF
-            import fitz
-            doc = fitz.open(local_pdf)
-            total_pages = len(doc)
-            rendered = []
-
-            pages_to_render = []
-            if slide_index is not None:
-                if slide_index < 0 or slide_index >= total_pages:
-                    doc.close()
-                    return {"success": False, "error": f"Slide {slide_index} out of range (0-{total_pages-1})"}
-                pages_to_render = [slide_index]
-            else:
-                pages_to_render = list(range(total_pages))
-
-            for pi in pages_to_render:
-                page = doc[pi]
-                pix = page.get_pixmap(dpi=dpi)
-                out_path = os.path.join(output_dir, f"slide_{pi:03d}.png")
-                pix.save(out_path)
-                rendered.append({
-                    "slide": pi, "file": out_path,
-                    "width": pix.width, "height": pix.height,
-                    "dpi": dpi, "size_bytes": os.path.getsize(out_path),
-                })
-            doc.close()
-
-            # Cleanup temp PDF
-            try:
-                os.unlink(local_pdf)
-            except OSError:
-                pass
-            # Cleanup container files
-            subprocess.run(
-                ["docker", "exec", "onlyoffice-documentserver", "rm", "-f",
-                 container_pptx, container_pdf, container_xml],
-                capture_output=True, timeout=10,
-            )
-
-            return {
-                "success": True, "file": file_path,
-                "output_dir": output_dir,
-                "total_slides": total_pages,
-                "slides_rendered": len(rendered),
-                "dpi": dpi, "images": rendered,
-            }
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Conversion timed out (is onlyoffice-documentserver running?)"}
-        except FileNotFoundError:
-            return {"success": False, "error": "Docker not found. Is it installed?"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._pptx_ops.preview_slide(
+            file_path, output_dir, slide_index=slide_index, dpi=dpi
+        )
 
     def _office_to_pdf(
         self, file_path: str, output_path: str = None,
@@ -5937,14 +2066,12 @@ class DocumentServerClient:
     def doc_to_pdf(
         self, file_path: str, output_path: str = None,
     ) -> Dict[str, Any]:
-        """Convert a .docx file to PDF via OnlyOffice x2t inside the Docker container."""
-        return self._office_to_pdf(file_path, output_path=output_path)
+        return self._doc_ops.doc_to_pdf(file_path, output_path=output_path)
 
     def spreadsheet_to_pdf(
         self, file_path: str, output_path: str = None,
     ) -> Dict[str, Any]:
-        """Convert a spreadsheet file to PDF via OnlyOffice x2t inside Docker."""
-        return self._office_to_pdf(file_path, output_path=output_path)
+        return self._xlsx_ops.spreadsheet_to_pdf(file_path, output_path)
 
     def _preview_via_pdf(
         self,
@@ -6001,9 +2128,8 @@ class DocumentServerClient:
         dpi: int = 150,
         fmt: str = "png",
     ) -> Dict[str, Any]:
-        """Render DOCX pages as images via OnlyOffice conversion + PyMuPDF."""
-        return self._preview_via_pdf(
-            file_path, output_dir, self.doc_to_pdf, pages=pages, dpi=dpi, fmt=fmt
+        return self._doc_ops.preview_document(
+            file_path, output_dir, pages=pages, dpi=dpi, fmt=fmt
         )
 
     def preview_spreadsheet(
@@ -6014,15 +2140,7 @@ class DocumentServerClient:
         dpi: int = 150,
         fmt: str = "png",
     ) -> Dict[str, Any]:
-        """Render spreadsheet pages as images via OnlyOffice conversion + PyMuPDF."""
-        return self._preview_via_pdf(
-            file_path,
-            output_dir,
-            self.spreadsheet_to_pdf,
-            pages=pages,
-            dpi=dpi,
-            fmt=fmt,
-        )
+        return self._xlsx_ops.preview_spreadsheet(file_path, output_dir, pages, dpi, fmt)
 
     _EDITOR_EXTENSIONS = {
         "document": {".docx", ".doc", ".docm", ".dotx", ".odt", ".rtf", ".txt", ".md", ".html", ".htm", ".epub"},
@@ -6604,437 +2722,104 @@ class DocumentServerClient:
         }
 
     # ==================== RDF OPERATIONS ====================
-
-    _RDF_FORMAT_MAP = {
-        ".ttl": "turtle", ".n3": "n3", ".nt": "nt",
-        ".nq": "nquads", ".jsonld": "json-ld", ".json": "json-ld",
-        ".rdf": "xml", ".xml": "xml", ".trig": "trig",
-    }
-
     def _rdf_format_from_path(self, file_path: str) -> str:
-        """Infer RDF serialisation format from file extension. Defaults to turtle."""
-        return self._RDF_FORMAT_MAP.get(Path(file_path).suffix.lower(), "turtle")
+        return self._rdf_ops.rdf_format_from_path(file_path)
 
-    def _rdf_safe_save(self, data: str, file_path: str):
-        """Atomic write of a serialised RDF string via temp-file + os.replace."""
-        target = Path(file_path)
-        fd, tmp_path = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(target.parent))
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(data)
-            os.replace(tmp_path, str(target))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+    def _rdf_safe_save(self, data: str, file_path: str) -> None:
+        self._rdf_ops.rdf_safe_save(data, file_path)
 
     def _get_rdf_graph(self, file_path: str = None):
-        """Load or create an RDF graph. Returns (graph, error_string)."""
-        try:
-            from rdflib import Graph
-        except ImportError:
-            return None, "rdflib not installed. pip install rdflib"
-        g = Graph()
-        if file_path:
-            if not os.path.exists(file_path):
-                return None, f"File not found: {file_path}"
-            fmt = self._rdf_format_from_path(file_path)
-            g.parse(file_path, format=fmt)
-        return g, None
+        return self._rdf_ops.get_graph(file_path)
 
     def rdf_create(
         self, file_path: str, base_uri: str = None, format: str = "turtle",
         prefixes: Dict[str, str] = None,
     ) -> Dict[str, Any]:
-        """Create a new empty RDF graph file."""
-        try:
-            from rdflib import Graph, Namespace
-            from rdflib.namespace import RDF, RDFS, OWL, XSD, FOAF, DCTERMS, SKOS
-            with self._file_lock(file_path):
-                self._snapshot_backup(file_path)
-                g = Graph()
-                if base_uri:
-                    g.bind("base", Namespace(base_uri))
-                if prefixes:
-                    for prefix, uri in prefixes.items():
-                        g.bind(prefix, Namespace(uri))
-                for ns_prefix, ns in [
-                    ("rdf", RDF), ("rdfs", RDFS), ("owl", OWL),
-                    ("xsd", XSD), ("foaf", FOAF), ("dcterms", DCTERMS), ("skos", SKOS),
-                ]:
-                    g.bind(ns_prefix, ns)
-                data = g.serialize(format=format)
-                self._rdf_safe_save(data, file_path)
-            return {
-                "success": True, "file": file_path,
-                "format": format, "triples": len(g),
-                "prefixes": {p: str(n) for p, n in g.namespaces()},
-            }
-        except ImportError:
-            return {"success": False, "error": "rdflib not installed. pip install rdflib"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.create(
+            file_path,
+            base_uri=base_uri,
+            format=format,
+            prefixes=prefixes,
+        )
 
     def rdf_read(
         self, file_path: str, limit: int = 100
     ) -> Dict[str, Any]:
-        """Read and parse an RDF file, returning triples and stats."""
-        try:
-            g, err = self._get_rdf_graph(file_path)
-            if err:
-                return {"success": False, "error": err}
-            triples = []
-            truncated = False
-            for i, (s, p, o) in enumerate(g):
-                if i >= limit:
-                    truncated = True
-                    break
-                triples.append({
-                    "subject": str(s), "predicate": str(p), "object": str(o),
-                })
-            subjects = set(str(s) for s in g.subjects())
-            predicates = set(str(p) for p in g.predicates())
-            return {
-                "success": True, "file": file_path,
-                "total_triples": len(g),
-                "unique_subjects": len(subjects),
-                "unique_predicates": len(predicates),
-                "prefixes": {p: str(n) for p, n in g.namespaces()},
-                "triples": triples,
-                "truncated": truncated,
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.read(file_path, limit=limit)
 
     def rdf_add(
         self, file_path: str, subject: str, predicate: str, object_val: str,
         object_type: str = "uri", lang: str = None, datatype: str = None,
         format: str = None,
     ) -> Dict[str, Any]:
-        """Add a triple to an RDF graph. object_type: uri|literal|bnode"""
-        try:
-            from rdflib import URIRef, Literal, BNode
-            if lang and datatype:
-                return {"success": False, "error": "Cannot specify both --lang and --datatype for a literal"}
-            with self._file_lock(file_path):
-                self._snapshot_backup(file_path)
-                g, err = self._get_rdf_graph(file_path)
-                if err:
-                    return {"success": False, "error": err}
-                fmt = format or self._rdf_format_from_path(file_path)
-                s = URIRef(subject)
-                p = URIRef(predicate)
-                if object_type == "literal":
-                    dt = URIRef(datatype) if datatype else None
-                    o = Literal(object_val, lang=lang, datatype=dt)
-                elif object_type == "bnode":
-                    o = BNode(object_val)
-                else:
-                    o = URIRef(object_val)
-                before = len(g)
-                g.add((s, p, o))
-                data = g.serialize(format=fmt)
-                self._rdf_safe_save(data, file_path)
-            return {
-                "success": True, "file": file_path,
-                "triple": {"subject": str(s), "predicate": str(p), "object": str(o)},
-                "triples_before": before, "triples_after": len(g),
-                "format": fmt,
-            }
-        except ImportError:
-            return {"success": False, "error": "rdflib not installed"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.add(
+            file_path,
+            subject,
+            predicate,
+            object_val,
+            object_type=object_type,
+            lang=lang,
+            datatype=datatype,
+            format=format,
+        )
 
     def rdf_remove(
         self, file_path: str, subject: str = None, predicate: str = None,
-        object_val: str = None, object_type: str = "uri", format: str = None,
+        object_val: str = None, object_type: str = "uri", lang: str = None,
+        datatype: str = None, format: str = None,
     ) -> Dict[str, Any]:
-        """Remove triples matching a pattern. None values act as wildcards.
-        object_type: uri|literal|bnode — controls how object_val is interpreted."""
-        try:
-            from rdflib import URIRef, Literal, BNode
-            with self._file_lock(file_path):
-                self._snapshot_backup(file_path)
-                g, err = self._get_rdf_graph(file_path)
-                if err:
-                    return {"success": False, "error": err}
-                fmt = format or self._rdf_format_from_path(file_path)
-                s = URIRef(subject) if subject else None
-                p = URIRef(predicate) if predicate else None
-                if object_val is None:
-                    o = None
-                elif object_type == "literal":
-                    o = Literal(object_val)
-                elif object_type == "bnode":
-                    o = BNode(object_val)
-                else:
-                    o = URIRef(object_val)
-                before = len(g)
-                g.remove((s, p, o))
-                data = g.serialize(format=fmt)
-                self._rdf_safe_save(data, file_path)
-            return {
-                "success": True, "file": file_path,
-                "triples_before": before, "triples_after": len(g),
-                "removed": before - len(g), "format": fmt,
-            }
-        except ImportError:
-            return {"success": False, "error": "rdflib not installed"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.remove(
+            file_path,
+            subject=subject,
+            predicate=predicate,
+            object_val=object_val,
+            object_type=object_type,
+            lang=lang,
+            datatype=datatype,
+            format=format,
+        )
 
     def rdf_query(
         self, file_path: str, sparql: str, limit: int = 100
     ) -> Dict[str, Any]:
-        """Execute a SPARQL query against an RDF graph.
-        Handles SELECT, ASK, CONSTRUCT, and DESCRIBE query types correctly."""
-        try:
-            g, err = self._get_rdf_graph(file_path)
-            if err:
-                return {"success": False, "error": err}
-            results = g.query(sparql)
-            qtype = results.type  # "SELECT" | "ASK" | "CONSTRUCT" | "DESCRIBE"
-
-            if qtype == "ASK":
-                return {
-                    "success": True, "file": file_path,
-                    "query_type": "ASK",
-                    "result": bool(results),
-                }
-
-            if qtype in ("CONSTRUCT", "DESCRIBE"):
-                triples = []
-                truncated = False
-                for i, (s, p, o) in enumerate(results.graph):
-                    if i >= limit:
-                        truncated = True
-                        break
-                    triples.append({"subject": str(s), "predicate": str(p), "object": str(o)})
-                return {
-                    "success": True, "file": file_path,
-                    "query_type": qtype,
-                    "triples": triples,
-                    "result_count": len(triples),
-                    "truncated": truncated,
-                }
-
-            # SELECT
-            variables = [str(v) for v in results.vars] if results.vars else []
-            rows = []
-            truncated = False
-            for i, row in enumerate(results):
-                if i >= limit:
-                    truncated = True
-                    break
-                rows.append({
-                    str(v): str(row[v]) if row[v] is not None else None
-                    for v in results.vars
-                })
-            return {
-                "success": True, "file": file_path,
-                "query_type": "SELECT",
-                "variables": variables,
-                "result_count": len(rows),
-                "rows": rows,
-                "truncated": truncated,
-            }
-        except ImportError:
-            return {"success": False, "error": "rdflib not installed"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.query(file_path, sparql, limit=limit)
 
     def rdf_export(
         self, file_path: str, output_path: str, output_format: str = "turtle"
     ) -> Dict[str, Any]:
-        """Convert/export an RDF graph to a different serialization format.
-        Formats: turtle, xml, n3, nt, nquads, json-ld, trig"""
-        try:
-            g, err = self._get_rdf_graph(file_path)
-            if err:
-                return {"success": False, "error": err}
-            data = g.serialize(format=output_format)
-            self._rdf_safe_save(data, output_path)
-            return {
-                "success": True, "source": file_path,
-                "output": output_path, "format": output_format,
-                "triples": len(g),
-                "size": os.path.getsize(output_path),
-            }
-        except ImportError:
-            return {"success": False, "error": "rdflib not installed"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.export(
+            file_path,
+            output_path,
+            output_format=output_format,
+        )
 
     def rdf_merge(
         self, file_path: str, other_path: str, output_path: str = None,
         format: str = None,
     ) -> Dict[str, Any]:
-        """Merge two RDF graphs. Result goes to output_path or overwrites file_path."""
-        try:
-            abs_a = str(Path(file_path).resolve())
-            abs_b = str(Path(other_path).resolve())
-            if abs_a == abs_b:
-                return {
-                    "success": False,
-                    "error": "Cannot merge a file with itself — use rdf-export to copy",
-                }
-            target = output_path or file_path
-            with self._file_lock(target):
-                self._snapshot_backup(target)
-                g1, err = self._get_rdf_graph(file_path)
-                if err:
-                    return {"success": False, "error": err}
-                g2, err = self._get_rdf_graph(other_path)
-                if err:
-                    return {"success": False, "error": err}
-                fmt = format or self._rdf_format_from_path(target)
-                before = len(g1)
-                g1 += g2
-                data = g1.serialize(format=fmt)
-                self._rdf_safe_save(data, target)
-            return {
-                "success": True, "file": target,
-                "graph_a_triples": before, "graph_b_triples": len(g2),
-                "merged_triples": len(g1), "format": fmt,
-            }
-        except ImportError:
-            return {"success": False, "error": "rdflib not installed"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.merge(
+            file_path,
+            other_path,
+            output_path=output_path,
+            format=format,
+        )
 
     def rdf_stats(self, file_path: str) -> Dict[str, Any]:
-        """Get detailed statistics about an RDF graph."""
-        try:
-            from rdflib import Literal as RDFLiteral
-            from rdflib.namespace import RDF
-            g, err = self._get_rdf_graph(file_path)
-            if err:
-                return {"success": False, "error": err}
-            subjects = set(str(s) for s in g.subjects())
-            predicates = set(str(p) for p in g.predicates())
-            objects_uri = set()
-            objects_literal = set()
-            for o in g.objects():
-                if isinstance(o, RDFLiteral):
-                    objects_literal.add(str(o))
-                else:
-                    objects_uri.add(str(o))
-            # Class instances via rdf:type
-            classes = set()
-            for s, p, o in g.triples((None, RDF.type, None)):
-                classes.add(str(o))
-            # Predicate frequency
-            pred_freq: Dict[str, int] = {}
-            for s, p, o in g:
-                ps = str(p)
-                pred_freq[ps] = pred_freq.get(ps, 0) + 1
-            top_predicates = sorted(pred_freq.items(), key=lambda x: x[1], reverse=True)[:20]
-            return {
-                "success": True, "file": file_path,
-                "total_triples": len(g),
-                "unique_subjects": len(subjects),
-                "unique_predicates": len(predicates),
-                "unique_objects_uri": len(objects_uri),
-                "unique_objects_literal": len(objects_literal),
-                "rdf_types": sorted(classes),
-                "type_count": len(classes),
-                "prefixes": {p: str(n) for p, n in g.namespaces()},
-                "top_predicates": [{"predicate": p, "count": c} for p, c in top_predicates],
-            }
-        except ImportError:
-            return {"success": False, "error": "rdflib not installed"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.stats(file_path)
 
     def rdf_namespace(
         self, file_path: str, prefix: str = None, uri: str = None,
         format: str = None,
     ) -> Dict[str, Any]:
-        """Add a namespace prefix or list all prefixes. If prefix+uri given, adds. Otherwise lists."""
-        try:
-            from rdflib import Namespace
-            if prefix and uri:
-                with self._file_lock(file_path):
-                    self._snapshot_backup(file_path)
-                    g, err = self._get_rdf_graph(file_path)
-                    if err:
-                        return {"success": False, "error": err}
-                    fmt = format or self._rdf_format_from_path(file_path)
-                    g.bind(prefix, Namespace(uri))
-                    data = g.serialize(format=fmt)
-                    self._rdf_safe_save(data, file_path)
-                return {
-                    "success": True, "file": file_path,
-                    "action": "added", "prefix": prefix, "uri": uri,
-                    "all_prefixes": {p: str(n) for p, n in g.namespaces()},
-                }
-            else:
-                g, err = self._get_rdf_graph(file_path)
-                if err:
-                    return {"success": False, "error": err}
-                return {
-                    "success": True, "file": file_path,
-                    "prefixes": {p: str(n) for p, n in g.namespaces()},
-                    "prefix_count": len(list(g.namespaces())),
-                }
-        except ImportError:
-            return {"success": False, "error": "rdflib not installed"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.namespace(
+            file_path,
+            prefix=prefix,
+            uri=uri,
+            format=format,
+        )
 
     def rdf_validate(self, file_path: str, shapes_path: str) -> Dict[str, Any]:
-        """Validate an RDF graph against SHACL shapes."""
-        try:
-            from pyshacl import validate as shacl_validate
-            from rdflib import URIRef
-            g, err = self._get_rdf_graph(file_path)
-            if err:
-                return {"success": False, "error": err}
-            sg, err = self._get_rdf_graph(shapes_path)
-            if err:
-                return {"success": False, "error": f"Shapes file error: {err}"}
-            conforms, results_graph, results_text = shacl_validate(
-                g, shacl_graph=sg, inference="rdfs"
-            )
-            # Parse structured violations from results_graph
-            violations = []
-            try:
-                SH = "http://www.w3.org/ns/shacl#"
-                for result_node in results_graph.objects(None, URIRef(f"{SH}result")):
-                    v: Dict[str, Any] = {}
-                    fn = next(results_graph.objects(result_node, URIRef(f"{SH}focusNode")), None)
-                    if fn:
-                        v["focusNode"] = str(fn)
-                    rp = next(results_graph.objects(result_node, URIRef(f"{SH}resultPath")), None)
-                    if rp:
-                        v["resultPath"] = str(rp)
-                    rm = next(results_graph.objects(result_node, URIRef(f"{SH}resultMessage")), None)
-                    if rm:
-                        v["message"] = str(rm)
-                    rs = next(results_graph.objects(result_node, URIRef(f"{SH}resultSeverity")), None)
-                    if rs:
-                        v["severity"] = str(rs).split("#")[-1]
-                    sc = next(results_graph.objects(result_node, URIRef(f"{SH}sourceConstraintComponent")), None)
-                    if sc:
-                        v["constraint"] = str(sc).split("#")[-1]
-                    violations.append(v)
-            except Exception:
-                pass  # violation parsing is best-effort
-            return {
-                "success": True, "file": file_path,
-                "shapes_file": shapes_path,
-                "conforms": conforms,
-                "violation_count": len(violations),
-                "violations": violations,
-                "results_text": results_text[:5000],
-            }
-        except ImportError:
-            return {"success": False, "error": "pyshacl not installed. pip install pyshacl"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return self._rdf_ops.validate(file_path, shapes_path)
 
     # ==================== HELPERS ====================
 

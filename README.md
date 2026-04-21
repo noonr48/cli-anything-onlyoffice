@@ -1,8 +1,8 @@
-# CLI-Anything OnlyOffice v4.2.0
+# CLI-Anything OnlyOffice v4.4.11
 
 > Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs — designed for AI agents.
 
-**112 commands. 7 categories. Full JSON output. Production-safe.**
+**117 commands. 7 categories. Full JSON output. Production-safe.**
 
 Part of the [SLOANE OS](https://github.com/sloane-os) agent stack. Agents call this via `cli_anything_run(tool='onlyoffice', ...)`.
 
@@ -58,10 +58,18 @@ When calling from SLOANE OS or another agent, invoke via the venv binary directl
 cli-anything-onlyoffice <command> [args] [--json]
         │
         ▼
-  core/cli.py          ← Arg parsing + dispatch router
+  core/cli.py          ← Bootstrap + prefix routing
+  core/general_cli.py  ← General commands + alias compatibility
+  core/doc_cli.py      ← Dedicated DOCX CLI parsing/dispatch
+  core/xlsx_cli.py     ← Dedicated XLSX/chart CLI parsing/dispatch
         │
         ▼
-utils/docserver.py     ← Backend engine (~5,900 lines)
+utils/docserver.py     ← Shared editor/render backend + lightweight modality wrappers
+utils/doc_ops.py       ← Dedicated DOCX submission/runtime operations
+utils/xlsx_ops.py      ← Dedicated XLSX/chart runtime operations
+utils/pdf_ops.py       ← Dedicated PDF operations module
+utils/pptx_ops.py      ← Dedicated PPTX operations module
+utils/rdf_ops.py       ← Dedicated RDF graph operations module
   ├── Documents        ← python-docx wrapper + image extraction
   ├── Spreadsheets     ← openpyxl wrapper + scipy stats + data validation
   ├── Presentations    ← python-pptx wrapper + spatial awareness + preview
@@ -91,7 +99,7 @@ All responses have `{"success": true, ...}` or `{"success": false, "error": "...
 
 ## Mode 1 — Documents (.docx)
 
-**28 commands** — full lifecycle from creation to APA references, plus image extraction and rendered page preview.
+**32 commands** — full lifecycle from creation to APA references, plus image extraction, rendered page preview, submission preflight, and hidden-data sanitization.
 
 `.docx` files are OOXML containers, so generic text file readers will often treat them as binary. For agent use, rely on the semantic document commands below (`doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`) rather than raw file reads.
 
@@ -234,11 +242,12 @@ cli-anything-onlyoffice doc-formatting-info /tmp/essay.docx --json
 ### Page Layout
 
 #### `doc-layout <file> [options]`
-Set page orientation, margins, header, and page numbers.
+Set page size, orientation, margins, header, and page numbers.
 
-Options: `--orientation portrait|landscape`, `--margin-top <in>`, `--margin-bottom <in>`, `--margin-left <in>`, `--margin-right <in>`, `--header <text>`, `--page-numbers`
+Options: `--size A4|Letter`, `--orientation portrait|landscape`, `--margin-top <in>`, `--margin-bottom <in>`, `--margin-left <in>`, `--margin-right <in>`, `--header <text>`, `--page-numbers`
 
 ```bash
+cli-anything-onlyoffice doc-layout /tmp/submission.docx --size A4 --json
 cli-anything-onlyoffice doc-layout /tmp/essay.docx --orientation landscape --json
 cli-anything-onlyoffice doc-layout /tmp/report.docx \
   --margin-top 1.0 --margin-bottom 1.0 --margin-left 1.25 --margin-right 1.25 \
@@ -386,6 +395,30 @@ cli-anything-onlyoffice doc-get-metadata /tmp/essay.docx --json
 ```
 ```json
 {"success": true, "author": "SLOANE Agent", "title": "Research Essay", "created": "2026-04-07T10:00:00"}
+```
+
+#### `doc-inspect-hidden-data <file>`
+Inspect hidden DOCX data relevant to submission workflows: comments, revision markup, custom XML parts, page size, and core/app metadata.
+
+```bash
+cli-anything-onlyoffice doc-inspect-hidden-data /tmp/submission.docx --json
+```
+
+#### `doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>]`
+Run a submission-oriented DOCX preflight. This wraps hidden-data inspection, section page-size checks, visible text font audits, and inline-image sizing checks into a single pass/fail/warn report.
+
+```bash
+cli-anything-onlyoffice doc-preflight /tmp/submission.docx --expected-page-size A4 --json
+cli-anything-onlyoffice doc-preflight /tmp/submission.docx \
+  --expected-page-size A4 --expected-font "Times New Roman" --expected-font-size 12 --json
+```
+
+#### `doc-sanitize <file> [output_path] [options]`
+Sanitize a DOCX for submission. Useful options: `--remove-comments`, `--accept-revisions`, `--clear-metadata`, `--remove-custom-xml`, `--set-remove-personal-information`, and metadata overrides such as `--author`.
+
+```bash
+cli-anything-onlyoffice doc-sanitize /tmp/submission.docx /tmp/submission-clean.docx \
+  --remove-comments --accept-revisions --clear-metadata --author benbi --json
 ```
 
 #### `doc-comment <file> <comment> [--paragraph <index>]`
@@ -1017,7 +1050,7 @@ cli-anything-onlyoffice pptx-update-text /tmp/lecture.pptx 1 \
 
 ### Image Extraction
 
-#### `pptx-extract-images <file> <output_dir> [--slide <index>] [--format png|jpg]`
+#### `pptx-extract-images <file> <output_dir> [--slide <index>] [--format png|jpg] [--prefix <name>]`
 Extract all images from slides. Optionally target a single slide.
 
 ```bash
@@ -1126,7 +1159,7 @@ cli-anything-onlyoffice pptx-preview /tmp/lecture.pptx /tmp/previews --slide 1 -
 
 ## Mode 5 — PDF Native Blocks + Image Operations
 
-**4 commands** — read/search native PDF blocks or extract/render images using PyMuPDF.
+**6 commands** — read/search native PDF blocks, extract/render images, inspect hidden PDF data, or sanitize PDF metadata using PyMuPDF.
 
 #### `pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]`
 Extract embedded image objects (photos, figures, charts) from a PDF.
@@ -1163,6 +1196,21 @@ cli-anything-onlyoffice pdf-page-to-image /tmp/paper.pdf /tmp/pages --pages 0,3,
 ```
 
 Page ranges: `0-3` (pages 0 through 3), `1,3,5` (specific pages), omit for all. Default DPI: 150.
+
+#### `pdf-inspect-hidden-data <file>`
+Inspect hidden PDF metadata, XMP/XML metadata presence, annotations, embedded files, form usage, and page-size consistency.
+
+```bash
+cli-anything-onlyoffice pdf-inspect-hidden-data /tmp/submission.pdf --json
+```
+
+#### `pdf-sanitize <file> [output_path] [options]`
+Clear PDF metadata/XMP and optionally set replacement metadata such as `--author`.
+
+```bash
+cli-anything-onlyoffice pdf-sanitize /tmp/submission.pdf /tmp/submission-clean.pdf \
+  --clear-metadata --remove-xml-metadata --author benbi --json
+```
 
 #### `pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]`
 Read native PDF text blocks, lines, and spans with exact bounding boxes. Use this when downstream tooling needs stable `block_id` / `line_id` / `span_id` anchors instead of page-only references.
@@ -1253,7 +1301,7 @@ cli-anything-onlyoffice rdf-add /tmp/knowledge.ttl \
 #### `rdf-remove <file> [options]`
 Remove triples matching a pattern. `None` / omitting acts as wildcard.
 
-Options: `--subject <uri>`, `--predicate <uri>`, `--object <value>`, `--format <f>`
+Options: `--subject <uri>`, `--predicate <uri>`, `--object <value>`, `--type uri|literal|bnode`, `--lang <tag>`, `--datatype <xsd_uri>`, `--format <f>`
 
 ```bash
 # Remove all triples about Alice
@@ -1264,7 +1312,12 @@ cli-anything-onlyoffice rdf-remove /tmp/knowledge.ttl \
 cli-anything-onlyoffice rdf-remove /tmp/knowledge.ttl \
   --subject "http://example.org/Alice" \
   --predicate "http://xmlns.com/foaf/0.1/name" \
-  --object "Alice Smith" --json
+  --object "Alice Smith" --type literal --json
+
+# Remove a language-tagged literal
+cli-anything-onlyoffice rdf-remove /tmp/knowledge.ttl \
+  --predicate "http://www.w3.org/2000/01/rdf-schema#label" \
+  --object "Alice" --type literal --lang en --json
 ```
 
 #### `rdf-query <file> <sparql_query> [--limit <n>]`
@@ -1440,7 +1493,7 @@ cli-anything-onlyoffice status --json
 ```json
 {
   "success": true,
-  "version": "4.2.0",
+  "version": "4.4.11",
   "python": "/path/to/.venv/bin/python3",
   "python_docx": true,
   "openpyxl": true,
@@ -1499,14 +1552,14 @@ cli-anything-onlyoffice backup-restore /tmp/grades.xlsx --latest --dry-run --jso
 
 | Category | Count | Commands |
 |----------|-------|----------|
-| Documents (.docx) | 29 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, **doc-render-map**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, doc-word-count |
+| Documents (.docx) | 32 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, **doc-render-map**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, **doc-inspect-hidden-data**, **doc-preflight**, **doc-sanitize**, doc-word-count |
 | Spreadsheets (.xlsx) | 39 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export, **xlsx-add-validation**, **xlsx-add-dropdown**, **xlsx-list-validations**, **xlsx-remove-validation**, **xlsx-validate-data**, **xlsx-to-pdf**, **xlsx-preview** |
 | Charts (.xlsx) | 4 | chart-create, chart-comparison, chart-grade-dist, chart-progress |
-| Presentations (.pptx) | 16 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text, **pptx-extract-images**, **pptx-list-shapes**, **pptx-add-textbox**, **pptx-modify-shape**, **pptx-preview** |
-| PDF (.pdf) | 4 | **pdf-extract-images**, **pdf-page-to-image**, **pdf-read-blocks**, **pdf-search-blocks** |
+| Presentations (.pptx) | 15 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text, **pptx-extract-images**, **pptx-list-shapes**, **pptx-add-textbox**, **pptx-modify-shape**, **pptx-preview** |
+| PDF (.pdf) | 6 | **pdf-extract-images**, **pdf-page-to-image**, **pdf-read-blocks**, **pdf-search-blocks**, **pdf-inspect-hidden-data**, **pdf-sanitize** |
 | RDF Knowledge Graphs | 10 | rdf-create, rdf-read, rdf-add, rdf-remove, rdf-query, rdf-export, rdf-merge, rdf-stats, rdf-namespace, rdf-validate |
 | General | 11 | list, open, watch, info, backup-list, backup-prune, backup-restore, **editor-session**, **editor-capture**, status, help |
-| **Total** | **112** | |
+| **Total** | **117** | |
 
 ---
 
@@ -1680,16 +1733,28 @@ result = cli_anything_run(tool="onlyoffice", args=[
 
 ```
 agent-harness/
-├── setup.py                          # Package config (v4.1.0)
+├── setup.py                          # Package config (v4.4.11)
 ├── README.md                         # This file
 ├── cli_anything/
 │   └── onlyoffice/
 │       ├── core/
 │       │   ├── __init__.py
-│       │   └── cli.py                # CLI router + dispatcher (~3,200 lines)
+│       │   ├── cli.py                # Main CLI bootstrap + modality routing
+│       │   ├── command_registry.py   # Single source of truth for command/help metadata
+│       │   ├── general_cli.py        # General command handling + alias compatibility
+│       │   ├── doc_cli.py            # DOCX-specific CLI parsing/dispatch
+│       │   ├── pdf_cli.py            # PDF-specific CLI parsing/dispatch
+│       │   ├── pptx_cli.py           # PPTX-specific CLI parsing/dispatch
+│       │   ├── rdf_cli.py            # RDF-specific CLI parsing/dispatch
+│       │   └── xlsx_cli.py           # XLSX/chart-specific CLI parsing/dispatch
 │       ├── utils/
 │       │   ├── __init__.py
-│       │   └── docserver.py          # Backend engine (~5,900 lines)
+│       │   ├── docserver.py          # Shared backend engine (~2,800 lines)
+│       │   ├── pdf_ops.py            # Dedicated PDF operations
+│       │   ├── pptx_ops.py           # Dedicated PPTX operations
+│       │   ├── doc_ops.py            # Dedicated DOCX submission/runtime operations
+│       │   ├── rdf_ops.py            # Dedicated RDF graph operations
+│       │   └── xlsx_ops.py           # Dedicated XLSX/chart operations
 │       ├── skills/
 │       │   ├── __init__.py
 │       │   └── SKILL.md              # SLOANE skill manifest
@@ -1698,7 +1763,15 @@ agent-harness/
 │           ├── test_concurrency_stress.py
 │           ├── test_formula_safety.py
 │           ├── test_inferential_stats.py
+│           ├── test_pdf_ops.py
+│           ├── test_pptx_ops.py
 │           ├── test_production_readiness.py
+│           ├── test_doc_cli.py
+│           ├── test_doc_ops.py
+│           ├── test_general_cli.py
+│           ├── test_rdf_ops.py
+│           ├── test_xlsx_cli.py
+│           ├── test_xlsx_ops.py
 │           └── test_research_pack.py
 ```
 
@@ -1708,6 +1781,19 @@ agent-harness/
 
 | Version | Changes |
 |---------|---------|
+| **4.4.11** | **General CLI modularization + direct handler coverage.** Moved alias normalization plus the non-prefixed `open/watch/info/editor-* / backup-* / status / help / list` command layer into `core/general_cli.py`, reducing `core/cli.py` to bootstrap and modality routing. Added dedicated `test_general_cli.py` coverage for alias handling, editor-session parsing, backup pruning, usage errors, and unknown-command fallthrough. |
+| **4.4.10** | **Registry-driven handler usage strings.** Extended `core/command_registry.py` with canonical command-usage lookups and usage overrides, then rewired the DOCX/XLSX/PPTX/PDF/RDF handlers plus general command usage errors to consume the registry instead of embedding raw `Usage:` strings. This removes the last large block of duplicated command-surface text from the handler layer. |
+| **4.4.9** | **Registry-driven command/help surface.** Added `core/command_registry.py` as the single source of truth for command catalogue metadata, help examples, category counts, and total command count. `help` and `status` now consume the registry instead of maintaining separate hardcoded counts/descriptions, and regression coverage now verifies the live CLI surface matches the registry. |
+| **4.4.8** | **DOCX backend split completed + broader runtime coverage.** Moved the remaining public DOCX CRUD, formatting, layout, metadata, table, hyperlink, list, and APA-reference methods into `utils/doc_ops.py`, reducing `utils/docserver.py` to shared helpers, editor/render plumbing, and thin wrappers. Expanded `test_doc_ops.py` to cover direct CRUD, formatting, table/search, metadata/layout, and reference-building workflows. |
+| **4.4.7** | **DOCX backend modularization + direct runtime regression coverage.** Extracted DOCX submission/runtime logic into `utils/doc_ops.py`, moving hidden-data inspection, preflight/sanitization, DOCX image extraction, rendered preview delegation, and render-map generation out of `utils/docserver.py`. Added dedicated `test_doc_ops.py` coverage for sanitization, preflight, preview delegation, and render-map delegation. |
+| **4.4.6** | **XLSX backend modularization + direct runtime regression coverage.** Extracted spreadsheet/chart runtime logic into `utils/xlsx_ops.py`, reducing `utils/docserver.py` to shared DOCX/editor/render responsibilities plus thin spreadsheet wrappers. Added dedicated `test_xlsx_ops.py` coverage for spreadsheet creation/writes, formula-audit risk detection, and preview delegation through the shared PDF render pipeline. |
+| **4.4.5** | **DOCX CLI modularization + dispatch regression coverage.** Extracted document command parsing into `core/doc_cli.py`, moving the last large document command slab out of the main router while preserving the existing command surface and DOCX availability guards. Added dedicated `test_doc_cli.py` coverage for document creation, layout parsing, sanitization, preview dispatch, render-map dispatch, and unavailable-`python-docx` error handling. |
+| **4.4.4** | **XLSX/chart CLI modularization + dispatch regression coverage.** Extracted spreadsheet and chart command parsing into `core/xlsx_cli.py`, removing the largest remaining command slab from the main router while preserving the public CLI surface. Added dedicated `test_xlsx_cli.py` coverage for spreadsheet writes/calculations, validation parsing, preview dispatch, Mann-Whitney dispatch, and chart creation dispatch. |
+| **4.4.3** | **PPTX modularization + regression coverage.** Extracted presentation runtime logic into `utils/pptx_ops.py` and PPTX CLI parsing into `core/pptx_cli.py`. Added dedicated PPTX regression coverage for creation, notes, text/image/table editing, image extraction, spatial inspection, textbox/shape editing, preview delegation, and CLI dispatch. Also removed the lingering DOCX/PPTX symbol collision in the shared backend by localising presentation-specific imports. |
+| **4.4.2** | **PDF modularization + regression coverage.** Extracted PDF runtime logic into `utils/pdf_ops.py` and PDF CLI parsing into `core/pdf_cli.py`. Added dedicated PDF regression coverage for extraction, rendering, block reading/search, hidden-data inspection, sanitization, and PDF CLI dispatch. This reduces pressure on the monolithic DOCX/XLSX/PPTX/PDF backend while preserving the existing command surface. |
+| **4.4.1** | **RDF modularization + hardening.** Extracted RDF runtime logic into `utils/rdf_ops.py` and RDF CLI parsing into `core/rdf_cli.py`. Added dedicated RDF regression coverage for CRUD, query modes, merge/export, namespace handling, and SHACL validation. Hardened `rdf-export` with lock/backup discipline, made `rdf-validate` surface violation-parse errors, and extended `rdf-remove` so language-tagged and typed literals can be targeted precisely. |
+| **4.4.0** | **2 new commands + richer preflight auditing.** Added `doc-preflight` to combine DOCX hidden-data inspection, page-size checks, font audits, and image sizing checks into a single submission report. Added `pdf-inspect-hidden-data` to expose PDF metadata, annotations, embedded files, forms, and page-size consistency before export or submission. |
+| **4.3.0** | **3 new commands + page-size upgrade.** `doc-layout` now supports named page sizes (`A4`, `Letter`). Added `doc-inspect-hidden-data` for submission preflight, `doc-sanitize` for DOCX comment/revision/metadata cleanup, and `pdf-sanitize` for PDF metadata/XMP cleanup. |
 | **4.2.0** | **3 new commands.** Native PDF block/span reading and search with exact bounding boxes, plus DOCX render-map generation that anchors paragraphs and table cells to OnlyOffice-rendered PDF coordinates for downstream review tooling. |
 | **4.1.0** | **15 new commands.** Image extraction from PDFs (PyMuPDF), .docx, and .pptx files. PDF page-to-image rendering at configurable DPI. Spatial awareness for presentations — list all shapes with exact positions/sizes, add textboxes at precise coordinates, modify any shape by name. Slide preview rendering via OnlyOffice x2t. Excel-style data validation — dropdowns, number/decimal ranges, text length, date constraints, custom formulas — plus post-hoc data auditing that checks every cell against its rules. New deps: PyMuPDF, Pillow. |
 | **4.0.2** | Comprehensive bug-fix audit across all four modes: RDF full rewrite — 13 bugs fixed (ASK/CONSTRUCT/DESCRIBE query support, `rdf-remove` literal/bnode type flag, file-not-found guard, double-iteration fix, locking + atomic saves on all write methods, lang+datatype mutual exclusion, self-merge guard, `rdf-validate` structured violations output); xlsx — `xlsx-filter` now validates operator before executing, `xlsx-read` returns error on unknown sheet name instead of silently reading all sheets; docx — `doc-layout` landscape correctly swaps page dimensions, `doc-search` NameError fixed on table-only documents; pptx — `pptx-add-bullets` leading-empty-line enumerate-index bug fixed (orphan empty first paragraph) |

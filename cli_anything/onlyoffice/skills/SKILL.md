@@ -1,19 +1,19 @@
 ---
 name: onlyoffice
-version: 4.2.0
+version: 4.4.11
 author: SLOANE OS
-description: 112-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
+description: 117-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
 tags: [productivity, documents, office, onlyoffice, charts, spreadsheets, rdf, apa, pdf, image-extraction, spatial, data-validation]
 ---
 
-# CLI-Anything OnlyOffice v4.2.0
+# CLI-Anything OnlyOffice v4.4.11
 
 Programmatic control over Office documents designed for AI agents. Full JSON output. Production-safe with atomic writes, two-layer file locking, and automatic backups.
 
-## What's New in v4.2.0
-- **Native PDF Blocks** — read/search exact PDF text blocks, lines, and spans with bounding boxes
-- **DOCX Render Map** — map DOCX paragraphs and table cells to OnlyOffice-rendered PDF pages and boxes
-- **Proof-Grade Anchors** — expose stable block/span ids for downstream reviewer and audit tooling
+## What's New in v4.4.11
+- **General CLI Split** — alias handling plus the non-prefixed `open/watch/info/editor-* / backup-* / status / help / list` command layer now lives in `core/general_cli.py`, so `core/cli.py` is reduced to bootstrap and modality routing
+- **Direct General-Handler Tests** — added dedicated `test_general_cli.py` coverage for alias normalization, editor-session flag parsing, backup-prune parsing, usage errors, and unknown-command fallthrough
+- **Carry Forward** — the registry-driven help/status surface, registry-driven usage strings, and all earlier modality/backend splits remain in place from `v4.4.10`, `v4.4.9`, `v4.4.8`, `v4.4.7`, `v4.4.6`, `v4.4.5`, `v4.4.4`, `v4.4.3`, `v4.4.2`, and `v4.4.1`
 
 ## Carry Forward from v4.1.0
 - **Image Extraction** — pull images out of PDFs, .docx, and .pptx files
@@ -77,7 +77,7 @@ If you need the rendered visual layout, use preview/export commands rather than 
 
 ---
 
-## DOCUMENTS (.docx) — 29 commands
+## DOCUMENTS (.docx) — 32 commands
 
 ### Core CRUD
 - `doc-create <file> <title> <content>`
@@ -97,7 +97,7 @@ If you need the rendered visual layout, use preview/export commands rather than 
 - `doc-formatting-info <file>`
 
 ### Page Layout
-- `doc-layout <file> [--orientation portrait|landscape] [--margin-top <in>] [--margin-bottom <in>] [--margin-left <in>] [--margin-right <in>] [--header <text>] [--page-numbers]`
+- `doc-layout <file> [--size A4|Letter] [--orientation portrait|landscape] [--margin-top <in>] [--margin-bottom <in>] [--margin-left <in>] [--margin-right <in>] [--header <text>] [--page-numbers]`
 
 ### Rich Content
 - `doc-add-table <file> <headers_csv> <data_csv>` — rows separated by `;`
@@ -113,6 +113,9 @@ If you need the rendered visual layout, use preview/export commands rather than 
 ### Metadata & Annotations
 - `doc-set-metadata <file> [--author] [--title] [--subject] [--keywords] [--comments] [--category]`
 - `doc-get-metadata <file>`
+- `doc-inspect-hidden-data <file>`
+- `doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>]`
+- `doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--author <a>]`
 - `doc-comment <file> <comment> [--paragraph <index>]`
 
 ### References (APA 7th)
@@ -218,7 +221,7 @@ Types: bar, column, bar_horizontal, line, pie, scatter
 - `pptx-update-text <file> <slide_index> [--title <t>] [--body <b>]`
 
 ### Image Extraction
-- `pptx-extract-images <file> <output_dir> [--slide <index>] [--format png|jpg]` — extract all images from slides
+- `pptx-extract-images <file> <output_dir> [--slide <index>] [--format png|jpg] [--prefix <name>]` — extract all images from slides
 
 ### Spatial Awareness & Layout Control
 - `pptx-list-shapes <file> [--slide <index>]` — list ALL shapes with exact position, size, text, type
@@ -240,12 +243,14 @@ Types: bar, column, bar_horizontal, line, pie, scatter
 
 ---
 
-## PDF (.pdf) — 4 commands
+## PDF (.pdf) — 6 commands
 
 - `pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]` — extract embedded image objects (PyMuPDF)
 - `pdf-page-to-image <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]` — render full pages as images
 - `pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]` — read native PDF blocks/lines/spans with bbox metadata
 - `pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]` — search exact PDF blocks/spans and return native anchors
+- `pdf-inspect-hidden-data <file>` — inspect metadata, XMP/XML metadata, annotations, embedded files, form usage, and page-size consistency
+- `pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>]` — clear PDF metadata/XMP for submission
 
 Page ranges: `0-3` (pages 0 through 3), `1,3,5` (specific pages), omit for all pages.
 Default DPI: 150. Use 300 for print quality.
@@ -257,7 +262,7 @@ Default DPI: 150. Use 300 for print quality.
 - `rdf-create <file> [--base <uri>] [--format turtle|xml|n3|json-ld] [--prefix <p>=<uri>]`
 - `rdf-read <file> [--limit <n>]`
 - `rdf-add <file> <subject> <predicate> <object> [--type uri|literal|bnode] [--lang <tag>] [--datatype <xsd_uri>]`
-- `rdf-remove <file> [--subject <uri>] [--predicate <uri>] [--object <value>]`
+- `rdf-remove <file> [--subject <uri>] [--predicate <uri>] [--object <value>] [--type uri|literal|bnode] [--lang <tag>] [--datatype <xsd_uri>]`
 - `rdf-query <file> <sparql_query> [--limit <n>]`
 - `rdf-export <file> <output_file> [--format <format>]`
 - `rdf-merge <file_a> <file_b> [--output <file>] [--format <f>]`
@@ -296,5 +301,5 @@ Default DPI: 150. Use 300 for print quality.
 
 ---
 
-**Last Updated:** 2026-04-08
-**Version:** 4.1.0
+**Last Updated:** 2026-04-21
+**Version:** 4.4.11
