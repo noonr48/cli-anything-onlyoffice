@@ -5121,6 +5121,223 @@ class DocumentServerClient:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    @staticmethod
+    def _normalize_pdf_bbox(bbox) -> Dict[str, Any]:
+        if not bbox or len(bbox) < 4:
+            return None
+        left, top, right, bottom = [float(value) for value in bbox[:4]]
+        return {
+            "left": left,
+            "top": top,
+            "right": right,
+            "bottom": bottom,
+            "width": max(0.0, right - left),
+            "height": max(0.0, bottom - top),
+        }
+
+    def pdf_read_blocks(
+        self,
+        file_path: str,
+        pages: str = None,
+        include_spans: bool = True,
+        include_images: bool = True,
+        include_empty: bool = False,
+    ) -> Dict[str, Any]:
+        """Read native PDF text blocks, lines, and spans with bounding boxes via PyMuPDF."""
+        try:
+            import fitz
+        except ImportError:
+            return {"success": False, "error": "PyMuPDF (fitz) not installed. Run: pip install PyMuPDF"}
+
+        try:
+            doc = fitz.open(file_path)
+            total_pages = len(doc)
+            page_indices = self._parse_page_range(pages, total_pages)
+            pages_payload = []
+            text_block_count = 0
+            image_block_count = 0
+            span_count = 0
+
+            for pi in page_indices:
+                page = doc[pi]
+                page_dict = page.get_text("dict", sort=True)
+                page_blocks = []
+
+                for bi, block in enumerate(page_dict.get("blocks", [])):
+                    block_type = int(block.get("type", 0))
+                    block_bbox = self._normalize_pdf_bbox(block.get("bbox"))
+                    block_id = f"page_{pi}_block_{bi}"
+
+                    if block_type == 0:
+                        lines_payload = []
+                        block_text_parts = []
+
+                        for li, line in enumerate(block.get("lines", [])):
+                            line_bbox = self._normalize_pdf_bbox(line.get("bbox"))
+                            line_id = f"{block_id}_line_{li}"
+                            line_spans = []
+                            line_text_parts = []
+
+                            for si, span in enumerate(line.get("spans", [])):
+                                span_text = str(span.get("text", "") or "")
+                                if not include_empty and not span_text.strip():
+                                    continue
+                                span_id = f"{line_id}_span_{si}"
+                                span_payload = {
+                                    "span_id": span_id,
+                                    "text": span_text,
+                                    "bbox": self._normalize_pdf_bbox(span.get("bbox")),
+                                    "font": span.get("font"),
+                                    "size": float(span.get("size")) if span.get("size") is not None else None,
+                                    "flags": int(span.get("flags", 0)) if span.get("flags") is not None else None,
+                                    "color": int(span.get("color", 0)) if span.get("color") is not None else None,
+                                    "origin": list(span.get("origin", [])) if isinstance(span.get("origin"), (list, tuple)) else None,
+                                }
+                                span_count += 1
+                                line_spans.append(span_payload)
+                                if span_text.strip():
+                                    line_text_parts.append(span_text)
+
+                            line_text = re.sub(r"\s+", " ", " ".join(line_text_parts)).strip()
+                            if line_spans or include_empty or line_text:
+                                line_payload = {
+                                    "line_id": line_id,
+                                    "bbox": line_bbox,
+                                    "text": line_text,
+                                }
+                                if include_spans:
+                                    line_payload["spans"] = line_spans
+                                lines_payload.append(line_payload)
+                                if line_text:
+                                    block_text_parts.append(line_text)
+
+                        block_text = "\n".join([entry for entry in block_text_parts if entry]).strip()
+                        if block_text or lines_payload or include_empty:
+                            text_block_count += 1
+                            page_blocks.append({
+                                "block_id": block_id,
+                                "block_index": bi,
+                                "type": "text",
+                                "bbox": block_bbox,
+                                "text": block_text,
+                                "line_count": len(lines_payload),
+                                "span_count": sum(len(line.get("spans", [])) for line in lines_payload),
+                                "lines": lines_payload,
+                            })
+                    elif block_type == 1 and include_images:
+                        image_block_count += 1
+                        page_blocks.append({
+                            "block_id": block_id,
+                            "block_index": bi,
+                            "type": "image",
+                            "bbox": block_bbox,
+                            "width": block.get("width"),
+                            "height": block.get("height"),
+                            "ext": block.get("ext"),
+                            "transform": list(block.get("transform", [])) if isinstance(block.get("transform"), (list, tuple)) else None,
+                        })
+
+                pages_payload.append({
+                    "page_index": pi,
+                    "page_number": pi + 1,
+                    "width": float(page.rect.width),
+                    "height": float(page.rect.height),
+                    "block_count": len(page_blocks),
+                    "blocks": page_blocks,
+                })
+
+            doc.close()
+            return {
+                "success": True,
+                "file": file_path,
+                "total_pages": total_pages,
+                "pages_scanned": len(page_indices),
+                "text_block_count": text_block_count,
+                "image_block_count": image_block_count,
+                "span_count": span_count,
+                "pages": pages_payload,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def pdf_search_blocks(
+        self,
+        file_path: str,
+        query: str,
+        pages: str = None,
+        case_sensitive: bool = False,
+        include_spans: bool = True,
+    ) -> Dict[str, Any]:
+        """Search native PDF text blocks/spans and return exact block/span anchors with bounding boxes."""
+        if not str(query or "").strip():
+            return {"success": False, "error": "query is required"}
+
+        payload = self.pdf_read_blocks(
+            file_path,
+            pages=pages,
+            include_spans=include_spans,
+            include_images=False,
+            include_empty=False,
+        )
+        if not payload.get("success"):
+            return payload
+
+        query_text = str(query)
+        haystack_query = query_text if case_sensitive else query_text.lower()
+        matches = []
+
+        for page in payload.get("pages", []):
+            for block in page.get("blocks", []):
+                if block.get("type") != "text":
+                    continue
+
+                block_text = str(block.get("text", "") or "")
+                block_cmp = block_text if case_sensitive else block_text.lower()
+                if haystack_query in block_cmp:
+                    matches.append({
+                        "page_index": page.get("page_index"),
+                        "page_number": page.get("page_number"),
+                        "block_id": block.get("block_id"),
+                        "line_id": None,
+                        "span_id": None,
+                        "scope": "block",
+                        "bbox": block.get("bbox"),
+                        "text": block_text,
+                        "match_text": query_text,
+                    })
+
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        span_text = str(span.get("text", "") or "")
+                        span_cmp = span_text if case_sensitive else span_text.lower()
+                        if haystack_query not in span_cmp:
+                            continue
+                        matches.append({
+                            "page_index": page.get("page_index"),
+                            "page_number": page.get("page_number"),
+                            "block_id": block.get("block_id"),
+                            "line_id": line.get("line_id"),
+                            "span_id": span.get("span_id"),
+                            "scope": "span",
+                            "bbox": span.get("bbox"),
+                            "text": span_text,
+                            "match_text": query_text,
+                            "font": span.get("font"),
+                            "size": span.get("size"),
+                            "flags": span.get("flags"),
+                        })
+
+        return {
+            "success": True,
+            "file": file_path,
+            "query": query_text,
+            "case_sensitive": bool(case_sensitive),
+            "match_count": len(matches),
+            "matches": matches,
+            "pages_scanned": payload.get("pages_scanned", 0),
+            "total_pages": payload.get("total_pages", 0),
+        }
+
     def pdf_page_to_image(
         self, file_path: str, output_dir: str,
         pages: str = None, dpi: int = 150, fmt: str = "png",
@@ -5181,6 +5398,138 @@ class DocumentServerClient:
                 if 0 <= idx < total:
                     result.append(idx)
         return sorted(set(result))
+
+    def doc_render_map(self, file_path: str) -> Dict[str, Any]:
+        """Build deterministic paragraph/table-cell to rendered PDF page/bbox mappings."""
+        if not DOCX_AVAILABLE:
+            return {"success": False, "error": "python-docx not installed"}
+        try:
+            abs_path = str(Path(file_path).resolve())
+            if not os.path.exists(abs_path):
+                return {"success": False, "error": f"File not found: {file_path}"}
+
+            with tempfile.TemporaryDirectory(prefix="onlyoffice-doc-render-map-") as tmpdir:
+                temp_docx = os.path.join(tmpdir, Path(abs_path).name)
+                temp_pdf = os.path.join(tmpdir, f"{Path(abs_path).stem}.pdf")
+                shutil.copy2(abs_path, temp_docx)
+
+                doc = Document(temp_docx)
+                paragraph_anchors = []
+                table_cell_anchors = []
+
+                paragraph_index = 0
+                for paragraph in doc.paragraphs:
+                    original_text = re.sub(r"\s+", " ", paragraph.text or "").strip()
+                    if not original_text:
+                        continue
+                    paragraph_index += 1
+                    anchor_id = f"SLOANE_P_{paragraph_index:04d}"
+                    paragraph.text = f"{anchor_id} {original_text}"
+                    paragraph_anchors.append({
+                        "anchor_id": anchor_id,
+                        "paragraph_index": paragraph_index,
+                        "text_preview": original_text[:220],
+                    })
+
+                for table_number, table in enumerate(doc.tables, start=1):
+                    for row_number, row in enumerate(table.rows, start=1):
+                        for column_number, cell in enumerate(row.cells, start=1):
+                            cell_text = re.sub(
+                                r"\s+",
+                                " ",
+                                " ".join(paragraph.text or "" for paragraph in cell.paragraphs),
+                            ).strip()
+                            if not cell_text:
+                                continue
+                            anchor_id = f"SLOANE_T{table_number}R{row_number}C{column_number}"
+                            cell.text = f"{anchor_id} {cell_text}"
+                            table_cell_anchors.append({
+                                "anchor_id": anchor_id,
+                                "table_number": table_number,
+                                "row_number": row_number,
+                                "column_number": column_number,
+                                "cell_ref": f"T{table_number}R{row_number}C{column_number}",
+                                "text_preview": cell_text[:220],
+                            })
+
+                doc.save(temp_docx)
+
+                pdf_result = self.doc_to_pdf(temp_docx, output_path=temp_pdf)
+                if not pdf_result.get("success"):
+                    return pdf_result
+
+                block_payload = self.pdf_read_blocks(
+                    temp_pdf,
+                    include_spans=True,
+                    include_images=False,
+                    include_empty=False,
+                )
+                if not block_payload.get("success"):
+                    return block_payload
+
+                marker_hits = {}
+                marker_pattern = re.compile(r"SLOANE_(?:P_\d{4}|T\d+R\d+C\d+)")
+
+                for page in block_payload.get("pages", []):
+                    for block in page.get("blocks", []):
+                        if block.get("type") != "text":
+                            continue
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                span_text = str(span.get("text", "") or "")
+                                for match in marker_pattern.finditer(span_text):
+                                    anchor_id = match.group(0)
+                                    if anchor_id in marker_hits:
+                                        continue
+                                    marker_hits[anchor_id] = {
+                                        "page_index": page.get("page_index"),
+                                        "page_number": page.get("page_number"),
+                                        "block_id": block.get("block_id"),
+                                        "line_id": line.get("line_id"),
+                                        "span_id": span.get("span_id"),
+                                        "bbox": span.get("bbox") or block.get("bbox"),
+                                        "block_bbox": block.get("bbox"),
+                                        "text": block.get("text"),
+                                    }
+
+                paragraph_mappings = []
+                table_cell_mappings = []
+                unresolved_anchor_ids = []
+
+                for anchor in paragraph_anchors:
+                    hit = marker_hits.get(anchor["anchor_id"])
+                    if not hit:
+                        unresolved_anchor_ids.append(anchor["anchor_id"])
+                        continue
+                    paragraph_mappings.append({
+                        **anchor,
+                        **hit,
+                    })
+
+                for anchor in table_cell_anchors:
+                    hit = marker_hits.get(anchor["anchor_id"])
+                    if not hit:
+                        unresolved_anchor_ids.append(anchor["anchor_id"])
+                        continue
+                    table_cell_mappings.append({
+                        **anchor,
+                        **hit,
+                    })
+
+                return {
+                    "success": True,
+                    "file": abs_path,
+                    "paragraph_count": len(paragraph_anchors),
+                    "table_cell_count": len(table_cell_anchors),
+                    "mapped_paragraph_count": len(paragraph_mappings),
+                    "mapped_table_cell_count": len(table_cell_mappings),
+                    "pages": block_payload.get("pages_scanned", 0),
+                    "paragraphs": paragraph_mappings,
+                    "table_cells": table_cell_mappings,
+                    "unresolved_anchor_ids": unresolved_anchor_ids,
+                }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     # ==================== PPTX SPATIAL / TEXTBOX ====================
 
@@ -5483,11 +5832,13 @@ class DocumentServerClient:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def doc_to_pdf(
+    def _office_to_pdf(
         self, file_path: str, output_path: str = None,
     ) -> Dict[str, Any]:
-        """Convert a .docx file to PDF via OnlyOffice x2t inside the Docker container.
-        Requires: Docker container 'onlyoffice-documentserver' running, PyMuPDF on system."""
+        """Convert an OnlyOffice-supported file to PDF via x2t in Docker."""
+        container_input = None
+        container_pdf = None
+        container_xml = None
         try:
             import subprocess
             import uuid
@@ -5496,30 +5847,27 @@ class DocumentServerClient:
             if not os.path.exists(abs_path):
                 return {"success": False, "error": f"File not found: {file_path}"}
 
-            # Determine output path
             if output_path is None:
                 output_path = str(Path(abs_path).with_suffix(".pdf"))
             else:
                 output_path = str(Path(output_path).resolve())
 
-            # Ensure output directory exists
             os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
+            input_suffix = Path(abs_path).suffix or ".bin"
             tmp_id = uuid.uuid4().hex[:8]
-            container_docx = f"/tmp/convert_{tmp_id}.docx"
+            container_input = f"/tmp/convert_{tmp_id}{input_suffix}"
             container_pdf = f"/tmp/convert_{tmp_id}.pdf"
             container_xml = f"/tmp/convert_{tmp_id}.xml"
 
-            # Step 1: Copy docx into Docker container
             subprocess.run(
-                ["docker", "cp", abs_path, f"onlyoffice-documentserver:{container_docx}"],
+                ["docker", "cp", abs_path, f"onlyoffice-documentserver:{container_input}"],
                 check=True, capture_output=True, timeout=30,
             )
 
-            # Step 2: Create x2t conversion XML
             x2t_xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <TaskQueueDataConvert>
-  <m_sFileFrom>{container_docx}</m_sFileFrom>
+  <m_sFileFrom>{container_input}</m_sFileFrom>
   <m_sFileTo>{container_pdf}</m_sFileTo>
   <m_nFormatTo>513</m_nFormatTo>
   <m_sFontDir>/usr/share/fonts</m_sFontDir>
@@ -5531,7 +5879,6 @@ class DocumentServerClient:
                 check=True, capture_output=True, timeout=15,
             )
 
-            # Step 3: Run x2t conversion
             result = subprocess.run(
                 ["docker", "exec", "onlyoffice-documentserver",
                  "/var/www/onlyoffice/documentserver/server/FileConverter/bin/x2t",
@@ -5540,15 +5887,11 @@ class DocumentServerClient:
             )
             if result.returncode != 0:
                 stderr = result.stderr.decode("utf-8", errors="replace").strip()
-                # Cleanup container files
-                subprocess.run(
-                    ["docker", "exec", "onlyoffice-documentserver", "rm", "-f",
-                     container_docx, container_pdf, container_xml],
-                    capture_output=True, timeout=10,
-                )
-                return {"success": False, "error": f"x2t conversion failed (exit {result.returncode}): {stderr}"}
+                return {
+                    "success": False,
+                    "error": f"x2t conversion failed (exit {result.returncode}): {stderr}",
+                }
 
-            # Step 4: Copy PDF back
             subprocess.run(
                 ["docker", "cp", f"onlyoffice-documentserver:{container_pdf}", output_path],
                 check=True, capture_output=True, timeout=30,
@@ -5558,8 +5901,6 @@ class DocumentServerClient:
                 return {"success": False, "error": "Conversion produced no output file"}
 
             file_size = os.path.getsize(output_path)
-
-            # Count pages with PyMuPDF
             pages = None
             try:
                 import fitz
@@ -5568,13 +5909,6 @@ class DocumentServerClient:
                 doc.close()
             except Exception:
                 pass
-
-            # Cleanup container files
-            subprocess.run(
-                ["docker", "exec", "onlyoffice-documentserver", "rm", "-f",
-                 container_docx, container_pdf, container_xml],
-                capture_output=True, timeout=10,
-            )
 
             return {
                 "success": True,
@@ -5589,16 +5923,39 @@ class DocumentServerClient:
             return {"success": False, "error": "Docker not found. Is it installed?"}
         except Exception as e:
             return {"success": False, "error": str(e)}
+        finally:
+            if container_input and container_pdf and container_xml:
+                try:
+                    subprocess.run(
+                        ["docker", "exec", "onlyoffice-documentserver", "rm", "-f",
+                         container_input, container_pdf, container_xml],
+                        capture_output=True, timeout=10,
+                    )
+                except Exception:
+                    pass
 
-    def preview_document(
+    def doc_to_pdf(
+        self, file_path: str, output_path: str = None,
+    ) -> Dict[str, Any]:
+        """Convert a .docx file to PDF via OnlyOffice x2t inside the Docker container."""
+        return self._office_to_pdf(file_path, output_path=output_path)
+
+    def spreadsheet_to_pdf(
+        self, file_path: str, output_path: str = None,
+    ) -> Dict[str, Any]:
+        """Convert a spreadsheet file to PDF via OnlyOffice x2t inside Docker."""
+        return self._office_to_pdf(file_path, output_path=output_path)
+
+    def _preview_via_pdf(
         self,
         file_path: str,
         output_dir: str,
+        converter,
         pages: str = None,
         dpi: int = 150,
         fmt: str = "png",
     ) -> Dict[str, Any]:
-        """Render DOCX pages as images via OnlyOffice conversion + PyMuPDF."""
+        """Render an Office file as page images by converting it to PDF first."""
         pdf_path = None
         try:
             os.makedirs(output_dir, exist_ok=True)
@@ -5609,7 +5966,7 @@ class DocumentServerClient:
             )
             os.close(fd)
 
-            pdf_result = self.doc_to_pdf(file_path, output_path=pdf_path)
+            pdf_result = converter(file_path, output_path=pdf_path)
             if not pdf_result.get("success"):
                 return pdf_result
 
@@ -5635,6 +5992,616 @@ class DocumentServerClient:
                     os.unlink(pdf_path)
                 except OSError:
                     pass
+
+    def preview_document(
+        self,
+        file_path: str,
+        output_dir: str,
+        pages: str = None,
+        dpi: int = 150,
+        fmt: str = "png",
+    ) -> Dict[str, Any]:
+        """Render DOCX pages as images via OnlyOffice conversion + PyMuPDF."""
+        return self._preview_via_pdf(
+            file_path, output_dir, self.doc_to_pdf, pages=pages, dpi=dpi, fmt=fmt
+        )
+
+    def preview_spreadsheet(
+        self,
+        file_path: str,
+        output_dir: str,
+        pages: str = None,
+        dpi: int = 150,
+        fmt: str = "png",
+    ) -> Dict[str, Any]:
+        """Render spreadsheet pages as images via OnlyOffice conversion + PyMuPDF."""
+        return self._preview_via_pdf(
+            file_path,
+            output_dir,
+            self.spreadsheet_to_pdf,
+            pages=pages,
+            dpi=dpi,
+            fmt=fmt,
+        )
+
+    _EDITOR_EXTENSIONS = {
+        "document": {".docx", ".doc", ".docm", ".dotx", ".odt", ".rtf", ".txt", ".md", ".html", ".htm", ".epub"},
+        "spreadsheet": {".xlsx", ".xls", ".xlsm", ".xltx", ".xltm", ".ods", ".csv", ".tsv"},
+        "presentation": {".pptx", ".ppt", ".pptm", ".ppsx", ".odp"},
+        "pdf": {".pdf"},
+    }
+
+    def _editor_file_type(self, file_path: str) -> str:
+        ext = Path(file_path).suffix.lower()
+        for kind, extensions in self._EDITOR_EXTENSIONS.items():
+            if ext in extensions:
+                return kind
+        return "file"
+
+    def _desktop_capture_tools(self) -> Dict[str, Any]:
+        tools = {
+            "xdotool": shutil.which("xdotool"),
+            "xprop": shutil.which("xprop"),
+            "onlyoffice-desktopeditors": shutil.which("onlyoffice-desktopeditors"),
+            "spectacle": shutil.which("spectacle"),
+            "scrot": shutil.which("scrot"),
+        }
+        if tools["spectacle"]:
+            tools["capture_tool"] = "spectacle"
+        elif tools["scrot"] and os.environ.get("XDG_SESSION_TYPE") != "wayland":
+            tools["capture_tool"] = "scrot"
+        else:
+            tools["capture_tool"] = None
+        tools["available"] = all(
+            tools[name] for name in ("xdotool", "xprop", "onlyoffice-desktopeditors")
+        ) and bool(tools["capture_tool"])
+        return tools
+
+    def _desktop_window_geometry(self, window_id: str) -> Dict[str, int]:
+        import subprocess
+
+        result = subprocess.run(
+            ["xdotool", "getwindowgeometry", "--shell", str(window_id)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        geometry = {}
+        for line in result.stdout.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key in {"X", "Y", "WIDTH", "HEIGHT", "SCREEN"}:
+                geometry[key.lower()] = int(value.strip())
+        return geometry
+
+    def _desktop_window_title(self, window_id: str) -> Dict[str, Any]:
+        import subprocess
+
+        result = subprocess.run(
+            ["xprop", "-id", str(window_id), "WM_NAME", "WM_CLASS", "_NET_WM_PID"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        title_match = re.search(r'WM_NAME\([^)]*\) = "(.*)"', result.stdout)
+        class_match = re.search(r'WM_CLASS\([^)]*\) = (.*)', result.stdout)
+        pid_match = re.search(r"_NET_WM_PID\(CARDINAL\) = (\d+)", result.stdout)
+        classes = []
+        if class_match:
+            classes = re.findall(r'"([^"]+)"', class_match.group(1))
+        return {
+            "title": title_match.group(1) if title_match else "",
+            "classes": classes,
+            "pid": int(pid_match.group(1)) if pid_match else None,
+        }
+
+    def _desktop_find_editor_window(self, file_path: str) -> Dict[str, Any]:
+        import subprocess
+
+        basename = Path(file_path).name
+        candidate_ids = []
+        commands = [
+            ["xdotool", "search", "--name", basename],
+            ["xdotool", "search", "--class", "ONLYOFFICE"],
+        ]
+        for cmd in commands:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                candidate_ids.extend(
+                    [line.strip() for line in result.stdout.splitlines() if line.strip()]
+                )
+
+        seen = set()
+        candidates = []
+        basename_lower = basename.lower()
+        for window_id in candidate_ids:
+            if window_id in seen:
+                continue
+            seen.add(window_id)
+            try:
+                meta = self._desktop_window_title(window_id)
+                if "ONLYOFFICE" not in meta.get("classes", []):
+                    continue
+                geometry = self._desktop_window_geometry(window_id)
+                title = meta.get("title", "")
+                area = geometry.get("width", 0) * geometry.get("height", 0)
+                candidates.append(
+                    {
+                        "window_id": int(window_id),
+                        "title": title,
+                        "pid": meta.get("pid"),
+                        "classes": meta.get("classes", []),
+                        "geometry": geometry,
+                        "area": area,
+                        "title_matches": basename_lower in title.lower(),
+                    }
+                )
+            except Exception:
+                continue
+
+        if not candidates:
+            return {}
+
+        matched = [item for item in candidates if item["title_matches"]]
+        if matched:
+            candidates = matched
+        else:
+            return {}
+
+        candidates.sort(
+            key=lambda item: (
+                0 if item["title"] else 1,
+                -item["area"],
+            )
+        )
+        return candidates[0]
+
+    def editor_session(
+        self,
+        file_path: str,
+        open_if_needed: bool = False,
+        wait_seconds: float = 10.0,
+        activate: bool = False,
+    ) -> Dict[str, Any]:
+        """Locate or open a native OnlyOffice Desktop Editors session for a file."""
+        import subprocess
+        import time
+
+        abs_path = str(Path(file_path).resolve())
+        if not os.path.exists(abs_path):
+            return {"success": False, "error": f"File not found: {file_path}"}
+
+        tools = self._desktop_capture_tools()
+        if not tools["available"]:
+            missing = [
+                name
+                for name, path in tools.items()
+                if name not in {"available", "capture_tool"} and not path
+            ]
+            if not tools.get("capture_tool"):
+                missing.append("desktop screenshot tool (spectacle or X11 scrot)")
+            return {
+                "success": False,
+                "error": f"Desktop capture tools unavailable: {', '.join(missing)}",
+            }
+
+        session = self._desktop_find_editor_window(abs_path)
+        launched = False
+        if not session and open_if_needed:
+            subprocess.Popen(
+                [tools["onlyoffice-desktopeditors"], abs_path], start_new_session=True
+            )
+            launched = True
+            deadline = time.monotonic() + max(1.0, float(wait_seconds))
+            while time.monotonic() < deadline:
+                time.sleep(0.25)
+                session = self._desktop_find_editor_window(abs_path)
+                if session:
+                    break
+
+        if not session:
+            return {
+                "success": False,
+                "error": (
+                    f"No OnlyOffice desktop window found for {Path(abs_path).name}. "
+                    "Desktop capture needs a live editor window; use open <file> gui, "
+                    "pass --open, or use --backend rendered for export-based capture."
+                ),
+            }
+
+        if activate:
+            self._desktop_activate_window(session["window_id"])
+
+        geometry = session["geometry"]
+        return {
+            "success": True,
+            "backend": "desktop",
+            "file": abs_path,
+            "type": self._editor_file_type(abs_path),
+            "launched": launched,
+            "capture_tool": tools["capture_tool"],
+            "window_id": session["window_id"],
+            "title": session["title"],
+            "pid": session["pid"],
+            "geometry": {
+                "x": geometry.get("x", 0),
+                "y": geometry.get("y", 0),
+                "width": geometry.get("width", 0),
+                "height": geometry.get("height", 0),
+            },
+            "supported_targets": {
+                "document": ["page", "zoom"],
+                "spreadsheet": ["range", "zoom"],
+                "presentation": ["slide", "zoom"],
+                "pdf": ["page", "zoom"],
+            }.get(self._editor_file_type(abs_path), []),
+        }
+
+    def _desktop_activate_window(self, window_id: int):
+        import subprocess
+
+        subprocess.run(
+            ["xdotool", "windowactivate", "--sync", str(window_id)],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+
+    def _desktop_get_active_window(self) -> int:
+        import subprocess
+
+        result = subprocess.run(
+            ["xdotool", "getactivewindow"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return int(result.stdout.strip())
+
+    def _desktop_ensure_active_window(
+        self, window_id: int, attempts: int = 3, delay_seconds: float = 0.15
+    ) -> bool:
+        import time
+
+        expected = int(window_id)
+        for _ in range(max(1, int(attempts))):
+            self._desktop_activate_window(expected)
+            time.sleep(max(0.0, float(delay_seconds)))
+            try:
+                if self._desktop_get_active_window() == expected:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _desktop_send_key(self, window_id: int, keyspec: str):
+        import subprocess
+
+        subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "--window", str(window_id), keyspec],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+
+    def _desktop_type_text(self, window_id: int, text: str):
+        import subprocess
+
+        subprocess.run(
+            ["xdotool", "type", "--delay", "10", "--window", str(window_id), text],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+
+    def _desktop_apply_viewport(
+        self,
+        session: Dict[str, Any],
+        file_type: str,
+        page: int = None,
+        cell_range: str = None,
+        slide: int = None,
+        zoom_reset: bool = False,
+        zoom_in_steps: int = 0,
+        zoom_out_steps: int = 0,
+        settle_ms: int = 800,
+    ) -> List[str]:
+        import time
+
+        window_id = session["window_id"]
+        self._desktop_activate_window(window_id)
+        time.sleep(0.2)
+        actions = []
+
+        if zoom_reset:
+            self._desktop_send_key(window_id, "ctrl+0")
+            actions.append("zoom_reset")
+
+        if file_type in {"document", "pdf"} and page is not None:
+            self._desktop_send_key(window_id, "ctrl+g")
+            time.sleep(0.15)
+            self._desktop_type_text(window_id, str(int(page) + 1))
+            self._desktop_send_key(window_id, "Return")
+            actions.append(f"page={page}")
+        elif file_type == "spreadsheet" and cell_range:
+            self._desktop_send_key(window_id, "ctrl+g")
+            time.sleep(0.15)
+            self._desktop_type_text(window_id, cell_range)
+            self._desktop_send_key(window_id, "Return")
+            actions.append(f"range={cell_range}")
+        elif file_type == "presentation" and slide is not None:
+            self._desktop_send_key(window_id, "Home")
+            if int(slide) > 0:
+                subprocess.run(
+                    ["xdotool", "key", "--clearmodifiers", "--window", str(window_id), "--repeat", str(int(slide)), "Page_Down"],
+                    check=True,
+                    capture_output=True,
+                    timeout=15,
+                )
+            actions.append(f"slide={slide}")
+
+        for _ in range(max(0, int(zoom_in_steps))):
+            self._desktop_send_key(window_id, "ctrl+plus")
+        if zoom_in_steps:
+            actions.append(f"zoom_in_steps={int(zoom_in_steps)}")
+
+        for _ in range(max(0, int(zoom_out_steps))):
+            self._desktop_send_key(window_id, "ctrl+minus")
+        if zoom_out_steps:
+            actions.append(f"zoom_out_steps={int(zoom_out_steps)}")
+
+        time.sleep(max(0.0, int(settle_ms)) / 1000.0)
+        return actions
+
+    def _crop_image(self, source_path: str, output_path: str, crop: str = None, fmt: str = "png") -> Dict[str, Any]:
+        from PIL import Image
+
+        img = Image.open(source_path)
+        crop_box = None
+        if crop:
+            parts = [int(part.strip()) for part in crop.split(",")]
+            if len(parts) != 4:
+                raise ValueError("crop must be x,y,width,height")
+            x, y, width, height = parts
+            if width <= 0 or height <= 0:
+                raise ValueError("crop width and height must be positive")
+            crop_box = (x, y, x + width, y + height)
+            img = img.crop(crop_box)
+        save_format = "JPEG" if fmt.lower() in {"jpg", "jpeg"} else "PNG"
+        if save_format == "JPEG" and img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.save(output_path, format=save_format, quality=95)
+        return {
+            "output_file": output_path,
+            "width": img.width,
+            "height": img.height,
+            "crop": crop_box,
+            "format": fmt.lower(),
+            "size_bytes": os.path.getsize(output_path),
+        }
+
+    def _rendered_capture(
+        self,
+        file_path: str,
+        output_path: str,
+        file_type: str,
+        page: int = None,
+        slide: int = None,
+        crop: str = None,
+        dpi: int = 150,
+        fmt: str = "png",
+    ) -> Dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="onlyoffice-rendered-capture-") as tmpdir:
+            if file_type == "document":
+                preview = self.preview_document(
+                    file_path, tmpdir, pages=str(page if page is not None else 0), dpi=dpi, fmt=fmt
+                )
+            elif file_type == "spreadsheet":
+                preview = self.preview_spreadsheet(
+                    file_path, tmpdir, pages=str(page if page is not None else 0), dpi=dpi, fmt=fmt
+                )
+            elif file_type == "presentation":
+                preview = self.preview_slide(
+                    file_path, tmpdir, slide_index=slide if slide is not None else 0, dpi=dpi
+                )
+            elif file_type == "pdf":
+                preview = self.pdf_page_to_image(
+                    file_path, tmpdir, pages=str(page if page is not None else 0), dpi=dpi, fmt=fmt
+                )
+            else:
+                return {"success": False, "error": f"Rendered capture unsupported for type: {file_type}"}
+
+            if not preview.get("success"):
+                return preview
+            images = preview.get("images", [])
+            if not images:
+                return {"success": False, "error": "Preview produced no images"}
+            source_image = images[0]["file"]
+            cropped = self._crop_image(source_image, output_path, crop=crop, fmt=fmt)
+            return {
+                "success": True,
+                "backend": "rendered",
+                "file": str(Path(file_path).resolve()),
+                "type": file_type,
+                "output_file": cropped["output_file"],
+                "width": cropped["width"],
+                "height": cropped["height"],
+                "format": cropped["format"],
+                "size_bytes": cropped["size_bytes"],
+                "crop": cropped["crop"],
+                "exact_viewport": False,
+                "note": "Rendered fallback uses page/slide export rather than the live editor viewport.",
+            }
+
+    def capture_editor_view(
+        self,
+        file_path: str,
+        output_path: str,
+        backend: str = "auto",
+        open_if_needed: bool = True,
+        page: int = None,
+        cell_range: str = None,
+        slide: int = None,
+        zoom_reset: bool = False,
+        zoom_in_steps: int = 0,
+        zoom_out_steps: int = 0,
+        crop: str = None,
+        settle_ms: int = 800,
+        wait_seconds: float = 10.0,
+        dpi: int = 150,
+        fmt: str = None,
+    ) -> Dict[str, Any]:
+        """Capture either the live desktop editor viewport or a rendered fallback image."""
+        abs_path = str(Path(file_path).resolve())
+        if not os.path.exists(abs_path):
+            return {"success": False, "error": f"File not found: {file_path}"}
+
+        file_type = self._editor_file_type(abs_path)
+        if file_type == "file":
+            return {"success": False, "error": f"Unsupported file type for capture: {Path(abs_path).suffix}"}
+
+        output_path = str(Path(output_path).resolve())
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        fmt = (fmt or Path(output_path).suffix.lstrip(".") or "png").lower()
+        if fmt == "jpeg":
+            fmt = "jpg"
+
+        requested_backend = backend
+        selected_backend = backend
+        if selected_backend == "auto":
+            selected_backend = "desktop" if self._desktop_capture_tools()["available"] else "rendered"
+
+        if selected_backend == "rendered":
+            if cell_range:
+                return {
+                    "success": False,
+                    "error": "Rendered capture does not support live spreadsheet range targeting. Use backend=desktop for exact viewport capture.",
+                }
+            return self._rendered_capture(
+                abs_path,
+                output_path,
+                file_type=file_type,
+                page=page,
+                slide=slide,
+                crop=crop,
+                dpi=dpi,
+                fmt=fmt,
+            )
+
+        if selected_backend != "desktop":
+            return {"success": False, "error": f"Unsupported backend: {backend}"}
+
+        session = self.editor_session(
+            abs_path, open_if_needed=open_if_needed, wait_seconds=wait_seconds, activate=True
+        )
+        if not session.get("success"):
+            if requested_backend == "auto":
+                if cell_range:
+                    return {
+                        "success": False,
+                        "error": "Desktop session unavailable and rendered fallback cannot honor live spreadsheet range targeting. Use --open for desktop capture or omit --range.",
+                    }
+                return self._rendered_capture(
+                    abs_path,
+                    output_path,
+                    file_type=file_type,
+                    page=page,
+                    slide=slide,
+                    crop=crop,
+                    dpi=dpi,
+                    fmt=fmt,
+                )
+            return session
+
+        actions = self._desktop_apply_viewport(
+            session,
+            file_type=file_type,
+            page=page,
+            cell_range=cell_range,
+            slide=slide,
+            zoom_reset=zoom_reset,
+            zoom_in_steps=zoom_in_steps,
+            zoom_out_steps=zoom_out_steps,
+            settle_ms=settle_ms,
+        )
+
+        geometry = session["geometry"]
+        if geometry["width"] <= 0 or geometry["height"] <= 0:
+            return {"success": False, "error": "Editor window has invalid geometry for capture"}
+
+        with tempfile.NamedTemporaryFile(
+            prefix="onlyoffice-window-", suffix=".png", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            import subprocess
+            tools = self._desktop_capture_tools()
+            if not self._desktop_ensure_active_window(session["window_id"]):
+                return {
+                    "success": False,
+                    "error": (
+                        "Unable to confirm the target OnlyOffice window is active for "
+                        "desktop capture. Re-focus the editor and retry, or use "
+                        "--backend rendered for export-based capture."
+                    ),
+                }
+            if tools["capture_tool"] == "spectacle":
+                subprocess.run(
+                    ["spectacle", "-b", "-n", "-a", "-o", tmp_path],
+                    check=True,
+                    capture_output=True,
+                    timeout=20,
+                )
+            elif tools["capture_tool"] == "scrot":
+                subprocess.run(
+                    [
+                        "scrot",
+                        "-a",
+                        f"{max(0, geometry['x'])},{max(0, geometry['y'])},{geometry['width']},{geometry['height']}",
+                        tmp_path,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=20,
+                )
+            else:
+                return {
+                    "success": False,
+                    "error": "No supported desktop screenshot tool is available",
+                }
+            cropped = self._crop_image(tmp_path, output_path, crop=crop, fmt=fmt)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        return {
+            "success": True,
+            "backend": "desktop",
+            "file": abs_path,
+            "type": file_type,
+            "output_file": cropped["output_file"],
+            "width": cropped["width"],
+            "height": cropped["height"],
+            "format": cropped["format"],
+            "size_bytes": cropped["size_bytes"],
+            "crop": cropped["crop"],
+            "exact_viewport": True,
+            "window_id": session["window_id"],
+            "title": session["title"],
+            "pid": session["pid"],
+            "window_geometry": geometry,
+            "actions": actions,
+        }
 
     # ==================== RDF OPERATIONS ====================
 

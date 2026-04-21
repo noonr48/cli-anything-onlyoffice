@@ -1,14 +1,18 @@
+import io
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
+import fitz
 from docx import Document
 from openpyxl import Workbook, load_workbook
 from PIL import Image
 
+from cli_anything.onlyoffice.core import cli as cli_module
 from cli_anything.onlyoffice.utils.docserver import get_client
 
 
@@ -212,10 +216,388 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             "doc-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]",
             docs,
         )
+        self.assertIn("doc-render-map <file>", docs)
         self.assertIn(
             "xlsx-calc <file> <column> <op> [--sheet <name>] [--include-formulas] [--strict-formulas]",
             sheet,
         )
+        self.assertIn(
+            "xlsx-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]",
+            sheet,
+        )
+        pdf = payload["categories"]["PDF (.pdf)"]
+        self.assertIn(
+            "pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]",
+            pdf,
+        )
+        self.assertIn(
+            "pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]",
+            pdf,
+        )
+        general = payload["categories"]["GENERAL"]
+        self.assertIn(
+            "editor-session <file> [--open] [--wait <sec>] [--activate]",
+            general,
+        )
+        self.assertIn(
+            "editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h]",
+            general,
+        )
+
+    def test_agent_style_open_alias_opens_spreadsheet(self):
+        path = self._path("alias.xlsx")
+        Workbook().save(path)
+        stdout = io.StringIO()
+
+        with mock.patch.object(cli_module.subprocess, "Popen") as popen:
+            with mock.patch(
+                "sys.argv", ["cli-anything-onlyoffice", "document.open", path, "--json"]
+            ):
+                with redirect_stdout(stdout):
+                    cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["requested_command"], "document.open")
+        self.assertEqual(payload["resolved_command"], "open")
+        self.assertEqual(payload["command_namespace"], "document")
+        self.assertEqual(payload["detected_type"], "spreadsheet")
+        popen.assert_called_once_with(
+            ["onlyoffice-desktopeditors", os.path.abspath(path)], start_new_session=True
+        )
+
+    def test_agent_style_open_alias_preserves_metadata_on_error(self):
+        missing = self._path("missing.xlsx")
+        stdout = io.StringIO()
+
+        with mock.patch(
+            "sys.argv", ["cli-anything-onlyoffice", "document.open", missing, "--json"]
+        ):
+            with redirect_stdout(stdout):
+                cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["requested_command"], "document.open")
+        self.assertEqual(payload["resolved_command"], "open")
+        self.assertEqual(payload["command_namespace"], "document")
+        self.assertIn("File not found", payload["error"])
+
+    def test_agent_style_info_alias_resolves(self):
+        path = self._path("alias_info.docx")
+        self.client.create_document(path, "Alias", "Body")
+        stdout = io.StringIO()
+
+        with mock.patch(
+            "sys.argv", ["cli-anything-onlyoffice", "spreadsheet.info", path, "--json"]
+        ):
+            with redirect_stdout(stdout):
+                cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["requested_command"], "spreadsheet.info")
+        self.assertEqual(payload["resolved_command"], "info")
+        self.assertEqual(payload["command_namespace"], "spreadsheet")
+
+    def test_pdf_read_blocks_returns_native_block_span_metadata(self):
+        path = self._path("native_blocks.pdf")
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "Alpha Results")
+        page.insert_text((72, 120), "Beta Findings")
+        doc.save(path)
+        doc.close()
+
+        result = self.client.pdf_read_blocks(path, pages="0")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["pages_scanned"], 1)
+        self.assertGreaterEqual(result["text_block_count"], 1)
+        first_page = result["pages"][0]
+        self.assertEqual(first_page["page_index"], 0)
+        text_blocks = [block for block in first_page["blocks"] if block["type"] == "text"]
+        self.assertTrue(text_blocks)
+        first_block = text_blocks[0]
+        self.assertIn("bbox", first_block)
+        self.assertTrue(first_block["block_id"].startswith("page_0_block_"))
+        self.assertGreaterEqual(first_block["line_count"], 1)
+        first_line = first_block["lines"][0]
+        self.assertTrue(first_line["line_id"].startswith(first_block["block_id"]))
+        self.assertIn("bbox", first_line)
+        first_span = first_line["spans"][0]
+        self.assertTrue(first_span["span_id"].startswith(first_line["line_id"]))
+        self.assertIn("bbox", first_span)
+        self.assertTrue(any(token in first_block["text"] for token in ("Alpha", "Results", "Beta", "Findings")))
+
+    def test_doc_render_map_maps_paragraphs_and_table_cells(self):
+        path = self._path("render_map.docx")
+        doc = Document()
+        doc.add_paragraph("Executive summary")
+        table = doc.add_table(rows=1, cols=1)
+        table.cell(0, 0).text = "42"
+        doc.save(path)
+
+        def fake_doc_to_pdf(file_path, output_path=None):
+            self.assertTrue(file_path.endswith(".docx"))
+            self.assertIsNotNone(output_path)
+            with open(output_path, "wb") as handle:
+                handle.write(b"%PDF-1.4 fake")
+            return {"success": True, "output_file": output_path, "pages": 1}
+
+        def fake_pdf_read_blocks(file_path, pages=None, include_spans=True, include_images=False, include_empty=False):
+            self.assertTrue(file_path.endswith(".pdf"))
+            self.assertTrue(os.path.exists(file_path))
+            self.assertTrue(include_spans)
+            return {
+                "success": True,
+                "pages_scanned": 1,
+                "total_pages": 1,
+                "pages": [
+                    {
+                        "page_index": 0,
+                        "page_number": 1,
+                        "blocks": [
+                            {
+                                "block_id": "page_0_block_0",
+                                "type": "text",
+                                "bbox": {"left": 10, "top": 10, "right": 200, "bottom": 40, "width": 190, "height": 30},
+                                "lines": [
+                                    {
+                                        "line_id": "page_0_block_0_line_0",
+                                        "bbox": {"left": 10, "top": 10, "right": 200, "bottom": 25, "width": 190, "height": 15},
+                                        "spans": [
+                                            {
+                                                "span_id": "page_0_block_0_line_0_span_0",
+                                                "text": "SLOANE_P_0001 Executive summary",
+                                                "bbox": {"left": 10, "top": 10, "right": 200, "bottom": 25, "width": 190, "height": 15},
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                            {
+                                "block_id": "page_0_block_1",
+                                "type": "text",
+                                "bbox": {"left": 10, "top": 50, "right": 200, "bottom": 80, "width": 190, "height": 30},
+                                "lines": [
+                                    {
+                                        "line_id": "page_0_block_1_line_0",
+                                        "bbox": {"left": 10, "top": 50, "right": 200, "bottom": 65, "width": 190, "height": 15},
+                                        "spans": [
+                                            {
+                                                "span_id": "page_0_block_1_line_0_span_0",
+                                                "text": "SLOANE_T1R1C1 42",
+                                                "bbox": {"left": 10, "top": 50, "right": 200, "bottom": 65, "width": 190, "height": 15},
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            }
+
+        with mock.patch.object(self.client, "doc_to_pdf", side_effect=fake_doc_to_pdf):
+            with mock.patch.object(self.client, "pdf_read_blocks", side_effect=fake_pdf_read_blocks):
+                result = self.client.doc_render_map(path)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["mapped_paragraph_count"], 1)
+        self.assertEqual(result["mapped_table_cell_count"], 1)
+        self.assertEqual(result["paragraphs"][0]["page_number"], 1)
+        self.assertEqual(result["paragraphs"][0]["paragraph_index"], 1)
+        self.assertEqual(result["table_cells"][0]["cell_ref"], "T1R1C1")
+        self.assertEqual(result["table_cells"][0]["page_number"], 1)
+        self.assertFalse(result["unresolved_anchor_ids"])
+
+    def test_cli_pdf_search_blocks_dispatches_to_docserver(self):
+        path = self._path("dispatch.pdf")
+        with open(path, "wb") as handle:
+            handle.write(b"%PDF-1.4")
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "pdf_search_blocks",
+            return_value={
+                "success": True,
+                "file": path,
+                "query": "Results",
+                "match_count": 1,
+                "matches": [{"page_index": 0, "block_id": "page_0_block_0"}],
+            },
+        ) as search_blocks:
+            with mock.patch(
+                "sys.argv",
+                [
+                    "cli-anything-onlyoffice",
+                    "pdf-search-blocks",
+                    path,
+                    "Results",
+                    "--pages",
+                    "0-1",
+                    "--case-sensitive",
+                    "--json",
+                ],
+            ):
+                with redirect_stdout(stdout):
+                    cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["match_count"], 1)
+        search_blocks.assert_called_once_with(
+            path,
+            "Results",
+            pages="0-1",
+            case_sensitive=True,
+            include_spans=True,
+        )
+
+    def test_preview_spreadsheet_reuses_pdf_render_pipeline(self):
+        path = self._path("preview.xlsx")
+        Workbook().save(path)
+        output_dir = self._path("sheet_previews")
+
+        captured = {}
+
+        def fake_xlsx_to_pdf(file_path, output_path=None):
+            self.assertEqual(file_path, path)
+            self.assertIsNotNone(output_path)
+            with open(output_path, "wb") as f:
+                f.write(b"%PDF-1.4 fake")
+            captured["pdf_path"] = output_path
+            return {
+                "success": True,
+                "input_file": file_path,
+                "output_file": output_path,
+                "pages": 1,
+            }
+
+        def fake_pdf_page_to_image(file_path, render_dir, pages=None, dpi=150, fmt="png"):
+            self.assertEqual(file_path, captured["pdf_path"])
+            self.assertTrue(os.path.exists(file_path))
+            self.assertEqual(render_dir, output_dir)
+            self.assertEqual(pages, "0")
+            self.assertEqual(dpi, 180)
+            self.assertEqual(fmt, "png")
+            return {
+                "success": True,
+                "total_pages": 1,
+                "pages_rendered": 1,
+                "images": [{"page": 0, "file": os.path.join(render_dir, "page_000.png")}],
+            }
+
+        with mock.patch.object(
+            self.client, "spreadsheet_to_pdf", side_effect=fake_xlsx_to_pdf
+        ):
+            with mock.patch.object(
+                self.client, "pdf_page_to_image", side_effect=fake_pdf_page_to_image
+            ):
+                result = self.client.preview_spreadsheet(
+                    path, output_dir, pages="0", dpi=180, fmt="png"
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["total_pages"], 1)
+        self.assertEqual(result["pages_rendered"], 1)
+        self.assertEqual(result["format"], "png")
+        self.assertFalse(os.path.exists(captured["pdf_path"]))
+
+    def test_capture_editor_view_uses_rendered_backend(self):
+        path = self._path("rendered_capture.xlsx")
+        Workbook().save(path)
+        output = self._path("capture.png")
+        preview_dir = self._path("rendered_backend")
+        os.makedirs(preview_dir, exist_ok=True)
+        preview_image = os.path.join(preview_dir, "page_000.png")
+        Image.new("RGB", (200, 100), color="green").save(preview_image)
+
+        with mock.patch.object(
+            self.client,
+            "preview_spreadsheet",
+            return_value={
+                "success": True,
+                "images": [{"page": 0, "file": preview_image}],
+                "total_pages": 1,
+                "pages_rendered": 1,
+            },
+        ) as preview:
+            result = self.client.capture_editor_view(
+                path, output, backend="rendered", page=0, crop="10,10,50,40"
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["backend"], "rendered")
+        self.assertFalse(result["exact_viewport"])
+        self.assertEqual((result["width"], result["height"]), (50, 40))
+        self.assertTrue(os.path.exists(output))
+        preview.assert_called_once()
+
+    def test_capture_editor_view_refuses_unverified_spectacle_focus(self):
+        path = self._path("desktop_capture.xlsx")
+        Workbook().save(path)
+        output = self._path("desktop_capture.png")
+
+        with mock.patch.object(
+            self.client,
+            "editor_session",
+            return_value={
+                "success": True,
+                "backend": "desktop",
+                "file": path,
+                "type": "spreadsheet",
+                "window_id": 4242,
+                "geometry": {"x": 0, "y": 0, "width": 1280, "height": 720},
+            },
+        ):
+            with mock.patch.object(
+                self.client, "_desktop_apply_viewport", return_value=[]
+            ):
+                with mock.patch.object(
+                    self.client,
+                    "_desktop_capture_tools",
+                    return_value={"available": True, "capture_tool": "spectacle"},
+                ):
+                    with mock.patch.object(
+                        self.client,
+                        "_desktop_ensure_active_window",
+                        return_value=False,
+                    ) as ensure_active:
+                        result = self.client.capture_editor_view(
+                            path, output, backend="desktop"
+                        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("target OnlyOffice window is active", result["error"])
+        ensure_active.assert_called_once_with(4242)
+        self.assertFalse(os.path.exists(output))
+
+    def test_editor_session_missing_window_explains_next_steps(self):
+        path = self._path("missing_window.docx")
+        self.client.create_document(path, "Title", "Body")
+
+        with mock.patch.object(
+            self.client,
+            "_desktop_capture_tools",
+            return_value={
+                "available": True,
+                "xdotool": "/usr/bin/xdotool",
+                "xprop": "/usr/bin/xprop",
+                "onlyoffice-desktopeditors": "/usr/bin/onlyoffice-desktopeditors",
+                "capture_tool": "spectacle",
+            },
+        ):
+            with mock.patch.object(
+                self.client, "_desktop_find_editor_window", return_value={}
+            ):
+                result = self.client.editor_session(path, open_if_needed=False)
+
+        self.assertFalse(result["success"])
+        self.assertIn("Desktop capture needs a live editor window", result["error"])
+        self.assertIn("--backend rendered", result["error"])
 
     def test_strict_schema_validation_rejects_row_width_mismatch(self):
         path = self._path("schema_strict.xlsx")

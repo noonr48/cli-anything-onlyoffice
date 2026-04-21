@@ -1,8 +1,8 @@
-# CLI-Anything OnlyOffice v4.1.0
+# CLI-Anything OnlyOffice v4.2.0
 
 > Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs — designed for AI agents.
 
-**105 commands. 7 categories. Full JSON output. Production-safe.**
+**112 commands. 7 categories. Full JSON output. Production-safe.**
 
 Part of the [SLOANE OS](https://github.com/sloane-os) agent stack. Agents call this via `cli_anything_run(tool='onlyoffice', ...)`.
 
@@ -46,7 +46,7 @@ When calling from SLOANE OS or another agent, invoke via the venv binary directl
 | `rdflib>=7.0.0` | RDF graph / SPARQL | Core |
 | `lxml>=4.9.0` | XML parsing for OOXML | Core |
 | `scipy>=1.11.0` | Statistical tests | Core |
-| `PyMuPDF>=1.24.0` | PDF image extraction + page rendering | Core |
+| `PyMuPDF>=1.24.0` | PDF image extraction + native block/span reading + page rendering | Core |
 | `Pillow>=10.0.0` | Image format conversion | Core |
 | `pyshacl>=0.25.0` | SHACL validation | Optional (`[shacl]`) |
 
@@ -65,7 +65,7 @@ utils/docserver.py     ← Backend engine (~5,900 lines)
   ├── Documents        ← python-docx wrapper + image extraction
   ├── Spreadsheets     ← openpyxl wrapper + scipy stats + data validation
   ├── Presentations    ← python-pptx wrapper + spatial awareness + preview
-  ├── PDF              ← PyMuPDF wrapper (image extraction + page rendering)
+  ├── PDF              ← PyMuPDF wrapper (native blocks/spans, image extraction, page rendering)
   └── RDF              ← rdflib 7 wrapper
 ```
 
@@ -92,6 +92,8 @@ All responses have `{"success": true, ...}` or `{"success": false, "error": "...
 ## Mode 1 — Documents (.docx)
 
 **28 commands** — full lifecycle from creation to APA references, plus image extraction and rendered page preview.
+
+`.docx` files are OOXML containers, so generic text file readers will often treat them as binary. For agent use, rely on the semantic document commands below (`doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`) rather than raw file reads.
 
 ### Document Defaults
 
@@ -334,6 +336,13 @@ cli-anything-onlyoffice doc-preview /tmp/report.docx /tmp/doc_previews --pages 1
 }
 ```
 
+#### `doc-render-map <file>`
+Build a deterministic render map that links DOCX paragraphs and table cells to OnlyOffice-rendered PDF pages, block ids, span ids, and bounding boxes. Use this when downstream review tooling needs native rendered anchors instead of heuristic page matching.
+
+```bash
+cli-anything-onlyoffice doc-render-map /tmp/report.docx --json
+```
+
 #### `doc-add-hyperlink <file> <text> <url> [--paragraph <index>]`
 Insert a hyperlink. Use `--paragraph -1` (default) to add to a new paragraph.
 
@@ -411,7 +420,7 @@ cli-anything-onlyoffice doc-build-references /tmp/essay.docx --json
 
 ## Mode 2 — Spreadsheets (.xlsx)
 
-**37 commands** — cell-level access, sheets, stats, CSV I/O, charts, and data validation.
+**39 commands** — cell-level access, sheets, stats, CSV I/O, charts, data validation, and rendered export/preview.
 
 ### Spreadsheet Defaults
 
@@ -725,6 +734,37 @@ cli-anything-onlyoffice xlsx-validate-data /tmp/survey.xlsx --sheet Data --json
     {"cell": "B4", "value": "INVALID", "reason": "'INVALID' not in allowed list: ['Yes', 'No', 'Maybe']"},
     {"cell": "C3", "value": "11", "reason": "value 11 not between 1.0 and 10.0"},
     {"cell": "C5", "value": "abc", "reason": "'abc' is not a valid whole number"}
+  ]
+}
+```
+
+---
+
+### Visual Export & Preview
+
+#### `xlsx-to-pdf <file> [output_path]`
+Convert a spreadsheet to PDF using OnlyOffice DocumentServer's x2t converter. Use this for appendix-ready evidence exports when you want rendered sheet pages rather than raw cell data.
+
+```bash
+cli-anything-onlyoffice xlsx-to-pdf /tmp/grades.xlsx --json
+cli-anything-onlyoffice xlsx-to-pdf /tmp/grades.xlsx /tmp/grades-appendix.pdf --json
+```
+
+#### `xlsx-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]`
+Render spreadsheet pages as images using the existing OnlyOffice conversion path plus PyMuPDF. This is the closest CLI-equivalent to a clean spreadsheet screenshot because it uses the rendered workbook pages instead of guessing a crop from raw workbook data.
+
+```bash
+cli-anything-onlyoffice xlsx-preview /tmp/grades.xlsx /tmp/xlsx-previews --json
+cli-anything-onlyoffice xlsx-preview /tmp/grades.xlsx /tmp/xlsx-previews --pages 0-1 --dpi 200 --format jpg --json
+```
+```json
+{
+  "success": true,
+  "file": "/tmp/grades.xlsx",
+  "total_pages": 2,
+  "pages_rendered": 2,
+  "images": [
+    {"page": 0, "file": "/tmp/xlsx-previews/page_000.jpg", "width": 1654, "height": 2339, "dpi": 200}
   ]
 }
 ```
@@ -1084,9 +1124,9 @@ cli-anything-onlyoffice pptx-preview /tmp/lecture.pptx /tmp/previews --slide 1 -
 
 ---
 
-## Mode 5 — PDF Image Operations
+## Mode 5 — PDF Native Blocks + Image Operations
 
-**2 commands** — extract embedded images or render pages as images using PyMuPDF.
+**4 commands** — read/search native PDF blocks or extract/render images using PyMuPDF.
 
 #### `pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]`
 Extract embedded image objects (photos, figures, charts) from a PDF.
@@ -1123,6 +1163,20 @@ cli-anything-onlyoffice pdf-page-to-image /tmp/paper.pdf /tmp/pages --pages 0,3,
 ```
 
 Page ranges: `0-3` (pages 0 through 3), `1,3,5` (specific pages), omit for all. Default DPI: 150.
+
+#### `pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]`
+Read native PDF text blocks, lines, and spans with exact bounding boxes. Use this when downstream tooling needs stable `block_id` / `line_id` / `span_id` anchors instead of page-only references.
+
+```bash
+cli-anything-onlyoffice pdf-read-blocks /tmp/paper.pdf --pages 0-1 --json
+```
+
+#### `pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]`
+Search exact PDF block/span text and return the matching native anchors and bounding boxes.
+
+```bash
+cli-anything-onlyoffice pdf-search-blocks /tmp/paper.pdf "Results" --pages 2-3 --json
+```
 
 ---
 
@@ -1318,7 +1372,11 @@ Open a file in OnlyOffice Desktop Editors GUI or web viewer.
 
 ```bash
 cli-anything-onlyoffice open /tmp/report.xlsx gui --json
+cli-anything-onlyoffice spreadsheet.open /tmp/report.xlsx --json
+cli-anything-onlyoffice document.open /tmp/essay.docx web --json
 ```
+
+Compatibility aliases are accepted for agent-style dotted commands: `document.open`, `spreadsheet.open`, `presentation.open`, `pdf.open`. The same alias pattern also works for `watch` and `info`.
 
 #### `watch <file> [gui|web]`
 Watch a file for changes and keep the GUI open for real-time viewing.
@@ -1338,6 +1396,41 @@ File metadata: type, size, sheet/slide/paragraph counts.
 cli-anything-onlyoffice info /tmp/grades.xlsx --json
 ```
 
+#### `editor-session <file> [--open] [--wait <sec>] [--activate]`
+Inspect or open a native OnlyOffice Desktop Editors window for a file and return machine-readable window metadata.
+
+```bash
+cli-anything-onlyoffice editor-session /tmp/report.xlsx --open --json
+cli-anything-onlyoffice editor-session /tmp/report.docx --activate --json
+```
+
+#### `editor-capture <file> <output_image> [options]`
+Capture the live editor viewport from OnlyOffice Desktop Editors when desktop automation is available, or fall back to rendered page export when `--backend rendered` is requested.
+
+Common options:
+- `--backend auto|desktop|rendered`
+- `--open` open the file first if no desktop session exists
+- `--page <n>` zero-based page index for documents/PDFs
+- `--range <Sheet0!A1:F20>` spreadsheet range target via native `Ctrl+G`
+- `--slide <n>` zero-based slide index for presentations
+- `--zoom-reset`, `--zoom-in <n>`, `--zoom-out <n>`
+- `--crop x,y,w,h` crop relative to the captured window image
+- `--wait <sec>`, `--settle-ms <n>`, `--dpi <n>`, `--format png|jpg`
+
+```bash
+# Exact current desktop editor viewport for a workbook
+cli-anything-onlyoffice editor-capture /tmp/report.xlsx /tmp/current-view.png \
+  --backend desktop --open --range Sheet0!A1:F20 --crop 100,120,1400,800 --json
+
+# Document page capture through the live desktop editor
+cli-anything-onlyoffice editor-capture /tmp/report.docx /tmp/page2.png \
+  --backend desktop --open --page 1 --zoom-reset --json
+
+# Rendered fallback when native desktop automation is unavailable
+cli-anything-onlyoffice editor-capture /tmp/report.xlsx /tmp/page0.png \
+  --backend rendered --page 0 --json
+```
+
 #### `status`
 Check installation and all capability flags.
 
@@ -1347,7 +1440,7 @@ cli-anything-onlyoffice status --json
 ```json
 {
   "success": true,
-  "version": "4.1.0",
+  "version": "4.2.0",
   "python": "/path/to/.venv/bin/python3",
   "python_docx": true,
   "openpyxl": true,
@@ -1406,14 +1499,14 @@ cli-anything-onlyoffice backup-restore /tmp/grades.xlsx --latest --dry-run --jso
 
 | Category | Count | Commands |
 |----------|-------|----------|
-| Documents (.docx) | 28 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, doc-word-count |
-| Spreadsheets (.xlsx) | 37 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export, **xlsx-add-validation**, **xlsx-add-dropdown**, **xlsx-list-validations**, **xlsx-remove-validation**, **xlsx-validate-data** |
+| Documents (.docx) | 29 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, **doc-render-map**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, doc-word-count |
+| Spreadsheets (.xlsx) | 39 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export, **xlsx-add-validation**, **xlsx-add-dropdown**, **xlsx-list-validations**, **xlsx-remove-validation**, **xlsx-validate-data**, **xlsx-to-pdf**, **xlsx-preview** |
 | Charts (.xlsx) | 4 | chart-create, chart-comparison, chart-grade-dist, chart-progress |
 | Presentations (.pptx) | 16 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text, **pptx-extract-images**, **pptx-list-shapes**, **pptx-add-textbox**, **pptx-modify-shape**, **pptx-preview** |
-| PDF (.pdf) | 2 | **pdf-extract-images**, **pdf-page-to-image** |
+| PDF (.pdf) | 4 | **pdf-extract-images**, **pdf-page-to-image**, **pdf-read-blocks**, **pdf-search-blocks** |
 | RDF Knowledge Graphs | 10 | rdf-create, rdf-read, rdf-add, rdf-remove, rdf-query, rdf-export, rdf-merge, rdf-stats, rdf-namespace, rdf-validate |
-| General | 9 | list, open, watch, info, backup-list, backup-prune, backup-restore, status, help |
-| **Total** | **105** | |
+| General | 11 | list, open, watch, info, backup-list, backup-prune, backup-restore, **editor-session**, **editor-capture**, status, help |
+| **Total** | **112** | |
 
 ---
 
@@ -1615,6 +1708,7 @@ agent-harness/
 
 | Version | Changes |
 |---------|---------|
+| **4.2.0** | **3 new commands.** Native PDF block/span reading and search with exact bounding boxes, plus DOCX render-map generation that anchors paragraphs and table cells to OnlyOffice-rendered PDF coordinates for downstream review tooling. |
 | **4.1.0** | **15 new commands.** Image extraction from PDFs (PyMuPDF), .docx, and .pptx files. PDF page-to-image rendering at configurable DPI. Spatial awareness for presentations — list all shapes with exact positions/sizes, add textboxes at precise coordinates, modify any shape by name. Slide preview rendering via OnlyOffice x2t. Excel-style data validation — dropdowns, number/decimal ranges, text length, date constraints, custom formulas — plus post-hoc data auditing that checks every cell against its rules. New deps: PyMuPDF, Pillow. |
 | **4.0.2** | Comprehensive bug-fix audit across all four modes: RDF full rewrite — 13 bugs fixed (ASK/CONSTRUCT/DESCRIBE query support, `rdf-remove` literal/bnode type flag, file-not-found guard, double-iteration fix, locking + atomic saves on all write methods, lang+datatype mutual exclusion, self-merge guard, `rdf-validate` structured violations output); xlsx — `xlsx-filter` now validates operator before executing, `xlsx-read` returns error on unknown sheet name instead of silently reading all sheets; docx — `doc-layout` landscape correctly swaps page dimensions, `doc-search` NameError fixed on table-only documents; pptx — `pptx-add-bullets` leading-empty-line enumerate-index bug fixed (orphan empty first paragraph) |
 | **4.0.1** | Bug fixes: two-layer file locking (threading.Lock + fcntl.flock) fixes concurrent write loss under thread load; docx defaults corrected to A4/1" margins/Calibri 11pt/double spacing; xlsx auto-fits column widths and sets A4 paper size; pptx defaults to 16:9 (13.333"×7.5"); status exposes active Python interpreter path |

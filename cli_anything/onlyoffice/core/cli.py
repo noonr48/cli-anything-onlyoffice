@@ -41,6 +41,72 @@ else:
     doc_server = None
 
 
+OPEN_COMPATIBILITY_NAMESPACES = {
+    "document",
+    "doc",
+    "spreadsheet",
+    "sheet",
+    "workbook",
+    "presentation",
+    "slides",
+    "slide",
+    "pdf",
+    "text",
+    "file",
+    "office",
+}
+
+
+def detect_onlyoffice_file_type(file_path):
+    """Best-effort type detection for files OnlyOffice commonly opens."""
+    ext = Path(file_path).suffix.lower()
+    if ext in {".xlsx", ".xls", ".xlsm", ".xltx", ".xltm", ".ods", ".csv", ".tsv"}:
+        return "spreadsheet"
+    if ext in {".pptx", ".ppt", ".pptm", ".ppsx", ".odp"}:
+        return "presentation"
+    if ext == ".pdf":
+        return "pdf"
+    if ext in {
+        ".docx",
+        ".doc",
+        ".docm",
+        ".dotx",
+        ".odt",
+        ".rtf",
+        ".txt",
+        ".md",
+        ".html",
+        ".htm",
+        ".epub",
+    }:
+        return "document"
+    return "file"
+
+
+def normalize_command_alias(command):
+    """Map agent-style dotted compatibility commands onto the canonical CLI surface."""
+    if "." not in command:
+        return command, None
+    namespace, action = command.rsplit(".", 1)
+    if action not in {"open", "watch", "info"}:
+        return command, None
+    if namespace not in OPEN_COMPATIBILITY_NAMESPACES:
+        return command, None
+    return action, {
+        "requested_command": command,
+        "resolved_command": action,
+        "command_namespace": namespace,
+    }
+
+
+def apply_alias_meta(result, alias_meta):
+    """Attach compatibility alias metadata to a result payload."""
+    if alias_meta:
+        result = dict(result)
+        result.update(alias_meta)
+    return result
+
+
 def print_result(result, json_output=False):
     """Print result in appropriate format"""
     if json_output:
@@ -125,14 +191,19 @@ def cmd_list(json_output=False):
     )
 
 
-def cmd_open(file_path, mode="gui", json_output=False):
+def cmd_open(file_path, mode="gui", json_output=False, alias_meta=None):
     """Open a document in OnlyOffice GUI or web viewer"""
     try:
         abs_path = os.path.abspath(file_path)
         if not os.path.exists(abs_path):
             return print_result(
-                {"success": False, "error": f"File not found: {file_path}"}, json_output
+                apply_alias_meta(
+                    {"success": False, "error": f"File not found: {file_path}"},
+                    alias_meta,
+                ),
+                json_output,
             )
+        detected_type = detect_onlyoffice_file_type(abs_path)
 
         if mode == "gui":
             # Open in OnlyOffice Desktop Editors GUI
@@ -143,6 +214,7 @@ def cmd_open(file_path, mode="gui", json_output=False):
                 "success": True,
                 "file": abs_path,
                 "mode": "gui",
+                "detected_type": detected_type,
                 "message": "Opened in OnlyOffice Desktop Editors",
             }
         elif mode == "web":
@@ -152,21 +224,29 @@ def cmd_open(file_path, mode="gui", json_output=False):
                 "success": True,
                 "file": abs_path,
                 "mode": "web",
+                "detected_type": detected_type,
                 "message": "Document Server URL: http://localhost:8080 (configure shared folder for web access)",
                 "note": "For web viewing, copy file to Document Server documents folder",
             }
         else:
-            result = {
-                "success": False,
-                "error": f"Unknown mode: {mode}. Use 'gui' or 'web'",
-            }
+            result = apply_alias_meta(
+                {
+                    "success": False,
+                    "error": f"Unknown mode: {mode}. Use 'gui' or 'web'",
+                },
+                alias_meta,
+            )
 
+        result = apply_alias_meta(result, alias_meta)
         print_result(result, json_output)
     except Exception as e:
-        print_result({"success": False, "error": str(e)}, json_output)
+        print_result(
+            apply_alias_meta({"success": False, "error": str(e)}, alias_meta),
+            json_output,
+        )
 
 
-def cmd_watch(file_path, mode="gui", json_output=False):
+def cmd_watch(file_path, mode="gui", json_output=False, alias_meta=None):
     """Watch a file and auto-open it in GUI for real-time viewing"""
     try:
         import time
@@ -174,7 +254,11 @@ def cmd_watch(file_path, mode="gui", json_output=False):
         abs_path = os.path.abspath(file_path)
         if not os.path.exists(abs_path):
             return print_result(
-                {"success": False, "error": f"File not found: {file_path}"}, json_output
+                apply_alias_meta(
+                    {"success": False, "error": f"File not found: {file_path}"},
+                    alias_meta,
+                ),
+                json_output,
             )
 
         if json_output:
@@ -184,7 +268,9 @@ def cmd_watch(file_path, mode="gui", json_output=False):
                         "success": True,
                         "watching": abs_path,
                         "mode": mode,
+                        "detected_type": detect_onlyoffice_file_type(abs_path),
                         "message": f"Started watching {abs_path}. Press Ctrl+C to stop.",
+                        **(alias_meta or {}),
                     },
                     indent=2,
                 )
@@ -218,10 +304,22 @@ def cmd_watch(file_path, mode="gui", json_output=False):
             if not json_output:
                 print("\nWatch stopped.")
             print_result(
-                {"success": True, "watching": abs_path, "stopped": True}, json_output
+                apply_alias_meta(
+                    {
+                    "success": True,
+                    "watching": abs_path,
+                    "stopped": True,
+                    "detected_type": detect_onlyoffice_file_type(abs_path),
+                    },
+                    alias_meta,
+                ),
+                json_output,
             )
     except Exception as e:
-        print_result({"success": False, "error": str(e)}, json_output)
+        print_result(
+            apply_alias_meta({"success": False, "error": str(e)}, alias_meta),
+            json_output,
+        )
 
 
 def cmd_doc_create(output_path, title, content, json_output=False):
@@ -882,10 +980,70 @@ def cmd_backup_restore(
     print_result(result, json_output)
 
 
-def cmd_info(file_path, json_output=False):
+def cmd_info(file_path, json_output=False, alias_meta=None):
     """Get file information"""
     result = (
         doc_server.get_document_info(file_path)
+        if doc_server
+        else {"success": False, "error": "Client not available"}
+    )
+    print_result(apply_alias_meta(result, alias_meta), json_output)
+
+
+def cmd_editor_session(
+    file_path, open_if_needed=False, wait_seconds=10.0, activate=False, json_output=False
+):
+    """Locate or open a native OnlyOffice desktop editor session."""
+    result = (
+        doc_server.editor_session(
+            file_path,
+            open_if_needed=open_if_needed,
+            wait_seconds=wait_seconds,
+            activate=activate,
+        )
+        if doc_server
+        else {"success": False, "error": "Client not available"}
+    )
+    print_result(result, json_output)
+
+
+def cmd_editor_capture(
+    file_path,
+    output_path,
+    backend="auto",
+    open_if_needed=True,
+    page=None,
+    cell_range=None,
+    slide=None,
+    zoom_reset=False,
+    zoom_in_steps=0,
+    zoom_out_steps=0,
+    crop=None,
+    settle_ms=800,
+    wait_seconds=10.0,
+    dpi=150,
+    fmt=None,
+    json_output=False,
+):
+    """Capture a live editor viewport or rendered fallback image."""
+    result = (
+        doc_server.capture_editor_view(
+            file_path,
+            output_path,
+            backend=backend,
+            open_if_needed=open_if_needed,
+            page=page,
+            cell_range=cell_range,
+            slide=slide,
+            zoom_reset=zoom_reset,
+            zoom_in_steps=zoom_in_steps,
+            zoom_out_steps=zoom_out_steps,
+            crop=crop,
+            settle_ms=settle_ms,
+            wait_seconds=wait_seconds,
+            dpi=dpi,
+            fmt=fmt,
+        )
         if doc_server
         else {"success": False, "error": "Client not available"}
     )
@@ -942,7 +1100,7 @@ def cmd_status(json_output=False):
             "rdf_query": rdflib_available,
             "rdf_validate": shacl_available,
         },
-        "total_commands": 105,
+        "total_commands": 112,
     }
     print_result(result, json_output)
 
@@ -958,7 +1116,7 @@ def cmd_help(json_output=False):
 
     result = {
         "success": True,
-        "version": "4.1.0",
+        "version": "4.2.0",
         "categories": {
             "DOCUMENTS (.docx)": {
                 "doc-create <file> <title> <content>": "Create new .docx document",
@@ -989,6 +1147,7 @@ def cmd_help(json_output=False):
                 "doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]": "Extract all embedded images from .docx",
                 "doc-to-pdf <file> [output_path]": "Convert .docx to PDF via OnlyOffice",
                 "doc-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]": "Render DOCX pages as images via OnlyOffice",
+                "doc-render-map <file>": "Map DOCX paragraphs/table cells to OnlyOffice-rendered PDF pages and bounding boxes",
             },
             "SPREADSHEETS (.xlsx)": {
                 "xlsx-create <file> [sheet]": "Create new .xlsx spreadsheet",
@@ -1028,6 +1187,8 @@ def cmd_help(json_output=False):
                 "xlsx-list-validations <file> [--sheet <name>]": "List all validation rules on a sheet",
                 "xlsx-remove-validation <file> [--range <range>] [--all]": "Remove validation rules",
                 "xlsx-validate-data <file> [--sheet <name>] [--max-rows <n>]": "Audit data against validation rules (pass/fail per cell)",
+                "xlsx-to-pdf <file> [output_path]": "Convert a spreadsheet to PDF via OnlyOffice",
+                "xlsx-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]": "Render spreadsheet pages as images via OnlyOffice",
             },
             "CHARTS (.xlsx)": {
                 "chart-create <file> <type> <data_range> <cat_range> <title> [options]": "Create chart (bar|line|pie|scatter|bar_horizontal)",
@@ -1052,9 +1213,11 @@ def cmd_help(json_output=False):
                 "pptx-modify-shape <file> <slide_index> <shape_name> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--text <text>] [--font-size <pt>] [--rotation <deg>]": "Move/resize/edit any shape by name",
                 "pptx-preview <file> <output_dir> [--slide <index>] [--dpi <n>]": "Render slides as PNG images (requires OnlyOffice Docker)",
             },
-            "PDF (.pdf) — Image Extraction": {
+            "PDF (.pdf)": {
                 "pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]": "Extract embedded images from PDF (PyMuPDF)",
                 "pdf-page-to-image <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]": "Render full PDF pages as images",
+                "pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]": "Read native PDF text blocks/lines/spans with bounding boxes",
+                "pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]": "Search native PDF blocks/spans and return exact block/span anchors",
             },
             "RDF (Knowledge Graphs)": {
                 "rdf-create <file> [--base <uri>] [--format turtle|xml|n3|json-ld] [--prefix <p>=<uri>]": "Create empty RDF graph with prefixes",
@@ -1070,12 +1233,14 @@ def cmd_help(json_output=False):
             },
             "GENERAL": {
                 "list": "List recent documents, spreadsheets, presentations",
-                "open <file> [gui|web]": "Open in OnlyOffice GUI or web viewer",
-                "watch <file> [gui|web]": "Watch file for changes + auto-open",
-                "info <file>": "File info (type, size, sheet/slide/paragraph counts)",
+                "open <file> [gui|web]": "Open in OnlyOffice GUI or web viewer (aliases: document.open, spreadsheet.open, presentation.open, pdf.open)",
+                "watch <file> [gui|web]": "Watch file for changes + auto-open (aliases: document.watch, spreadsheet.watch, presentation.watch, pdf.watch)",
+                "info <file>": "File info (type, size, sheet/slide/paragraph counts; aliases: document.info, spreadsheet.info, presentation.info, pdf.info)",
                 "backup-list <file> [--limit <n>]": "List backups for file",
                 "backup-prune [--file <f>] [--keep <n>] [--days <n>]": "Prune old backups",
                 "backup-restore <file> [--backup <p>] [--latest] [--dry-run]": "Restore from backup",
+                "editor-session <file> [--open] [--wait <sec>] [--activate]": "Inspect or open a native OnlyOffice desktop editor session",
+                "editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h]": "Capture a live editor viewport or rendered fallback image",
                 "status": "Check installation and all capabilities",
                 "help": "Show this help",
             },
@@ -1086,7 +1251,7 @@ def cmd_help(json_output=False):
             "python_pptx": PPTX_AVAILABLE,
             "rdflib": rdflib_available,
         },
-        "total_commands": 105,
+        "total_commands": 112,
         "examples": [
             "# Documents",
             "cli-anything-onlyoffice doc-create /tmp/essay.docx 'My Essay' 'Introduction paragraph here'",
@@ -1095,6 +1260,7 @@ def cmd_help(json_output=False):
             "cli-anything-onlyoffice doc-add-hyperlink /tmp/essay.docx 'Click here' 'https://example.com'",
             "cli-anything-onlyoffice doc-add-list /tmp/essay.docx 'First item;Second item;Third item' --type bullet",
             "cli-anything-onlyoffice doc-preview /tmp/essay.docx /tmp/doc-preview --pages 1-2",
+            "cli-anything-onlyoffice doc-render-map /tmp/essay.docx",
             "cli-anything-onlyoffice doc-word-count /tmp/essay.docx",
             "# Spreadsheets",
             "cli-anything-onlyoffice xlsx-write /tmp/data.xlsx 'Name,Score' 'Alice,90;Bob,85' --sheet Grades",
@@ -1105,10 +1271,15 @@ def cmd_help(json_output=False):
             "cli-anything-onlyoffice xlsx-sheet-list /tmp/data.xlsx",
             "cli-anything-onlyoffice xlsx-format-cells /tmp/data.xlsx A1:B1 --bold --bg-color 4472C4 --color FFFFFF",
             "cli-anything-onlyoffice xlsx-csv-import /tmp/data.xlsx /tmp/raw.csv --sheet Imported",
+            "cli-anything-onlyoffice xlsx-preview /tmp/data.xlsx /tmp/xlsx-preview --pages 0",
+            "cli-anything-onlyoffice editor-capture /tmp/data.xlsx /tmp/current-view.png --backend desktop --range Sheet0!A1:F20 --crop 100,120,1400,800",
             "# Presentations",
             "cli-anything-onlyoffice pptx-create /tmp/lecture.pptx 'Lecture 1' 'Introduction'",
             "cli-anything-onlyoffice pptx-speaker-notes /tmp/lecture.pptx 0 'Remember to introduce yourself'",
             "cli-anything-onlyoffice pptx-slide-count /tmp/lecture.pptx",
+            "# PDFs",
+            "cli-anything-onlyoffice pdf-read-blocks /tmp/paper.pdf --pages 0-1",
+            "cli-anything-onlyoffice pdf-search-blocks /tmp/paper.pdf 'Results' --pages 2-3",
             "# RDF Knowledge Graphs",
             "cli-anything-onlyoffice rdf-create /tmp/knowledge.ttl --base http://example.org/",
             "cli-anything-onlyoffice rdf-add /tmp/knowledge.ttl http://example.org/Alice http://xmlns.com/foaf/0.1/name Alice --type literal",
@@ -1119,12 +1290,60 @@ def cmd_help(json_output=False):
     print_result(result, json_output)
 
 
+def cmd_doc_render_map(file_path, json_output=False):
+    """Map DOCX paragraphs/table cells to rendered OnlyOffice PDF coordinates."""
+    if not DOCX_AVAILABLE:
+        return print_result(
+            {"success": False, "error": "python-docx not installed"}, json_output
+        )
+    result = doc_server.doc_render_map(file_path)
+    print_result(result, json_output)
+
+
+def cmd_pdf_read_blocks(
+    file_path,
+    pages=None,
+    include_spans=True,
+    include_images=True,
+    include_empty=False,
+    json_output=False,
+):
+    """Read native PDF blocks/spans with bounding boxes."""
+    result = doc_server.pdf_read_blocks(
+        file_path,
+        pages=pages,
+        include_spans=include_spans,
+        include_images=include_images,
+        include_empty=include_empty,
+    )
+    print_result(result, json_output)
+
+
+def cmd_pdf_search_blocks(
+    file_path,
+    query,
+    pages=None,
+    case_sensitive=False,
+    include_spans=True,
+    json_output=False,
+):
+    """Search native PDF blocks/spans."""
+    result = doc_server.pdf_search_blocks(
+        file_path,
+        query,
+        pages=pages,
+        case_sensitive=case_sensitive,
+        include_spans=include_spans,
+    )
+    print_result(result, json_output)
+
+
 # ==================== MAIN ====================
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CLI-Anything OnlyOffice v4.0 - Documents, Spreadsheets, Presentations, RDF", add_help=False
+        description="CLI-Anything OnlyOffice v4.2.0 - Documents, Spreadsheets, Presentations, PDFs, RDF", add_help=False
     )
     parser.add_argument("command", nargs="?", default="help", help="Command")
     parser.add_argument("args", nargs="*", default=[], help="Arguments")
@@ -1136,6 +1355,7 @@ def main():
         a for a in (sys.argv[2:] if len(sys.argv) > 2 else []) if a != "--json"
     ]
     json_output = args.json
+    args.command, alias_meta = normalize_command_alias(args.command)
 
     # Document commands
     if args.command == "doc-create":
@@ -2351,6 +2571,48 @@ def main():
             result = doc_server.validate_data(args.args[0], sheet_name=sheet, max_rows=max_rows)
             print_result(result, json_output)
 
+    elif args.command == "xlsx-to-pdf":
+        if len(args.args) < 1:
+            print_result(
+                {"success": False, "error": "Usage: xlsx-to-pdf <file> [output_path]"},
+                json_output,
+            )
+        else:
+            out_path = args.args[1] if len(args.args) >= 2 else None
+            result = doc_server.spreadsheet_to_pdf(args.args[0], output_path=out_path)
+            print_result(result, json_output)
+
+    elif args.command == "xlsx-preview":
+        if len(args.args) < 2:
+            print_result(
+                {
+                    "success": False,
+                    "error": "Usage: xlsx-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]",
+                },
+                json_output,
+            )
+        else:
+            pages = None
+            dpi = 150
+            fmt = "png"
+            i = 2
+            while i < len(args.args):
+                if args.args[i] == "--pages" and i + 1 < len(args.args):
+                    pages = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--dpi" and i + 1 < len(args.args):
+                    dpi = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--format" and i + 1 < len(args.args):
+                    fmt = args.args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            result = doc_server.preview_spreadsheet(
+                args.args[0], args.args[1], pages=pages, dpi=dpi, fmt=fmt
+            )
+            print_result(result, json_output)
+
     # Chart commands
     elif args.command == "chart-create":
         if len(args.args) < 5:
@@ -2864,7 +3126,7 @@ def main():
             )
         else:
             mode = args.args[1] if len(args.args) > 1 else "gui"
-            cmd_open(args.args[0], mode, json_output)
+            cmd_open(args.args[0], mode, json_output, alias_meta=alias_meta)
 
     elif args.command == "watch":
         if not args.args:
@@ -2874,13 +3136,132 @@ def main():
             )
         else:
             mode = args.args[1] if len(args.args) > 1 else "gui"
-            cmd_watch(args.args[0], mode, json_output)
+            cmd_watch(args.args[0], mode, json_output, alias_meta=alias_meta)
 
     elif args.command == "info":
         if not args.args:
             print_result({"success": False, "error": "Usage: info <file>"}, json_output)
         else:
-            cmd_info(args.args[0], json_output)
+            cmd_info(args.args[0], json_output, alias_meta=alias_meta)
+
+    elif args.command == "editor-session":
+        if not args.args:
+            print_result(
+                {
+                    "success": False,
+                    "error": "Usage: editor-session <file> [--open] [--wait <sec>] [--activate]",
+                },
+                json_output,
+            )
+        else:
+            open_if_needed = False
+            wait_seconds = 10.0
+            activate = False
+            i = 1
+            while i < len(args.args):
+                if args.args[i] == "--open":
+                    open_if_needed = True
+                    i += 1
+                elif args.args[i] == "--wait" and i + 1 < len(args.args):
+                    wait_seconds = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--activate":
+                    activate = True
+                    i += 1
+                else:
+                    i += 1
+            cmd_editor_session(
+                args.args[0],
+                open_if_needed=open_if_needed,
+                wait_seconds=wait_seconds,
+                activate=activate,
+                json_output=json_output,
+            )
+
+    elif args.command == "editor-capture":
+        if len(args.args) < 2:
+            print_result(
+                {
+                    "success": False,
+                    "error": "Usage: editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--open] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h] [--wait <sec>] [--settle-ms <n>] [--dpi <n>] [--format png|jpg]",
+                },
+                json_output,
+            )
+        else:
+            backend = "auto"
+            open_if_needed = False
+            page = None
+            cell_range = None
+            slide = None
+            zoom_reset = False
+            zoom_in_steps = 0
+            zoom_out_steps = 0
+            crop = None
+            settle_ms = 800
+            wait_seconds = 10.0
+            dpi = 150
+            fmt = None
+            i = 2
+            while i < len(args.args):
+                if args.args[i] == "--backend" and i + 1 < len(args.args):
+                    backend = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--open":
+                    open_if_needed = True
+                    i += 1
+                elif args.args[i] == "--page" and i + 1 < len(args.args):
+                    page = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--range" and i + 1 < len(args.args):
+                    cell_range = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--slide" and i + 1 < len(args.args):
+                    slide = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--zoom-reset":
+                    zoom_reset = True
+                    i += 1
+                elif args.args[i] == "--zoom-in" and i + 1 < len(args.args):
+                    zoom_in_steps = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--zoom-out" and i + 1 < len(args.args):
+                    zoom_out_steps = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--crop" and i + 1 < len(args.args):
+                    crop = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--settle-ms" and i + 1 < len(args.args):
+                    settle_ms = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--wait" and i + 1 < len(args.args):
+                    wait_seconds = float(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--dpi" and i + 1 < len(args.args):
+                    dpi = int(args.args[i + 1])
+                    i += 2
+                elif args.args[i] == "--format" and i + 1 < len(args.args):
+                    fmt = args.args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            cmd_editor_capture(
+                args.args[0],
+                args.args[1],
+                backend=backend,
+                open_if_needed=open_if_needed,
+                page=page,
+                cell_range=cell_range,
+                slide=slide,
+                zoom_reset=zoom_reset,
+                zoom_in_steps=zoom_in_steps,
+                zoom_out_steps=zoom_out_steps,
+                crop=crop,
+                settle_ms=settle_ms,
+                wait_seconds=wait_seconds,
+                dpi=dpi,
+                fmt=fmt,
+                json_output=json_output,
+            )
 
     elif args.command == "backup-list":
         if not args.args:
@@ -3040,6 +3421,15 @@ def main():
             )
             print_result(result, json_output)
 
+    elif args.command == "doc-render-map":
+        if len(args.args) < 1:
+            print_result(
+                {"success": False, "error": "Usage: doc-render-map <file>"},
+                json_output,
+            )
+        else:
+            cmd_doc_render_map(args.args[0], json_output=json_output)
+
     elif args.command == "pptx-extract-images":
         if len(args.args) < 2:
             print_result(
@@ -3113,6 +3503,80 @@ def main():
                     i += 1
             result = doc_server.pdf_page_to_image(args.args[0], args.args[1], pages=pages, dpi=dpi, fmt=fmt)
             print_result(result, json_output)
+
+    elif args.command == "pdf-read-blocks":
+        if len(args.args) < 1:
+            print_result(
+                {
+                    "success": False,
+                    "error": "Usage: pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]",
+                },
+                json_output,
+            )
+        else:
+            pages = None
+            include_spans = True
+            include_images = True
+            include_empty = False
+            i = 1
+            while i < len(args.args):
+                if args.args[i] == "--pages" and i + 1 < len(args.args):
+                    pages = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--no-spans":
+                    include_spans = False
+                    i += 1
+                elif args.args[i] == "--no-images":
+                    include_images = False
+                    i += 1
+                elif args.args[i] == "--include-empty":
+                    include_empty = True
+                    i += 1
+                else:
+                    i += 1
+            cmd_pdf_read_blocks(
+                args.args[0],
+                pages=pages,
+                include_spans=include_spans,
+                include_images=include_images,
+                include_empty=include_empty,
+                json_output=json_output,
+            )
+
+    elif args.command == "pdf-search-blocks":
+        if len(args.args) < 2:
+            print_result(
+                {
+                    "success": False,
+                    "error": "Usage: pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]",
+                },
+                json_output,
+            )
+        else:
+            pages = None
+            case_sensitive = False
+            include_spans = True
+            i = 2
+            while i < len(args.args):
+                if args.args[i] == "--pages" and i + 1 < len(args.args):
+                    pages = args.args[i + 1]
+                    i += 2
+                elif args.args[i] == "--case-sensitive":
+                    case_sensitive = True
+                    i += 1
+                elif args.args[i] == "--no-spans":
+                    include_spans = False
+                    i += 1
+                else:
+                    i += 1
+            cmd_pdf_search_blocks(
+                args.args[0],
+                args.args[1],
+                pages=pages,
+                case_sensitive=case_sensitive,
+                include_spans=include_spans,
+                json_output=json_output,
+            )
 
     # ==================== PPTX SPATIAL / TEXTBOX ====================
 

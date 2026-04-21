@@ -1,16 +1,21 @@
 ---
 name: onlyoffice
-version: 4.1.0
+version: 4.2.0
 author: SLOANE OS
-description: 103-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
+description: 112-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
 tags: [productivity, documents, office, onlyoffice, charts, spreadsheets, rdf, apa, pdf, image-extraction, spatial, data-validation]
 ---
 
-# CLI-Anything OnlyOffice v4.1.0
+# CLI-Anything OnlyOffice v4.2.0
 
 Programmatic control over Office documents designed for AI agents. Full JSON output. Production-safe with atomic writes, two-layer file locking, and automatic backups.
 
-## What's New in v4.1.0
+## What's New in v4.2.0
+- **Native PDF Blocks** — read/search exact PDF text blocks, lines, and spans with bounding boxes
+- **DOCX Render Map** — map DOCX paragraphs and table cells to OnlyOffice-rendered PDF pages and boxes
+- **Proof-Grade Anchors** — expose stable block/span ids for downstream reviewer and audit tooling
+
+## Carry Forward from v4.1.0
 - **Image Extraction** — pull images out of PDFs, .docx, and .pptx files
 - **PDF Rendering** — render PDF pages as PNG/JPG images (PyMuPDF)
 - **Spatial Awareness** — list all shapes with exact positions/sizes for layout control
@@ -40,6 +45,17 @@ cli_anything_run --app onlyoffice status --json
 ```
 Check the `python` field in the response — it must point to `.venv/bin/python3`.
 
+## CRITICAL: Office files are not plain text
+
+`.docx`, `.xlsx`, and `.pptx` are OOXML containers (zip/XML packages), so generic text Read/Write tools will often fail or report them as binary.
+
+**Do not treat that as a capability gap.** Use this tool's semantic commands instead:
+- DOCX: `doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`, `doc-add-image`, `doc-to-pdf`, `doc-preview`, `doc-render-map`
+- XLSX: `xlsx-read`, `xlsx-cell-read`, `xlsx-range-read`, `xlsx-write`, `xlsx-cell-write`, `xlsx-preview`
+- PPTX: `pptx-read`, `pptx-add-slide`, `pptx-update-text`, `pptx-preview`
+
+If you need the rendered visual layout, use preview/export commands rather than raw file reads.
+
 ---
 
 ## Document Defaults (doc-create)
@@ -61,7 +77,7 @@ Check the `python` field in the response — it must point to `.venv/bin/python3
 
 ---
 
-## DOCUMENTS (.docx) — 26 commands
+## DOCUMENTS (.docx) — 29 commands
 
 ### Core CRUD
 - `doc-create <file> <title> <content>`
@@ -102,6 +118,11 @@ Check the `python` field in the response — it must point to `.venv/bin/python3
 ### References (APA 7th)
 - `doc-add-reference <file> <ref_json>` — types: journal, book, website, report, chapter
 - `doc-build-references <file>`
+
+### Rendered Output
+- `doc-to-pdf <file> [output_path]`
+- `doc-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]`
+- `doc-render-map <file>`
 
 ---
 
@@ -219,10 +240,12 @@ Types: bar, column, bar_horizontal, line, pie, scatter
 
 ---
 
-## PDF (.pdf) — 2 commands
+## PDF (.pdf) — 4 commands
 
 - `pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]` — extract embedded image objects (PyMuPDF)
 - `pdf-page-to-image <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]` — render full pages as images
+- `pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]` — read native PDF blocks/lines/spans with bbox metadata
+- `pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]` — search exact PDF blocks/spans and return native anchors
 
 Page ranges: `0-3` (pages 0 through 3), `1,3,5` (specific pages), omit for all pages.
 Default DPI: 150. Use 300 for print quality.
@@ -244,12 +267,14 @@ Default DPI: 150. Use 300 for print quality.
 
 ---
 
-## GENERAL — 9 commands
+## GENERAL — 11 commands
 
 - `list` — List recent office files
 - `open <file> [gui|web]`
 - `watch <file> [gui|web]`
 - `info <file>`
+- `editor-session <file> [--open] [--wait <sec>] [--activate]`
+- `editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h]`
 - `status` — Check installation (includes `python` field showing active interpreter)
 - `help`
 - `backup-list <file> [--limit <n>]`
