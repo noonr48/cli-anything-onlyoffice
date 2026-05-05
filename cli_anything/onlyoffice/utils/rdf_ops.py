@@ -41,12 +41,16 @@ class RDFOperations:
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
             prefix=f".{target.name}.",
+            suffix=".tmp",
             dir=str(target.parent),
         )
         try:
-            with os.fdopen(fd, "w") as handle:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(tmp_path, str(target))
+            self.host._fsync_directory(target.parent)
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -54,7 +58,9 @@ class RDFOperations:
                 pass
             raise
 
-    def get_graph(self, file_path: str = None) -> Tuple[Optional[Any], Optional[str]]:
+    def get_graph(
+        self, file_path: str = None, format: str = None
+    ) -> Tuple[Optional[Any], Optional[str]]:
         """Load or create an RDF graph. Returns ``(graph, error_string)``."""
         try:
             from rdflib import Graph
@@ -65,14 +71,14 @@ class RDFOperations:
         if file_path:
             if not os.path.exists(file_path):
                 return None, f"File not found: {file_path}"
-            graph.parse(file_path, format=self.rdf_format_from_path(file_path))
+            graph.parse(file_path, format=format or self.rdf_format_from_path(file_path))
         return graph, None
 
     def create(
         self,
         file_path: str,
         base_uri: str = None,
-        format: str = "turtle",
+        format: str = None,
         prefixes: Dict[str, str] = None,
     ) -> Dict[str, Any]:
         """Create a new empty RDF graph file."""
@@ -80,8 +86,9 @@ class RDFOperations:
             from rdflib import Graph, Namespace
             from rdflib.namespace import DCTERMS, FOAF, OWL, RDF, RDFS, SKOS, XSD
 
+            fmt = format or self.rdf_format_from_path(file_path)
             with self.host._file_lock(file_path):
-                self.host._snapshot_backup(file_path)
+                backup = self.host._snapshot_backup(file_path)
                 graph = Graph()
                 if base_uri:
                     graph.bind("base", Namespace(base_uri))
@@ -98,13 +105,14 @@ class RDFOperations:
                     ("skos", SKOS),
                 ]:
                     graph.bind(ns_prefix, ns)
-                self.rdf_safe_save(graph.serialize(format=format), file_path)
+                self.rdf_safe_save(graph.serialize(format=fmt), file_path)
             return {
                 "success": True,
                 "file": file_path,
-                "format": format,
+                "format": fmt,
                 "triples": len(graph),
                 "prefixes": {prefix: str(namespace) for prefix, namespace in graph.namespaces()},
+                "backup": backup or None,
             }
         except ImportError:
             return {"success": False, "error": "rdflib not installed. pip install rdflib"}
@@ -167,11 +175,11 @@ class RDFOperations:
                 }
 
             with self.host._file_lock(file_path):
-                self.host._snapshot_backup(file_path)
-                graph, err = self.get_graph(file_path)
+                backup = self.host._snapshot_backup(file_path)
+                fmt = format or self.rdf_format_from_path(file_path)
+                graph, err = self.get_graph(file_path, format=fmt)
                 if err:
                     return {"success": False, "error": err}
-                fmt = format or self.rdf_format_from_path(file_path)
                 subj = URIRef(subject)
                 pred = URIRef(predicate)
                 if object_type == "literal":
@@ -195,6 +203,7 @@ class RDFOperations:
                 "triples_before": before,
                 "triples_after": len(graph),
                 "format": fmt,
+                "backup": backup or None,
             }
         except ImportError:
             return {"success": False, "error": "rdflib not installed"}
@@ -211,23 +220,30 @@ class RDFOperations:
         lang: str = None,
         datatype: str = None,
         format: str = None,
+        remove_all: bool = False,
+        dry_run: bool = False,
     ) -> Dict[str, Any]:
-        """Remove triples matching a pattern. None values act as wildcards."""
+        """Remove triples matching a pattern. Whole-graph removal requires remove_all."""
         try:
             from rdflib import BNode, Literal, URIRef
 
+            if not remove_all and subject is None and predicate is None and object_val is None:
+                return {
+                    "success": False,
+                    "error": "rdf-remove requires at least one selector or explicit --all.",
+                }
             if lang and datatype:
                 return {
                     "success": False,
                     "error": "Cannot specify both --lang and --datatype for a literal",
                 }
 
+            backup = None
             with self.host._file_lock(file_path):
-                self.host._snapshot_backup(file_path)
-                graph, err = self.get_graph(file_path)
+                fmt = format or self.rdf_format_from_path(file_path)
+                graph, err = self.get_graph(file_path, format=fmt)
                 if err:
                     return {"success": False, "error": err}
-                fmt = format or self.rdf_format_from_path(file_path)
                 subj = URIRef(subject) if subject else None
                 pred = URIRef(predicate) if predicate else None
                 if object_val is None:
@@ -240,15 +256,20 @@ class RDFOperations:
                 else:
                     obj = URIRef(object_val)
                 before = len(graph)
-                graph.remove((subj, pred, obj))
-                self.rdf_safe_save(graph.serialize(format=fmt), file_path)
+                matched_count = sum(1 for _ in graph.triples((subj, pred, obj)))
+                if not dry_run:
+                    backup = self.host._snapshot_backup(file_path)
+                    graph.remove((subj, pred, obj))
+                    self.rdf_safe_save(graph.serialize(format=fmt), file_path)
             return {
                 "success": True,
                 "file": file_path,
                 "triples_before": before,
-                "triples_after": len(graph),
-                "removed": before - len(graph),
+                "triples_after": before if dry_run else len(graph),
+                "removed": matched_count,
                 "format": fmt,
+                "dry_run": dry_run,
+                "backup": backup or None,
             }
         except ImportError:
             return {"success": False, "error": "rdflib not installed"}
@@ -326,23 +347,25 @@ class RDFOperations:
         self,
         file_path: str,
         output_path: str,
-        output_format: str = "turtle",
+        output_format: str = None,
     ) -> Dict[str, Any]:
         """Convert/export an RDF graph to a different serialisation format."""
         try:
-            with self.host._file_lock(output_path):
-                self.host._snapshot_backup(output_path)
+            fmt = output_format or self.rdf_format_from_path(output_path)
+            with self.host._file_locks(file_path, output_path):
+                backup = self.host._snapshot_backup(output_path)
                 graph, err = self.get_graph(file_path)
                 if err:
                     return {"success": False, "error": err}
-                self.rdf_safe_save(graph.serialize(format=output_format), output_path)
+                self.rdf_safe_save(graph.serialize(format=fmt), output_path)
             return {
                 "success": True,
                 "source": file_path,
                 "output": output_path,
-                "format": output_format,
+                "format": fmt,
                 "triples": len(graph),
                 "size": os.path.getsize(output_path),
+                "backup": backup or None,
             }
         except ImportError:
             return {"success": False, "error": "rdflib not installed"}
@@ -367,15 +390,15 @@ class RDFOperations:
                 }
 
             target = output_path or file_path
-            with self.host._file_lock(target):
-                self.host._snapshot_backup(target)
+            fmt = format or self.rdf_format_from_path(target)
+            with self.host._file_locks(file_path, other_path, target):
+                backup = self.host._snapshot_backup(target)
                 graph_a, err = self.get_graph(file_path)
                 if err:
                     return {"success": False, "error": err}
                 graph_b, err = self.get_graph(other_path)
                 if err:
                     return {"success": False, "error": err}
-                fmt = format or self.rdf_format_from_path(target)
                 before = len(graph_a)
                 graph_a += graph_b
                 self.rdf_safe_save(graph_a.serialize(format=fmt), target)
@@ -386,6 +409,7 @@ class RDFOperations:
                 "graph_b_triples": len(graph_b),
                 "merged_triples": len(graph_a),
                 "format": fmt,
+                "backup": backup or None,
             }
         except ImportError:
             return {"success": False, "error": "rdflib not installed"}
@@ -456,11 +480,11 @@ class RDFOperations:
 
             if prefix and uri:
                 with self.host._file_lock(file_path):
-                    self.host._snapshot_backup(file_path)
-                    graph, err = self.get_graph(file_path)
+                    backup = self.host._snapshot_backup(file_path)
+                    fmt = format or self.rdf_format_from_path(file_path)
+                    graph, err = self.get_graph(file_path, format=fmt)
                     if err:
                         return {"success": False, "error": err}
-                    fmt = format or self.rdf_format_from_path(file_path)
                     graph.bind(prefix, Namespace(uri))
                     self.rdf_safe_save(graph.serialize(format=fmt), file_path)
                 return {
@@ -473,6 +497,8 @@ class RDFOperations:
                         ns_prefix: str(namespace)
                         for ns_prefix, namespace in graph.namespaces()
                     },
+                    "format": fmt,
+                    "backup": backup or None,
                 }
 
             graph, err = self.get_graph(file_path)

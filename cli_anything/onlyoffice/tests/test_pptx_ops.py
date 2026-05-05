@@ -11,6 +11,7 @@ from pptx import Presentation
 
 from cli_anything.onlyoffice.core import cli as cli_module
 from cli_anything.onlyoffice.utils.docserver import get_client
+from cli_anything.onlyoffice.utils.pptx_ops import PPTXOperations
 
 
 class OnlyOfficePPTXTests(unittest.TestCase):
@@ -153,6 +154,130 @@ class OnlyOfficePPTXTests(unittest.TestCase):
         self.assertEqual(textbox_shape["left_inches"], 2.0)
         self.assertEqual(textbox_shape["top_inches"], 2.25)
         self.assertEqual(textbox_shape["rotation"], 15.0)
+
+    def test_pptx_extract_images_rejects_path_prefix_and_bad_format(self):
+        path = self._path("unsafe_prefix.pptx")
+        image_path = self._path("source.png")
+        out_dir = self._path("prefix_out")
+        self._build_png(image_path)
+
+        self.assertTrue(self.client.create_presentation(path, "Deck", "Intro")["success"])
+        self.assertTrue(self.client.add_image_slide(path, "Evidence", image_path)["success"])
+
+        traversal = self.client.extract_images_from_pptx(
+            path,
+            out_dir,
+            fmt="png",
+            prefix="../escape",
+        )
+        absolute = self.client.extract_images_from_pptx(
+            path,
+            out_dir,
+            fmt="png",
+            prefix=self._path("absolute"),
+        )
+        bad_format = self.client.extract_images_from_pptx(
+            path,
+            out_dir,
+            fmt="../escape",
+            prefix="slide",
+        )
+
+        self.assertFalse(traversal["success"])
+        self.assertEqual(traversal["error_code"], "unsafe_output_prefix")
+        self.assertFalse(os.path.exists(self._path("escape_01_000.png")))
+
+        self.assertFalse(absolute["success"])
+        self.assertEqual(absolute["error_code"], "unsafe_output_prefix")
+
+        self.assertFalse(bad_format["success"])
+        self.assertEqual(bad_format["error_code"], "unsupported_image_format")
+
+    def test_pptx_extract_images_enforces_embedded_image_resource_limits(self):
+        path = self._path("bounded_images.pptx")
+        image_path = self._path("bounded_source.png")
+        self._build_png(image_path)
+
+        self.assertTrue(self.client.create_presentation(path, "Deck", "Intro")["success"])
+        self.assertTrue(self.client.add_image_slide(path, "Evidence", image_path)["success"])
+
+        with mock.patch.object(PPTXOperations, "MAX_EXTRACT_IMAGES", 0):
+            count_limited = self.client.extract_images_from_pptx(
+                path,
+                self._path("count_limited"),
+                fmt="png",
+            )
+
+        self.assertTrue(count_limited["success"])
+        self.assertTrue(count_limited["truncated"])
+        self.assertEqual(count_limited["images_extracted"], 0)
+        self.assertEqual(count_limited["resource_limits"]["max_images"], 0)
+        self.assertTrue(any("Stopped after 0 images" in warning for warning in count_limited["warnings"]))
+
+        with mock.patch.object(PPTXOperations, "MAX_EXTRACT_IMAGE_COMPRESSED_BYTES", 1):
+            byte_limited = self.client.extract_images_from_pptx(
+                path,
+                self._path("byte_limited"),
+                fmt="png",
+            )
+
+        self.assertTrue(byte_limited["success"])
+        self.assertEqual(byte_limited["images_extracted"], 0)
+        self.assertEqual(byte_limited["images_skipped"], 1)
+        self.assertTrue(byte_limited["images"][0]["skipped"])
+        self.assertEqual(byte_limited["images"][0]["error_code"], "image_compressed_bytes_limit_exceeded")
+
+        with mock.patch.object(PPTXOperations, "MAX_EXTRACT_IMAGE_PIXELS", 1):
+            with mock.patch.object(Image.Image, "save") as image_save:
+                pixel_limited = self.client.extract_images_from_pptx(
+                    path,
+                    self._path("pixel_limited"),
+                    fmt="png",
+                )
+
+        self.assertTrue(pixel_limited["success"])
+        self.assertEqual(pixel_limited["images_extracted"], 0)
+        self.assertEqual(pixel_limited["images_skipped"], 1)
+        self.assertEqual(pixel_limited["images"][0]["error_code"], "image_pixel_limit_exceeded")
+        image_save.assert_not_called()
+
+        with mock.patch.object(PPTXOperations, "MAX_EXTRACT_TOTAL_COMPRESSED_BYTES", 1):
+            aggregate_byte_limited = self.client.extract_images_from_pptx(
+                path,
+                self._path("aggregate_byte_limited"),
+                fmt="png",
+            )
+
+        self.assertTrue(aggregate_byte_limited["success"])
+        self.assertTrue(aggregate_byte_limited["truncated"])
+        self.assertEqual(aggregate_byte_limited["images_extracted"], 0)
+        self.assertEqual(aggregate_byte_limited["images_skipped"], 1)
+        self.assertEqual(
+            aggregate_byte_limited["images"][0]["error_code"],
+            "aggregate_image_compressed_bytes_limit_exceeded",
+        )
+        self.assertEqual(
+            aggregate_byte_limited["resource_limits"]["max_total_compressed_image_bytes"],
+            1,
+        )
+
+        with mock.patch.object(PPTXOperations, "MAX_EXTRACT_TOTAL_PIXELS", 1):
+            with mock.patch.object(Image.Image, "save") as image_save:
+                aggregate_pixel_limited = self.client.extract_images_from_pptx(
+                    path,
+                    self._path("aggregate_pixel_limited"),
+                    fmt="png",
+                )
+
+        self.assertTrue(aggregate_pixel_limited["success"])
+        self.assertTrue(aggregate_pixel_limited["truncated"])
+        self.assertEqual(aggregate_pixel_limited["images_extracted"], 0)
+        self.assertEqual(aggregate_pixel_limited["images_skipped"], 1)
+        self.assertEqual(
+            aggregate_pixel_limited["images"][0]["error_code"],
+            "aggregate_image_pixel_limit_exceeded",
+        )
+        image_save.assert_not_called()
 
     def test_pptx_preview_uses_shared_pdf_render_pipeline(self):
         path = self._path("preview_deck.pptx")

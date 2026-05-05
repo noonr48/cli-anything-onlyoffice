@@ -99,6 +99,35 @@ class OnlyOfficeXLSXCLITests(unittest.TestCase):
             strict_formula_safety=True,
         )
 
+    def test_cli_xlsx_formula_dispatches_explicit_formula_entrypoint(self):
+        path = self._path("dispatch_formula.xlsx")
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "add_formula",
+            return_value={"success": True, "cell": "C2", "formula": "=A2+B2"},
+        ) as add_formula:
+            with mock.patch(
+                "sys.argv",
+                [
+                    "cli-anything-onlyoffice",
+                    "xlsx-formula",
+                    path,
+                    "C2",
+                    "=A2+B2",
+                    "--sheet",
+                    "Grades",
+                    "--json",
+                ],
+            ):
+                with redirect_stdout(stdout):
+                    cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["success"])
+        add_formula.assert_called_once_with(path, "C2", "=A2+B2", sheet_name="Grades")
+
     def test_cli_xlsx_add_validation_dispatches_via_xlsx_handler(self):
         path = self._path("dispatch_validate.xlsx")
         stdout = io.StringIO()

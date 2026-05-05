@@ -17,10 +17,12 @@ from PIL import Image
 
 from cli_anything.onlyoffice.core import cli as cli_module
 from cli_anything.onlyoffice.core.command_registry import (
+    CLI_SCHEMA_VERSION,
     COMMAND_CATEGORIES,
     HELP_EXAMPLES,
     TOTAL_COMMANDS,
     VERSION,
+    command_signature,
     command_usage,
 )
 from cli_anything.onlyoffice.utils.docserver import get_client
@@ -85,9 +87,15 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
         self.client.write_spreadsheet(
             output_path=path,
             headers=["A", "B", "Total"],
-            data=[[10, 20, "=A2+B2"], [15, 25, "=A3+B3"]],
+            data=[[10, 20, ""], [15, 25, ""]],
             sheet_name="Sheet1",
             overwrite_workbook=True,
+        )
+        self.assertTrue(
+            self.client.add_formula(path, "C2", "=A2+B2", sheet_name="Sheet1")["success"]
+        )
+        self.assertTrue(
+            self.client.add_formula(path, "C3", "=A3+B3", sheet_name="Sheet1")["success"]
         )
 
         raw = self.client.calculate_column(
@@ -170,6 +178,7 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
         def fake_doc_to_pdf(file_path, output_path=None):
             self.assertEqual(file_path, path)
             self.assertIsNotNone(output_path)
+            self.assertFalse(os.path.exists(output_path))
             with open(output_path, "wb") as f:
                 f.write(b"%PDF-1.4 fake")
             captured["pdf_path"] = output_path
@@ -441,10 +450,15 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
         )
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["version"], VERSION)
+        self.assertEqual(payload["schema_version"], CLI_SCHEMA_VERSION)
         self.assertEqual(payload["total_commands"], TOTAL_COMMANDS)
+        self.assertEqual(payload["command_count"], TOTAL_COMMANDS)
         self.assertEqual(payload["examples"], HELP_EXAMPLES)
         self.assertEqual(payload["categories"]["DOCUMENTS (.docx)"], COMMAND_CATEGORIES["DOCUMENTS (.docx)"])
         self.assertEqual(payload["categories"]["PDF (.pdf)"], COMMAND_CATEGORIES["PDF (.pdf)"])
+        self.assertIn("commands", payload)
+        self.assertIn("usage", payload)
+        self.assertIn("capability_metadata", payload)
         docs = payload["categories"]["DOCUMENTS (.docx)"]
         sheet = payload["categories"]["SPREADSHEETS (.xlsx)"]
         self.assertIn(
@@ -461,21 +475,41 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             docs,
         )
         self.assertIn("doc-inspect-hidden-data <file>", docs)
+        self.assertIn(command_signature("doc-sanitize"), docs)
         self.assertIn(
-            "doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--author <a>]",
+            "doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--rendered-layout] [--profile auto|generic|apa-references]",
             docs,
         )
         self.assertIn(
-            "doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>]",
+            "doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]",
             docs,
         )
         self.assertIn(
-            "xlsx-calc <file> <column> <op> [--sheet <name>] [--include-formulas] [--strict-formulas]",
+            "doc-to-pdf <file> [output_path] [--layout-warnings] [--profile auto|generic|apa-references]",
+            docs,
+        )
+        self.assertIn(
+            "doc-render-audit <file> [--pdf <path>] [--tolerance-points <n>] [--profile auto|generic|apa-references]",
+            docs,
+        )
+        self.assertIn(
+            "xlsx-calc <file> <column> <operation> [--sheet <name>] [--include-formulas] [--strict-formulas]",
             sheet,
         )
         self.assertIn(
             "xlsx-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]",
             sheet,
+        )
+        validation_signature = next(
+            signature for signature in sheet if signature.startswith("xlsx-add-validation ")
+        )
+        self.assertIn("--no-blank", validation_signature)
+        self.assertNotIn("--allow-blank", validation_signature)
+        self.assertIn("--no-blank", payload["usage"]["xlsx-add-validation"])
+        self.assertNotIn("--allow-blank", payload["usage"]["xlsx-add-validation"])
+        self.assertEqual(
+            payload["commands"]["xlsx-add-validation"]["usage"],
+            command_usage("xlsx-add-validation"),
         )
         pdf = payload["categories"]["PDF (.pdf)"]
         self.assertIn(
@@ -486,18 +520,17 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             "pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]",
             pdf,
         )
-        self.assertIn(
-            "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>]",
-            pdf,
-        )
+        self.assertIn(command_signature("pdf-sanitize"), pdf)
         self.assertIn("pdf-inspect-hidden-data <file>", pdf)
+        rdf = payload["categories"]["RDF (Knowledge Graphs)"]
+        self.assertIn(command_signature("rdf-remove"), rdf)
         general = payload["categories"]["GENERAL"]
         self.assertIn(
             "editor-session <file> [--open] [--wait <sec>] [--activate]",
             general,
         )
         self.assertIn(
-            "editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h]",
+            "editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--open] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h] [--wait <sec>] [--settle-ms <n>] [--dpi <n>] [--format png|jpg]",
             general,
         )
 
@@ -510,8 +543,28 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
         )
         payload = json.loads(proc.stdout)
         self.assertTrue(payload["success"])
+        self.assertEqual(payload["schema_version"], CLI_SCHEMA_VERSION)
         self.assertEqual(payload["version"], VERSION)
         self.assertEqual(payload["total_commands"], TOTAL_COMMANDS)
+        self.assertEqual(payload["command_count"], TOTAL_COMMANDS)
+        self.assertEqual(payload["registry"]["schema_version"], CLI_SCHEMA_VERSION)
+        self.assertEqual(payload["registry"]["total_commands"], TOTAL_COMMANDS)
+        self.assertEqual(payload["registry"]["category_counts"], payload["category_counts"])
+        self.assertIn("dependencies", payload)
+        self.assertIn("conversion", payload)
+        self.assertIn("capability_metadata", payload)
+        self.assertEqual(payload["dependencies"]["openpyxl"], payload["openpyxl"])
+        self.assertIn("docker", payload["dependencies"])
+        self.assertIn("onlyoffice_x2t", payload["dependencies"])
+        self.assertIn("office_to_pdf", payload["capabilities"])
+        self.assertEqual(
+            payload["capability_metadata"]["openpyxl"]["available"],
+            payload["openpyxl"],
+        )
+        self.assertEqual(
+            payload["capability_metadata"]["xlsx_create"]["requires"],
+            ["openpyxl"],
+        )
 
     def test_cli_doc_usage_error_comes_from_registry(self):
         stdout = io.StringIO()
@@ -779,6 +832,7 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             clear_metadata=True,
             remove_custom_xml=False,
             set_remove_personal_information=False,
+            canonicalize_ooxml=False,
             author="benbi",
             title=None,
             subject=None,
@@ -807,6 +861,9 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
                     "Times New Roman",
                     "--expected-font-size",
                     "12",
+                    "--rendered-layout",
+                    "--profile",
+                    "apa-references",
                     "--json",
                 ],
             ):
@@ -820,6 +877,8 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             expected_page_size="A4",
             expected_font_name="Times New Roman",
             expected_font_size=12.0,
+            rendered_layout=True,
+            render_profile="apa-references",
         )
 
     def test_cli_pdf_sanitize_dispatches_to_docserver(self):

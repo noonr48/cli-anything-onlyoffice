@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import tempfile
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,6 +27,19 @@ except ImportError:
 class PPTXOperations:
     """Encapsulate PPTX creation, editing, inspection, and preview workflows."""
 
+    MAX_EXTRACT_IMAGES = 1_000
+    MAX_EXTRACT_IMAGE_COMPRESSED_BYTES = 50 * 1024 * 1024
+    MAX_EXTRACT_IMAGE_PIXELS = 64_000_000
+    MAX_EXTRACT_TOTAL_COMPRESSED_BYTES = 250 * 1024 * 1024
+    MAX_EXTRACT_TOTAL_PIXELS = 512_000_000
+    MAX_OUTPUT_PREFIX_LENGTH = 80
+    IMAGE_OUTPUT_FORMATS = {
+        "png": ("png", "PNG"),
+        "jpg": ("jpg", "JPEG"),
+        "jpeg": ("jpg", "JPEG"),
+    }
+    SAFE_PREFIX_RE = re.compile(r"^[A-Za-z0-9_. -]+$")
+
     _LAYOUT_MAP = {
         "title_only": 5,
         "content": 1,
@@ -42,6 +57,218 @@ class PPTXOperations:
 
     def __init__(self, host: Any):
         self.host = host
+
+    @classmethod
+    def normalize_image_format(cls, fmt: str) -> Any:
+        fmt_key = str(fmt or "").strip().lower().lstrip(".")
+        normalized = cls.IMAGE_OUTPUT_FORMATS.get(fmt_key)
+        if normalized:
+            return normalized, None
+        return None, {
+            "success": False,
+            "error": "Unsupported image format. Use png or jpg.",
+            "error_code": "unsupported_image_format",
+            "allowed_formats": ["png", "jpg"],
+        }
+
+    @classmethod
+    def validate_output_prefix(cls, prefix: str) -> Any:
+        prefix_text = str(prefix or "").strip()
+        preflight = {
+            "operation": "pptx_extract_images",
+            "prefix": prefix,
+            "max_prefix_length": cls.MAX_OUTPUT_PREFIX_LENGTH,
+        }
+        if not prefix_text:
+            preflight["status"] = "fail"
+            preflight["reason"] = "prefix must not be empty"
+        elif len(prefix_text) > cls.MAX_OUTPUT_PREFIX_LENGTH:
+            preflight["status"] = "fail"
+            preflight["reason"] = (
+                f"prefix is {len(prefix_text)} characters; max is {cls.MAX_OUTPUT_PREFIX_LENGTH}"
+            )
+        elif (
+            Path(prefix_text).is_absolute()
+            or "/" in prefix_text
+            or "\\" in prefix_text
+            or ":" in prefix_text
+            or prefix_text in {".", ".."}
+            or any(part == ".." for part in Path(prefix_text).parts)
+        ):
+            preflight["status"] = "fail"
+            preflight["reason"] = "prefix must be a filename prefix, not a path"
+        elif not cls.SAFE_PREFIX_RE.match(prefix_text):
+            preflight["status"] = "fail"
+            preflight["reason"] = (
+                "prefix may contain only letters, numbers, spaces, dots, hyphens, and underscores"
+            )
+        else:
+            preflight["status"] = "pass"
+            return prefix_text, preflight, None
+
+        return None, preflight, {
+            "success": False,
+            "error": f"Unsafe PPTX image output prefix: {preflight['reason']}",
+            "error_code": "unsafe_output_prefix",
+            "preflight": preflight,
+        }
+
+    @staticmethod
+    def prepare_output_dir(output_dir: str) -> Path:
+        output_root = Path(output_dir).expanduser()
+        output_root.mkdir(parents=True, exist_ok=True)
+        return output_root.resolve()
+
+    @staticmethod
+    def safe_child_path(output_root: Path, filename: str) -> Path:
+        candidate = (output_root / filename).resolve()
+        try:
+            common = os.path.commonpath([str(output_root), str(candidate)])
+        except ValueError:
+            common = ""
+        if common != str(output_root):
+            raise ValueError("Refusing to write outside output_dir")
+        return candidate
+
+    @classmethod
+    def image_extract_resource_limits(cls) -> Dict[str, int]:
+        return {
+            "max_images": cls.MAX_EXTRACT_IMAGES,
+            "max_compressed_image_bytes": cls.MAX_EXTRACT_IMAGE_COMPRESSED_BYTES,
+            "max_decoded_image_pixels": cls.MAX_EXTRACT_IMAGE_PIXELS,
+            "max_total_compressed_image_bytes": cls.MAX_EXTRACT_TOTAL_COMPRESSED_BYTES,
+            "max_total_decoded_image_pixels": cls.MAX_EXTRACT_TOTAL_PIXELS,
+        }
+
+    @classmethod
+    def load_bounded_image(
+        cls,
+        PILImage: Any,
+        image_bytes: bytes,
+        *,
+        total_compressed_bytes: int = 0,
+        total_decoded_pixels: int = 0,
+    ) -> Any:
+        compressed_size = len(image_bytes)
+        compressed_after = total_compressed_bytes + compressed_size
+        if compressed_after > cls.MAX_EXTRACT_TOTAL_COMPRESSED_BYTES:
+            return None, None, {
+                "skipped": True,
+                "stop_extraction": True,
+                "error": (
+                    f"Embedded images would total {compressed_after} compressed bytes, exceeding "
+                    f"the safe limit {cls.MAX_EXTRACT_TOTAL_COMPRESSED_BYTES}"
+                ),
+                "error_code": "aggregate_image_compressed_bytes_limit_exceeded",
+                "compressed_size_bytes": compressed_size,
+                "total_compressed_size_bytes": total_compressed_bytes,
+                "would_total_compressed_size_bytes": compressed_after,
+                "max_total_compressed_size_bytes": cls.MAX_EXTRACT_TOTAL_COMPRESSED_BYTES,
+            }
+        if compressed_size > cls.MAX_EXTRACT_IMAGE_COMPRESSED_BYTES:
+            return None, None, {
+                "skipped": True,
+                "error": (
+                    f"Embedded image is {compressed_size} compressed bytes, exceeding "
+                    f"the safe limit {cls.MAX_EXTRACT_IMAGE_COMPRESSED_BYTES}"
+                ),
+                "error_code": "image_compressed_bytes_limit_exceeded",
+                "compressed_size_bytes": compressed_size,
+                "max_compressed_size_bytes": cls.MAX_EXTRACT_IMAGE_COMPRESSED_BYTES,
+                "total_compressed_size_bytes": compressed_after,
+            }
+
+        img = None
+        try:
+            stream = io.BytesIO(image_bytes)
+            bomb_warning = getattr(PILImage, "DecompressionBombWarning", None)
+            with warnings.catch_warnings():
+                if bomb_warning is not None:
+                    warnings.simplefilter("error", bomb_warning)
+                img = PILImage.open(stream)
+                width, height = [int(value) for value in img.size]
+                pixels = width * height
+                pixels_after = total_decoded_pixels + pixels
+                if pixels_after > cls.MAX_EXTRACT_TOTAL_PIXELS:
+                    img.close()
+                    return None, None, {
+                        "skipped": True,
+                        "stop_extraction": True,
+                        "error": (
+                            f"Embedded images would decode to {pixels_after} pixels, exceeding "
+                            f"the safe limit {cls.MAX_EXTRACT_TOTAL_PIXELS}"
+                        ),
+                        "error_code": "aggregate_image_pixel_limit_exceeded",
+                        "width": width,
+                        "height": height,
+                        "pixels": pixels,
+                        "total_decoded_image_pixels": total_decoded_pixels,
+                        "would_total_decoded_image_pixels": pixels_after,
+                        "max_total_decoded_image_pixels": cls.MAX_EXTRACT_TOTAL_PIXELS,
+                        "compressed_size_bytes": compressed_size,
+                        "total_compressed_size_bytes": compressed_after,
+                    }
+                if pixels > cls.MAX_EXTRACT_IMAGE_PIXELS:
+                    img.close()
+                    return None, None, {
+                        "skipped": True,
+                        "error": (
+                            f"Embedded image decodes to {pixels} pixels, exceeding "
+                            f"the safe limit {cls.MAX_EXTRACT_IMAGE_PIXELS}"
+                        ),
+                        "error_code": "image_pixel_limit_exceeded",
+                        "width": width,
+                        "height": height,
+                        "pixels": pixels,
+                        "max_decoded_image_pixels": cls.MAX_EXTRACT_IMAGE_PIXELS,
+                        "compressed_size_bytes": compressed_size,
+                        "total_compressed_size_bytes": compressed_after,
+                        "total_decoded_image_pixels": pixels_after,
+                    }
+                img.load()
+            return img, {
+                "width": width,
+                "height": height,
+                "pixels": pixels,
+                "compressed_size_bytes": compressed_size,
+                "total_compressed_size_bytes": compressed_after,
+                "total_decoded_image_pixels": pixels_after,
+            }, None
+        except Exception as exc:
+            if img is not None:
+                img.close()
+            return None, None, {
+                "skipped": True,
+                "error": f"Could not safely decode embedded image: {exc}",
+                "error_code": "unsafe_image_decode",
+                "compressed_size_bytes": compressed_size,
+                "total_compressed_size_bytes": compressed_after,
+            }
+
+    @staticmethod
+    def save_bounded_image(
+        img: Any,
+        out_path: Path,
+        fmt_ext: str,
+        pillow_format: str,
+    ) -> None:
+        tmp_path = out_path.with_name(f".{out_path.name}.tmp")
+        try:
+            if fmt_ext == "jpg":
+                converted = img.convert("RGB")
+                try:
+                    converted.save(str(tmp_path), "JPEG", quality=90)
+                finally:
+                    converted.close()
+            else:
+                img.save(str(tmp_path), pillow_format)
+            os.replace(str(tmp_path), str(out_path))
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     def create_presentation(
         self, output_path: str, title: str = "", subtitle: str = ""
@@ -401,10 +628,22 @@ class PPTXOperations:
         try:
             from PIL import Image as PILImage
 
-            os.makedirs(output_dir, exist_ok=True)
+            fmt_info, fmt_error = self.normalize_image_format(fmt)
+            if fmt_error:
+                return fmt_error
+            fmt_ext, pillow_format = fmt_info
+            safe_prefix, prefix_preflight, prefix_error = self.validate_output_prefix(prefix)
+            if prefix_error:
+                return prefix_error
+            output_root = self.prepare_output_dir(output_dir)
             prs = Presentation(file_path)
             extracted = []
             index = 0
+            truncated = False
+            warnings = []
+            resource_limits = self.image_extract_resource_limits()
+            total_compressed_bytes = 0
+            total_decoded_pixels = 0
             if slide_index is not None:
                 if slide_index < 0 or slide_index >= len(prs.slides):
                     return {
@@ -419,46 +658,110 @@ class PPTXOperations:
                 for shape in slide.shapes:
                     if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
                         continue
+                    if index >= self.MAX_EXTRACT_IMAGES:
+                        truncated = True
+                        warning = f"Stopped after {self.MAX_EXTRACT_IMAGES} images"
+                        if warning not in warnings:
+                            warnings.append(warning)
+                        break
                     try:
                         image = shape.image
                         image_bytes = image.blob
-                        out_path = os.path.join(
-                            output_dir,
-                            f"{prefix}_{slide_number:02d}_{index:03d}.{fmt}",
+                        out_path = self.safe_child_path(
+                            output_root,
+                            f"{safe_prefix}_{slide_number:02d}_{index:03d}.{fmt_ext}",
                         )
-                        converted = PILImage.open(io.BytesIO(image_bytes))
-                        if fmt.lower() == "jpg":
-                            converted = converted.convert("RGB")
-                            converted.save(out_path, "JPEG", quality=90)
+                        img, image_meta, skip_entry = self.load_bounded_image(
+                            PILImage,
+                            image_bytes,
+                            total_compressed_bytes=total_compressed_bytes,
+                            total_decoded_pixels=total_decoded_pixels,
+                        )
+                        stop_after_current = False
+                        if skip_entry:
+                            if (
+                                skip_entry.get("error_code")
+                                != "aggregate_image_compressed_bytes_limit_exceeded"
+                            ):
+                                total_compressed_bytes = skip_entry.get(
+                                    "total_compressed_size_bytes",
+                                    total_compressed_bytes,
+                                )
+                            if (
+                                skip_entry.get("error_code")
+                                != "aggregate_image_pixel_limit_exceeded"
+                            ):
+                                total_decoded_pixels = skip_entry.get(
+                                    "total_decoded_image_pixels",
+                                    total_decoded_pixels,
+                                )
+                            stop_after_current = bool(skip_entry.get("stop_extraction"))
+                            if stop_after_current:
+                                truncated = True
+                                warning = str(skip_entry.get("error") or "Stopped at image extraction budget")
+                                if warning not in warnings:
+                                    warnings.append(warning)
+                            skip_entry.update(
+                                {
+                                    "index": index,
+                                    "slide": slide_number,
+                                    "shape_name": shape.name,
+                                }
+                            )
+                            extracted.append(skip_entry)
                         else:
-                            converted.save(out_path, fmt.upper())
-                        extracted.append(
-                            {
-                                "index": index,
-                                "slide": slide_number,
-                                "file": out_path,
-                                "format": fmt,
-                                "width": converted.width,
-                                "height": converted.height,
-                                "size_bytes": os.path.getsize(out_path),
-                                "shape_name": shape.name,
-                            }
-                        )
+                            total_compressed_bytes = image_meta["total_compressed_size_bytes"]
+                            total_decoded_pixels = image_meta["total_decoded_image_pixels"]
+                            try:
+                                self.save_bounded_image(img, out_path, fmt_ext, pillow_format)
+                            finally:
+                                img.close()
+                            extracted.append(
+                                {
+                                    "index": index,
+                                    "slide": slide_number,
+                                    "file": str(out_path),
+                                    "format": fmt_ext,
+                                    "width": image_meta["width"],
+                                    "height": image_meta["height"],
+                                    "pixels": image_meta["pixels"],
+                                    "compressed_size_bytes": image_meta["compressed_size_bytes"],
+                                    "size_bytes": os.path.getsize(str(out_path)),
+                                    "shape_name": shape.name,
+                                }
+                            )
+                        if stop_after_current:
+                            index += 1
+                            break
                     except Exception as img_err:
                         extracted.append(
                             {
                                 "index": index,
                                 "slide": slide_number,
+                                "skipped": True,
                                 "error": str(img_err),
+                                "error_code": "image_extract_failed",
                             }
                         )
                     index += 1
+                if truncated:
+                    break
             return {
                 "success": True,
                 "file": file_path,
-                "output_dir": output_dir,
+                "output_dir": str(output_root),
+                "prefix": safe_prefix,
                 "images_extracted": len([item for item in extracted if "file" in item]),
+                "images_skipped": len([item for item in extracted if item.get("skipped")]),
                 "images": extracted,
+                "truncated": truncated,
+                "warnings": warnings,
+                "resource_limits": resource_limits,
+                "resource_usage": {
+                    "compressed_image_bytes": total_compressed_bytes,
+                    "decoded_image_pixels": total_decoded_pixels,
+                },
+                "preflight": prefix_preflight,
             }
         except Exception as exc:
             return {"success": False, "error": str(exc)}

@@ -261,7 +261,8 @@ class OnlyOfficeResearchPackTests(unittest.TestCase):
         self.assertTrue(ok["success"])
         self.assertTrue(ok["summary"]["require_formula_safe"])
 
-        # Build unsafe workbook (unsupported IF)
+        # Build unsafe workbook (unsupported IF). Bulk write neutralizes
+        # formula-like text by design, so use the explicit formula entrypoint.
         unsafe = os.path.join(self.tmp.name, "unsafe.xlsx")
         self.client.write_spreadsheet(
             output_path=unsafe,
@@ -270,7 +271,7 @@ class OnlyOfficeResearchPackTests(unittest.TestCase):
                 [
                     1,
                     1,
-                    "=IF(1=1,4,2)",
+                    "",
                     3,
                     4,
                     5,
@@ -284,6 +285,11 @@ class OnlyOfficeResearchPackTests(unittest.TestCase):
             sheet_name="Sheet0",
             overwrite_workbook=True,
             coerce_rows=True,
+        )
+        self.assertTrue(
+            self.client.add_formula(unsafe, "C2", "=IF(1=1,4,2)", sheet_name="Sheet0")[
+                "success"
+            ]
         )
         blocked = self.client.research_analysis_pack(
             file_path=unsafe,

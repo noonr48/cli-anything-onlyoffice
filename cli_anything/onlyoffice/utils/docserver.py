@@ -7,23 +7,28 @@ Provides full programmatic control with advanced formatting:
 - Spreadsheets (.xlsx) - Create, read, edit, formulas, styling
 """
 
+import ast
+import math
+
 import requests
 import json
 import os
 import shutil
+import stat
 import tempfile
 import fcntl
 import re
 import hashlib
 import threading
+import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from zipfile import ZipFile, ZIP_DEFLATED
 
-from cli_anything.onlyoffice.utils.doc_ops import DocumentOperations
+from cli_anything.onlyoffice.utils.doc_ops import DocumentOperations, serialize_ooxml_element
 from cli_anything.onlyoffice.utils.pdf_ops import PDFOperations
 from cli_anything.onlyoffice.utils.pptx_ops import PPTXOperations
 from cli_anything.onlyoffice.utils.rdf_ops import RDFOperations
@@ -104,10 +109,18 @@ class DocumentServerClient:
         self.server_url = server_url.rstrip("/")
         self.secret = secret
         self.headers = {"Authorization": f"Bearer {secret}"}
-        self.backup_dir = Path(
-            os.environ.get("ONLYOFFICE_BACKUP_DIR", "/tmp/sloane-onlyoffice-backups")
+        self.backup_dir = self._ensure_private_dir(
+            Path(
+                os.environ.get(
+                    "ONLYOFFICE_BACKUP_DIR", "~/.cli-anything/backups"
+                )
+            ),
+            "backup",
         )
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self.lock_dir = self._ensure_private_dir(
+            Path(os.environ.get("ONLYOFFICE_LOCK_DIR", "~/.cli-anything/locks")),
+            "lock",
+        )
         self._lock_timeout_seconds = int(
             os.environ.get("ONLYOFFICE_LOCK_TIMEOUT", "15")
         )
@@ -122,11 +135,59 @@ class DocumentServerClient:
             "AVG",
             "MIN",
             "MAX",
-            "ABS",
-            "ROUND",
-            "COUNT",
-            "COUNTA",
         }
+
+    @staticmethod
+    def _ensure_private_dir(path: Path, label: str) -> Path:
+        """Create and verify a private state directory."""
+        target = Path(path).expanduser()
+        if target.is_symlink():
+            raise RuntimeError(
+                f"OnlyOffice {label} directory must not be a symlink: {target}"
+            )
+        target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target_lstat = target.lstat()
+        if stat.S_ISLNK(target_lstat.st_mode):
+            raise RuntimeError(
+                f"OnlyOffice {label} directory must not be a symlink: {target}"
+            )
+        if not stat.S_ISDIR(target_lstat.st_mode):
+            raise RuntimeError(f"OnlyOffice {label} path is not a directory: {target}")
+        os.chmod(target, 0o700)
+        target_stat = target.stat()
+        if target_stat.st_uid != os.getuid():
+            raise RuntimeError(f"OnlyOffice {label} directory is not owned by this user: {target}")
+        mode = target_stat.st_mode & 0o777
+        if mode != 0o700:
+            raise RuntimeError(
+                f"OnlyOffice {label} directory must have permissions 0700; "
+                f"found {mode:04o}: {target}"
+            )
+        return target
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _nonexistent_temp_path(
+        *,
+        directory: str,
+        prefix: str,
+        suffix: str,
+    ) -> str:
+        """Reserve a unique temp name, then remove it so converters see no file."""
+        fd, tmp_path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
+        os.close(fd)
+        os.unlink(tmp_path)
+        return tmp_path
 
     def _file_key(self, file_path: str) -> str:
         abs_path = str(Path(file_path).resolve())
@@ -134,7 +195,8 @@ class DocumentServerClient:
 
     def _lock_path(self, file_path: str) -> Path:
         abs_path = str(Path(file_path).resolve())
-        return self.backup_dir / f"{self._file_key(abs_path)}.lock"
+        digest = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()
+        return self.lock_dir / f"{digest}.lock"
 
     @contextmanager
     def _file_lock(self, file_path: str):
@@ -153,8 +215,10 @@ class DocumentServerClient:
             tlock = _thread_lock_map[abs_path]
 
         with tlock:  # serialise threads within this process
-            lock_path = str(self._lock_path(abs_path))
-            lock_file = open(lock_path, "w")
+            lock_path = self._lock_path(abs_path)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            os.fchmod(fd, 0o600)
+            lock_file = os.fdopen(fd, "a+")
             deadline = time.monotonic() + self._lock_timeout_seconds
             acquired = False
             try:
@@ -178,10 +242,15 @@ class DocumentServerClient:
                     except Exception:
                         pass
                 lock_file.close()
-                try:
-                    os.unlink(lock_path)
-                except OSError:
-                    pass
+
+    @contextmanager
+    def _file_locks(self, *file_paths: str):
+        """Acquire multiple path locks in deterministic order to avoid races/deadlocks."""
+        paths = sorted({str(Path(path).resolve()) for path in file_paths if path})
+        with ExitStack() as stack:
+            for path in paths:
+                stack.enter_context(self._file_lock(path))
+            yield
 
     @staticmethod
     def _current_orientation(section) -> str:
@@ -216,7 +285,10 @@ class DocumentServerClient:
             with ZipFile(tmp_path, "w", compression=ZIP_DEFLATED) as zout:
                 for name, data in files.items():
                     zout.writestr(name, data)
+            with open(tmp_path, "rb") as handle:
+                os.fsync(handle.fileno())
             os.replace(tmp_path, str(target))
+            DocumentServerClient._fsync_directory(target.parent)
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -448,7 +520,7 @@ class DocumentServerClient:
                 kept.append(child)
             if changed:
                 root[:] = kept
-                files[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                files[name] = serialize_ooxml_element(root)
 
     @staticmethod
     def _strip_docx_content_types(files: Dict[str, bytes], predicate) -> None:
@@ -467,7 +539,7 @@ class DocumentServerClient:
             kept.append(child)
         if changed:
             root[:] = kept
-            files[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            files[name] = serialize_ooxml_element(root)
 
     def _get_sheet(self, wb, sheet_name: str):
         """Get a worksheet with a friendly error if not found."""
@@ -486,19 +558,46 @@ class DocumentServerClient:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup_name = f"{src.name}.{self._file_key(file_path)}.{stamp}.bak{src.suffix}"
         dst = self.backup_dir / backup_name
-        shutil.copy2(src, dst)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{backup_name}.", suffix=".tmp", dir=str(self.backup_dir)
+        )
+        try:
+            with os.fdopen(fd, "wb") as out_handle:
+                with open(src, "rb") as in_handle:
+                    shutil.copyfileobj(in_handle, out_handle)
+                out_handle.flush()
+                os.fsync(out_handle.fileno())
+            shutil.copystat(src, tmp_path, follow_symlinks=True)
+            with open(tmp_path, "rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, str(dst))
+            self._fsync_directory(self.backup_dir)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         return str(dst)
 
     def _safe_save(self, wb_or_doc, file_path: str):
         """Atomic save to reduce risk of partial writes."""
         target = Path(file_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
             prefix=f".{target.name}.", dir=str(target.parent)
         )
         os.close(fd)
         try:
             wb_or_doc.save(tmp_path)
+            if target.suffix.lower() == ".docx" and hasattr(self, "_doc_ops"):
+                prefix_report = self._doc_ops._docx_ooxml_prefix_report(tmp_path)
+                if prefix_report.get("submission_blocking"):
+                    raise RuntimeError(
+                        "Refusing to save DOCX with non-canonical WordprocessingML "
+                        "prefixes; repair/regenerate before claiming rendered readiness."
+                    )
+            with open(tmp_path, "rb") as handle:
+                os.fsync(handle.fileno())
             os.replace(tmp_path, str(target))
+            self._fsync_directory(target.parent)
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -531,17 +630,43 @@ class DocumentServerClient:
 
         return True, None, normalized_rows
 
+    def _backup_name_matches_file(self, backup_path: Path, file_path: str) -> bool:
+        target = Path(file_path)
+        suffix = re.escape(target.suffix)
+        target_name = re.escape(target.name)
+        key = re.escape(self._file_key(file_path))
+        patterns = [
+            rf"^{target_name}\.{key}\.\d{{8}}T\d{{12}}Z\.bak{suffix}$",
+            rf"^{target_name}\.\d{{8}}T\d{{12}}Z\.bak{suffix}$",
+        ]
+        return any(re.fullmatch(pattern, backup_path.name) for pattern in patterns)
+
+    def _resolve_backup_path_for_restore(self, backup: str, file_path: str) -> Path:
+        backup_root = self.backup_dir.resolve(strict=True)
+        chosen = Path(backup).expanduser()
+        if not chosen.is_absolute():
+            chosen = backup_root / backup
+        if chosen.is_symlink():
+            raise ValueError(f"Backup path must not be a symlink: {backup}")
+        chosen_resolved = chosen.resolve(strict=True)
+        if os.path.commonpath([str(backup_root), str(chosen_resolved)]) != str(backup_root):
+            raise ValueError("Backup must be located under the configured backup_dir")
+        if not chosen_resolved.is_file():
+            raise ValueError(f"Backup is not a file: {backup}")
+        if not self._backup_name_matches_file(chosen_resolved, file_path):
+            raise ValueError(
+                "Backup name/key does not match the requested restore target"
+            )
+        return chosen_resolved
+
     def _backup_candidates(self, file_path: str):
         p = Path(file_path)
-        key = self._file_key(file_path)
         suffix = p.suffix
         candidates = []
         for bf in self.backup_dir.glob(f"{p.name}*.bak{suffix}"):
-            name = bf.name
-            if f".{key}." in name or re.match(
-                rf"^{re.escape(p.name)}\.\d{{8}}T\d{{12}}Z\.bak{re.escape(suffix)}$",
-                name,
-            ):
+            if bf.is_symlink() or not bf.is_file():
+                continue
+            if self._backup_name_matches_file(bf, file_path):
                 candidates.append(bf)
         return sorted(candidates, key=lambda x: x.stat().st_mtime, reverse=True)
 
@@ -632,11 +757,12 @@ class DocumentServerClient:
         try:
             target = Path(file_path)
             if backup:
-                chosen = Path(backup)
-                if not chosen.is_absolute():
-                    chosen = self.backup_dir / backup
-                if not chosen.exists():
+                try:
+                    chosen = self._resolve_backup_path_for_restore(backup, file_path)
+                except FileNotFoundError:
                     return {"success": False, "error": f"Backup not found: {backup}"}
+                except ValueError as exc:
+                    return {"success": False, "error": str(exc)}
             else:
                 backups = self._backup_candidates(file_path)
                 if not backups:
@@ -652,6 +778,7 @@ class DocumentServerClient:
                 }
 
             with self._file_lock(file_path):
+                target.parent.mkdir(parents=True, exist_ok=True)
                 pre_restore_backup = (
                     self._snapshot_backup(file_path) if target.exists() else ""
                 )
@@ -661,7 +788,10 @@ class DocumentServerClient:
                 os.close(fd)
                 try:
                     shutil.copy2(chosen, tmp_path)
+                    with open(tmp_path, "rb") as handle:
+                        os.fsync(handle.fileno())
                     os.replace(tmp_path, str(target))
+                    self._fsync_directory(target.parent)
                 finally:
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
@@ -980,6 +1110,61 @@ class DocumentServerClient:
                     return True
         return False
 
+    def _safe_eval_arithmetic(self, expr: str):
+        """Evaluate a small arithmetic expression after formula substitutions."""
+        if not isinstance(expr, str) or len(expr) > 1000:
+            return None
+        try:
+            tree = ast.parse(expr, mode="eval")
+        except SyntaxError:
+            return None
+
+        max_nodes = 128
+        seen = 0
+
+        def eval_node(node):
+            nonlocal seen
+            seen += 1
+            if seen > max_nodes:
+                raise ValueError("expression too complex")
+
+            if isinstance(node, ast.Expression):
+                return eval_node(node.body)
+            if isinstance(node, ast.Constant):
+                if not isinstance(node.value, (int, float)):
+                    raise ValueError("non-numeric literal")
+                value = float(node.value)
+                if not math.isfinite(value) or abs(value) > 1e12:
+                    raise ValueError("numeric literal out of bounds")
+                return value
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+                value = eval_node(node.operand)
+                return value if isinstance(node.op, ast.UAdd) else -value
+            if isinstance(node, ast.BinOp) and isinstance(
+                node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)
+            ):
+                left = eval_node(node.left)
+                right = eval_node(node.right)
+                if isinstance(node.op, ast.Add):
+                    value = left + right
+                elif isinstance(node.op, ast.Sub):
+                    value = left - right
+                elif isinstance(node.op, ast.Mult):
+                    value = left * right
+                else:
+                    if right == 0:
+                        raise ValueError("division by zero")
+                    value = left / right
+                if not math.isfinite(value) or abs(value) > 1e12:
+                    raise ValueError("arithmetic result out of bounds")
+                return value
+            raise ValueError("unsupported expression")
+
+        try:
+            return float(eval_node(tree))
+        except Exception:
+            return None
+
     def _resolve_formula_value(
         self, ws, expr: str, row_hint: int = None, _depth: int = 0
     ):
@@ -1050,14 +1235,11 @@ class DocumentServerClient:
         cell_pat = re.compile(r"\b([A-Z]+\d+)\b")
         expr = cell_pat.sub(lambda m: str(cell_numeric(m.group(1)) or 0), expr)
 
-        # Safety guard: arithmetic-only after substitutions
+        # Safety guard: arithmetic-only after substitutions.
         if not re.fullmatch(r"[0-9\s\+\-\*/\(\)\.]+", expr):
             return None
 
-        try:
-            return float(eval(expr, {"__builtins__": {}}, {}))
-        except Exception:
-            return None
+        return self._safe_eval_arithmetic(expr)
 
     def _extract_formula_functions(self, formula: str):
         if not formula:
@@ -1089,8 +1271,20 @@ class DocumentServerClient:
     ) -> Dict[str, Any]:
         return self._xlsx_ops.audit_spreadsheet_formulas(file_path, sheet_name, max_examples)
 
-    def get_formatting_info(self, file_path: str) -> Dict[str, Any]:
-        return self._doc_ops.get_formatting_info(file_path)
+    def get_formatting_info(
+        self,
+        file_path: str,
+        *,
+        start: int = 0,
+        limit: Optional[int] = 10,
+        all_paragraphs: bool = False,
+    ) -> Dict[str, Any]:
+        return self._doc_ops.get_formatting_info(
+            file_path,
+            start=start,
+            limit=limit,
+            all_paragraphs=all_paragraphs,
+        )
 
     def get_document_info(self, file_path: str) -> Dict[str, Any]:
         """Get file information for any supported format"""
@@ -1534,12 +1728,33 @@ class DocumentServerClient:
         expected_page_size: str = None,
         expected_font_name: str = None,
         expected_font_size: float = None,
+        rendered_layout: bool = False,
+        render_profile: str = "auto",
     ) -> Dict[str, Any]:
         return self._doc_ops.document_preflight(
             file_path,
             expected_page_size=expected_page_size,
             expected_font_name=expected_font_name,
             expected_font_size=expected_font_size,
+            rendered_layout=rendered_layout,
+            render_profile=render_profile,
+        )
+
+    def rendered_layout_audit(
+        self,
+        file_path: str,
+        *,
+        pdf_path: Optional[str] = None,
+        tolerance_points: float = 6.0,
+        profile: str = "auto",
+        trusted_pdf: bool = False,
+    ) -> Dict[str, Any]:
+        return self._doc_ops.rendered_layout_audit(
+            file_path,
+            pdf_path=pdf_path,
+            tolerance_points=tolerance_points,
+            profile=profile,
+            trusted_pdf=trusted_pdf,
         )
 
     def sanitize_document(
@@ -1551,6 +1766,7 @@ class DocumentServerClient:
         clear_metadata: bool = False,
         remove_custom_xml: bool = False,
         set_remove_personal_information: bool = False,
+        canonicalize_ooxml: bool = False,
         author: Optional[str] = None,
         title: Optional[str] = None,
         subject: Optional[str] = None,
@@ -1564,6 +1780,7 @@ class DocumentServerClient:
             clear_metadata=clear_metadata,
             remove_custom_xml=remove_custom_xml,
             set_remove_personal_information=set_remove_personal_information,
+            canonicalize_ooxml=canonicalize_ooxml,
             author=author,
             title=title,
             subject=subject,
@@ -1957,9 +2174,126 @@ class DocumentServerClient:
         self, file_path: str, output_dir: str,
         slide_index: int = None, dpi: int = 150,
     ) -> Dict[str, Any]:
-        return self._pptx_ops.preview_slide(
-            file_path, output_dir, slide_index=slide_index, dpi=dpi
-        )
+        """Render presentation slides as PNG images via a non-existing temp PDF."""
+        try:
+            import fitz
+        except ImportError:
+            return {"success": False, "error": "PyMuPDF (fitz) not installed. Run: pip install PyMuPDF"}
+
+        pdf_path = None
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            pdf_path = self._nonexistent_temp_path(
+                directory=output_dir,
+                prefix=f".{Path(file_path).stem}_preview_",
+                suffix=".pdf",
+            )
+
+            pdf_result = self._office_to_pdf(file_path, output_path=pdf_path)
+            if not pdf_result.get("success"):
+                return pdf_result
+
+            total_slides = pdf_result.get("pages")
+            if total_slides is None:
+                pdf = fitz.open(pdf_path)
+                total_slides = len(pdf)
+                pdf.close()
+
+            if slide_index is not None and (slide_index < 0 or slide_index >= total_slides):
+                return {
+                    "success": False,
+                    "error": f"Slide {slide_index} out of range (0-{total_slides-1})",
+                }
+
+            render_result = self.pdf_page_to_image(
+                pdf_path,
+                output_dir,
+                pages=str(slide_index) if slide_index is not None else None,
+                dpi=dpi,
+                fmt="png",
+            )
+            if not render_result.get("success"):
+                return render_result
+
+            rendered = []
+            for image in render_result.get("images", []):
+                page_number = image.get("page")
+                if page_number is None:
+                    continue
+                suffix = Path(image["file"]).suffix or ".png"
+                slide_path = os.path.join(output_dir, f"slide_{page_number:03d}{suffix}")
+                if image["file"] != slide_path:
+                    os.replace(image["file"], slide_path)
+                rendered.append(
+                    {
+                        "slide": page_number,
+                        "file": slide_path,
+                        "width": image.get("width"),
+                        "height": image.get("height"),
+                        "dpi": image.get("dpi", dpi),
+                        "size_bytes": os.path.getsize(slide_path),
+                    }
+                )
+
+            return {
+                "success": True,
+                "file": file_path,
+                "output_dir": output_dir,
+                "total_slides": total_slides,
+                "slides_rendered": len(rendered),
+                "dpi": dpi,
+                "images": rendered,
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        finally:
+            if pdf_path:
+                try:
+                    os.unlink(pdf_path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _resolve_pdf_output_path(input_path: str, output_path: str = None) -> Path:
+        input_target = Path(input_path).expanduser().resolve()
+        if output_path is None:
+            target = input_target.with_suffix(".pdf")
+        else:
+            target = Path(output_path).expanduser()
+            if target.suffix == "":
+                target = target.with_suffix(".pdf")
+            target = target.resolve()
+
+        if target.suffix.lower() != ".pdf":
+            raise ValueError("Output path must be a PDF file ending in .pdf")
+
+        same_file = target == input_target
+        if not same_file and target.exists():
+            try:
+                same_file = os.path.samefile(str(input_target), str(target))
+            except OSError:
+                same_file = False
+        if same_file:
+            raise ValueError("Output path must not be the same as input file")
+
+        return target
+
+    @staticmethod
+    def _x2t_pdf_task_xml(container_input: str, container_pdf: str) -> bytes:
+        root = ET.Element("TaskQueueDataConvert")
+        values = {
+            "m_sFileFrom": container_input,
+            "m_sFileTo": container_pdf,
+            "m_nFormatTo": "513",
+            "m_sFontDir": "/usr/share/fonts",
+            "m_sThemeDir": (
+                "/var/www/onlyoffice/documentserver/server/"
+                "FileConverter/bin/empty/themes"
+            ),
+        }
+        for tag, value in values.items():
+            ET.SubElement(root, tag).text = value
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     def _office_to_pdf(
         self, file_path: str, output_path: str = None,
@@ -1968,20 +2302,24 @@ class DocumentServerClient:
         container_input = None
         container_pdf = None
         container_xml = None
+        local_xml = None
+        temp_pdf = None
         try:
-            import subprocess
             import uuid
 
-            abs_path = str(Path(file_path).resolve())
+            abs_path = str(Path(file_path).expanduser().resolve())
             if not os.path.exists(abs_path):
                 return {"success": False, "error": f"File not found: {file_path}"}
 
-            if output_path is None:
-                output_path = str(Path(abs_path).with_suffix(".pdf"))
-            else:
-                output_path = str(Path(output_path).resolve())
+            output_target = self._resolve_pdf_output_path(abs_path, output_path)
+            output_target.parent.mkdir(parents=True, exist_ok=True)
 
-            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            fd, temp_pdf = tempfile.mkstemp(
+                prefix=f".{output_target.name}.",
+                suffix=".tmp.pdf",
+                dir=str(output_target.parent),
+            )
+            os.close(fd)
 
             input_suffix = Path(abs_path).suffix or ".bin"
             tmp_id = uuid.uuid4().hex[:8]
@@ -1994,17 +2332,18 @@ class DocumentServerClient:
                 check=True, capture_output=True, timeout=30,
             )
 
-            x2t_xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<TaskQueueDataConvert>
-  <m_sFileFrom>{container_input}</m_sFileFrom>
-  <m_sFileTo>{container_pdf}</m_sFileTo>
-  <m_nFormatTo>513</m_nFormatTo>
-  <m_sFontDir>/usr/share/fonts</m_sFontDir>
-  <m_sThemeDir>/var/www/onlyoffice/documentserver/server/FileConverter/bin/empty/themes</m_sThemeDir>
-</TaskQueueDataConvert>"""
+            xml_payload = self._x2t_pdf_task_xml(container_input, container_pdf)
+            fd, local_xml = tempfile.mkstemp(
+                prefix=f".{output_target.name}.x2t.",
+                suffix=".xml",
+                dir=str(output_target.parent),
+            )
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(xml_payload)
+                handle.flush()
+                os.fsync(handle.fileno())
             subprocess.run(
-                ["docker", "exec", "-i", "onlyoffice-documentserver", "bash", "-c",
-                 f"cat > {container_xml} << 'XMLEOF'\n{x2t_xml}\nXMLEOF"],
+                ["docker", "cp", local_xml, f"onlyoffice-documentserver:{container_xml}"],
                 check=True, capture_output=True, timeout=15,
             )
 
@@ -2022,18 +2361,34 @@ class DocumentServerClient:
                 }
 
             subprocess.run(
-                ["docker", "cp", f"onlyoffice-documentserver:{container_pdf}", output_path],
+                ["docker", "cp", f"onlyoffice-documentserver:{container_pdf}", temp_pdf],
                 check=True, capture_output=True, timeout=30,
             )
 
-            if not os.path.exists(output_path):
+            if not os.path.exists(temp_pdf):
                 return {"success": False, "error": "Conversion produced no output file"}
 
-            file_size = os.path.getsize(output_path)
+            staged_size = os.path.getsize(temp_pdf)
+            if staged_size <= 0:
+                return {"success": False, "error": "Conversion produced empty output file"}
+            with open(temp_pdf, "rb") as handle:
+                if handle.read(5) != b"%PDF-":
+                    return {"success": False, "error": "Conversion output is not a PDF"}
+                os.fsync(handle.fileno())
+
+            backup = ""
+            with self._file_lock(str(output_target)):
+                if output_target.exists():
+                    backup = self._snapshot_backup(str(output_target))
+                os.replace(temp_pdf, str(output_target))
+                temp_pdf = None
+                self._fsync_directory(output_target.parent)
+
+            file_size = os.path.getsize(output_target)
             pages = None
             try:
                 import fitz
-                doc = fitz.open(output_path)
+                doc = fitz.open(output_target)
                 pages = len(doc)
                 doc.close()
             except Exception:
@@ -2042,9 +2397,10 @@ class DocumentServerClient:
             return {
                 "success": True,
                 "input_file": abs_path,
-                "output_file": output_path,
+                "output_file": str(output_target),
                 "file_size": file_size,
                 "pages": pages,
+                "backup": backup or None,
             }
         except subprocess.TimeoutExpired:
             return {"success": False, "error": "Conversion timed out (is onlyoffice-documentserver running?)"}
@@ -2062,11 +2418,27 @@ class DocumentServerClient:
                     )
                 except Exception:
                     pass
+            for temp_path in (local_xml, temp_pdf):
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
 
     def doc_to_pdf(
-        self, file_path: str, output_path: str = None,
+        self,
+        file_path: str,
+        output_path: str = None,
+        *,
+        layout_warnings: bool = False,
+        render_profile: str = "auto",
     ) -> Dict[str, Any]:
-        return self._doc_ops.doc_to_pdf(file_path, output_path=output_path)
+        return self._doc_ops.doc_to_pdf(
+            file_path,
+            output_path=output_path,
+            layout_warnings=layout_warnings,
+            render_profile=render_profile,
+        )
 
     def spreadsheet_to_pdf(
         self, file_path: str, output_path: str = None,
@@ -2086,12 +2458,11 @@ class DocumentServerClient:
         pdf_path = None
         try:
             os.makedirs(output_dir, exist_ok=True)
-            fd, pdf_path = tempfile.mkstemp(
+            pdf_path = self._nonexistent_temp_path(
+                directory=output_dir,
                 prefix=f".{Path(file_path).stem}_preview_",
                 suffix=".pdf",
-                dir=output_dir,
             )
-            os.close(fd)
 
             pdf_result = converter(file_path, output_path=pdf_path)
             if not pdf_result.get("success"):
@@ -2732,7 +3103,7 @@ class DocumentServerClient:
         return self._rdf_ops.get_graph(file_path)
 
     def rdf_create(
-        self, file_path: str, base_uri: str = None, format: str = "turtle",
+        self, file_path: str, base_uri: str = None, format: str = None,
         prefixes: Dict[str, str] = None,
     ) -> Dict[str, Any]:
         return self._rdf_ops.create(
@@ -2766,7 +3137,8 @@ class DocumentServerClient:
     def rdf_remove(
         self, file_path: str, subject: str = None, predicate: str = None,
         object_val: str = None, object_type: str = "uri", lang: str = None,
-        datatype: str = None, format: str = None,
+        datatype: str = None, format: str = None, remove_all: bool = False,
+        dry_run: bool = False,
     ) -> Dict[str, Any]:
         return self._rdf_ops.remove(
             file_path,
@@ -2777,6 +3149,8 @@ class DocumentServerClient:
             lang=lang,
             datatype=datatype,
             format=format,
+            remove_all=remove_all,
+            dry_run=dry_run,
         )
 
     def rdf_query(
@@ -2785,7 +3159,7 @@ class DocumentServerClient:
         return self._rdf_ops.query(file_path, sparql, limit=limit)
 
     def rdf_export(
-        self, file_path: str, output_path: str, output_format: str = "turtle"
+        self, file_path: str, output_path: str, output_format: str = None
     ) -> Dict[str, Any]:
         return self._rdf_ops.export(
             file_path,

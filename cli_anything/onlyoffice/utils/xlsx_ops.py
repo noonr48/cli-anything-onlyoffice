@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -30,6 +31,78 @@ class XLSXOperations:
     def __init__(self, host: Any):
         self.host = host
 
+    def _should_neutralize_spreadsheet_text(self, value: Any) -> bool:
+        """Return True for text that spreadsheet apps may treat as a formula."""
+        if not isinstance(value, str) or not value:
+            return False
+        if value.startswith("'"):
+            return False
+        if value[0] in {"\t", "\r"}:
+            return True
+        stripped = value.lstrip()
+        if not stripped:
+            return False
+        return stripped[0] in {"=", "+", "-", "@"}
+
+    def _neutralize_spreadsheet_text(self, value: str):
+        if self._should_neutralize_spreadsheet_text(value):
+            return "'" + value, True
+        return value, False
+
+    def _coerce_simple_number(self, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            if "." in value:
+                return float(value)
+            return int(value)
+        except (ValueError, TypeError):
+            return value
+
+    def _prepare_spreadsheet_value(self, value: Any, force_text: bool = False):
+        if force_text:
+            return self._neutralize_spreadsheet_text("" if value is None else str(value))
+        coerced = self._coerce_simple_number(value)
+        if isinstance(coerced, str):
+            return self._neutralize_spreadsheet_text(coerced)
+        return coerced, False
+
+    def _set_prepared_cell(self, cell, value: Any, force_text: bool = False) -> bool:
+        prepared, neutralized = self._prepare_spreadsheet_value(value, force_text=force_text)
+        cell.value = prepared
+        if force_text or neutralized:
+            cell.data_type = "s"
+        return neutralized
+
+    def _resolve_text_column_indices(
+        self, headers: List[Any], text_columns: List[str] = None
+    ):
+        """Resolve --text-columns entries by case-insensitive header or Excel letter."""
+        if not text_columns:
+            return set()
+        indices = set()
+        header_lookup = {}
+        for idx, header in enumerate(headers, 1):
+            key = str(header).strip().lower()
+            if key and key not in header_lookup:
+                header_lookup[key] = idx
+        for raw_column in text_columns:
+            spec = str(raw_column).strip()
+            if not spec:
+                continue
+            header_idx = header_lookup.get(spec.lower())
+            if header_idx is not None:
+                indices.add(header_idx)
+                continue
+            if re.fullmatch(r"[A-Za-z]{1,3}", spec):
+                try:
+                    idx = openpyxl.utils.column_index_from_string(spec.upper())
+                except ValueError:
+                    continue
+                if 1 <= idx <= len(headers):
+                    indices.add(idx)
+        return indices
+
 
     def audit_spreadsheet_formulas(
             self,
@@ -42,11 +115,14 @@ class XLSXOperations:
                 return {"success": False, "error": "openpyxl not installed"}
             try:
                 wb = load_workbook(file_path, data_only=False)
-                sheets = (
-                    [sheet_name]
-                    if sheet_name and sheet_name in wb.sheetnames
-                    else wb.sheetnames
-                )
+                if sheet_name and sheet_name not in wb.sheetnames:
+                    available = list(wb.sheetnames)
+                    wb.close()
+                    return {
+                        "success": False,
+                        "error": f"Sheet '{sheet_name}' not found. Available: {available}",
+                    }
+                sheets = [sheet_name] if sheet_name else list(wb.sheetnames)
 
                 has_vba = getattr(wb, "vba_archive", None) is not None
                 external_link_count = len(getattr(wb, "_external_links", []) or [])
@@ -200,34 +276,26 @@ class XLSXOperations:
                         ws = wb.active
                         ws.title = sheet_name
 
+                    neutralized_cells = 0
                     for col, header in enumerate(headers, 1):
-                        ws.cell(row=1, column=col, value=header)
-                    # Build set of column indices that should stay as text
-                    text_col_indices = set()
-                    if text_columns:
-                        tc_lower = {tc.strip().lower() for tc in text_columns}
-                        for ci, h in enumerate(headers):
-                            if h.strip().lower() in tc_lower:
-                                text_col_indices.add(ci + 1)  # 1-indexed
+                        if self._set_prepared_cell(
+                            ws.cell(row=1, column=col),
+                            "" if header is None else str(header),
+                            force_text=True,
+                        ):
+                            neutralized_cells += 1
+                    text_col_indices = self._resolve_text_column_indices(
+                        headers, text_columns
+                    )
 
                     for row_idx, row_data in enumerate(data, 2):
                         for col_idx, value in enumerate(row_data, 1):
-                            if col_idx in text_col_indices:
-                                # Text column: write as string, preserve leading zeros
-                                cell = ws.cell(row=row_idx, column=col_idx, value=str(value))
-                                cell.data_type = "s"
-                            elif isinstance(value, str) and value.startswith("="):
-                                ws.cell(row=row_idx, column=col_idx, value=value)
-                            else:
-                                try:
-                                    if isinstance(value, str):
-                                        if "." in value:
-                                            value = float(value)
-                                        else:
-                                            value = int(value)
-                                except (ValueError, TypeError):
-                                    pass
-                                ws.cell(row=row_idx, column=col_idx, value=value)
+                            if self._set_prepared_cell(
+                                ws.cell(row=row_idx, column=col_idx),
+                                value,
+                                force_text=col_idx in text_col_indices,
+                            ):
+                                neutralized_cells += 1
                     # Auto-fit column widths based on content (min 12, max 50 chars)
                     for col in ws.columns:
                         max_len = max((len(str(cell.value or "")) for cell in col), default=8)
@@ -244,6 +312,8 @@ class XLSXOperations:
                     "sheet": sheet_name,
                     "mode": "overwrite_workbook" if overwrite_workbook else "update_sheet",
                     "coerce_rows": bool(coerce_rows),
+                    "text_columns": sorted(text_col_indices),
+                    "neutralized_cells": neutralized_cells,
                     "backup": backup or None,
                 }
             except Exception as e:
@@ -1365,25 +1435,23 @@ class XLSXOperations:
                     # Find the next empty row
                     next_row = ws.max_row + 1
 
+                    neutralized_cells = 0
                     for col_idx, value in enumerate(row_data, 1):
-                        try:
-                            if (
-                                isinstance(value, str)
-                                and value.replace(".", "", 1).replace("-", "", 1).isdigit()
-                            ):
-                                value = float(value) if "." in value else int(value)
-                        except Exception:
-                            pass
-                        ws.cell(row=next_row, column=col_idx, value=value)
+                        if self._set_prepared_cell(
+                            ws.cell(row=next_row, column=col_idx), value
+                        ):
+                            neutralized_cells += 1
 
                     self.host._safe_save(wb, file_path)
+                    sheet_title = ws.title
                     wb.close()
                 return {
                     "success": True,
                     "file": file_path,
                     "row_added": next_row,
                     "columns": len(row_data),
-                    "sheet": ws.title,
+                    "sheet": sheet_title,
+                    "neutralized_cells": neutralized_cells,
                     "backup": backup or None,
                 }
             except Exception as e:
@@ -1398,11 +1466,14 @@ class XLSXOperations:
                 return {"success": False, "error": "openpyxl not installed"}
             try:
                 wb = load_workbook(file_path, read_only=True)
-                sheets_to_search = (
-                    [sheet_name]
-                    if sheet_name and sheet_name in wb.sheetnames
-                    else wb.sheetnames
-                )
+                if sheet_name and sheet_name not in wb.sheetnames:
+                    available = list(wb.sheetnames)
+                    wb.close()
+                    return {
+                        "success": False,
+                        "error": f"Sheet '{sheet_name}' not found. Available: {available}",
+                    }
+                sheets_to_search = [sheet_name] if sheet_name else list(wb.sheetnames)
 
                 results = []
                 for sn in sheets_to_search:
@@ -1949,27 +2020,20 @@ class XLSXOperations:
                     backup = self.host._snapshot_backup(file_path)
                     wb = load_workbook(file_path)
                     ws = self.host._get_sheet(wb, sheet_name) if sheet_name else wb.active
-                    if as_text:
-                        c = ws[cell_ref]
-                        c.value = str(value)
-                        c.data_type = "s"
-                    elif isinstance(value, str) and value.startswith("="):
-                        ws[cell_ref] = value
-                    else:
-                        try:
-                            if "." in str(value):
-                                value = float(value)
-                            else:
-                                value = int(value)
-                        except (ValueError, TypeError):
-                            pass
-                        ws[cell_ref] = value
+                    cell = ws[cell_ref]
+                    neutralized = self._set_prepared_cell(
+                        cell, value, force_text=as_text
+                    )
+                    stored_value = cell.value
                     self.host._safe_save(wb, file_path)
+                    sheet_title = ws.title
                     wb.close()
                 return {
                     "success": True, "file": file_path,
-                    "sheet": ws.title, "cell": cell_ref,
-                    "value": value, "backup": backup or None,
+                    "sheet": sheet_title, "cell": cell_ref,
+                    "value": stored_value,
+                    "neutralized": neutralized,
+                    "backup": backup or None,
                 }
             except Exception as e:
                 return {"success": False, "error": str(e)}
@@ -2381,7 +2445,7 @@ class XLSXOperations:
 
     def csv_import(
             self, file_path: str, csv_path: str, sheet_name: str = "Sheet1",
-            delimiter: str = ",",
+            delimiter: str = ",", text_columns: List[str] = None,
         ) -> Dict[str, Any]:
             """Import a CSV file into an xlsx spreadsheet."""
             if not OPENPYXL_AVAILABLE:
@@ -2401,23 +2465,30 @@ class XLSXOperations:
                     with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
                         reader = csv_module.reader(f, delimiter=delimiter)
                         row_count = 0
+                        neutralized_cells = 0
+                        text_col_indices = set()
                         for ri, row in enumerate(reader, 1):
+                            if ri == 1:
+                                text_col_indices = self._resolve_text_column_indices(
+                                    row, text_columns
+                                )
                             for ci, val in enumerate(row, 1):
-                                try:
-                                    if "." in val:
-                                        val = float(val)
-                                    else:
-                                        val = int(val)
-                                except (ValueError, TypeError):
-                                    pass
-                                ws.cell(row=ri, column=ci, value=val)
+                                if self._set_prepared_cell(
+                                    ws.cell(row=ri, column=ci),
+                                    val,
+                                    force_text=ci in text_col_indices,
+                                ):
+                                    neutralized_cells += 1
                             row_count += 1
                     self.host._safe_save(wb, file_path)
                     wb.close()
                 return {
                     "success": True, "file": file_path,
                     "csv_source": csv_path, "sheet": sheet_name,
-                    "rows_imported": row_count, "backup": backup or None,
+                    "rows_imported": row_count,
+                    "text_columns": sorted(text_col_indices),
+                    "neutralized_cells": neutralized_cells,
+                    "backup": backup or None,
                 }
             except Exception as e:
                 return {"success": False, "error": str(e)}
@@ -2432,19 +2503,59 @@ class XLSXOperations:
                 return {"success": False, "error": "openpyxl not installed"}
             try:
                 import csv as csv_module
-                wb = load_workbook(file_path, read_only=True)
-                ws = self.host._get_sheet(wb, sheet_name) if sheet_name else wb.active
+                target = Path(csv_path)
+                if Path(file_path).resolve() == target.resolve():
+                    return {
+                        "success": False,
+                        "error": "CSV export output path must be different from the source workbook.",
+                        "error_code": "source_output_same_path",
+                        "file": file_path,
+                        "csv_output": csv_path,
+                    }
+                target.parent.mkdir(parents=True, exist_ok=True)
                 row_count = 0
-                with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                    writer = csv_module.writer(f, delimiter=delimiter)
-                    for row in ws.iter_rows(values_only=True):
-                        writer.writerow([str(c) if c is not None else "" for c in row])
-                        row_count += 1
-                wb.close()
+                neutralized_cells = 0
+                with self.host._file_locks(file_path, csv_path):
+                    wb = load_workbook(file_path, read_only=True, data_only=False)
+                    try:
+                        ws = self.host._get_sheet(wb, sheet_name) if sheet_name else wb.active
+                        sheet_title = ws.title
+                        fd, tmp_path = tempfile.mkstemp(
+                            prefix=f".{target.name}.", dir=str(target.parent)
+                        )
+                        os.close(fd)
+                        try:
+                            with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+                                writer = csv_module.writer(f, delimiter=delimiter)
+                                for row in ws.iter_rows(values_only=True):
+                                    csv_row = []
+                                    for value in row:
+                                        if value is None:
+                                            csv_row.append("")
+                                            continue
+                                        if isinstance(value, str):
+                                            value, neutralized = self._neutralize_spreadsheet_text(value)
+                                            if neutralized:
+                                                neutralized_cells += 1
+                                            csv_row.append(value)
+                                        else:
+                                            csv_row.append(str(value))
+                                    writer.writerow(csv_row)
+                                    row_count += 1
+                            with open(tmp_path, "rb") as handle:
+                                os.fsync(handle.fileno())
+                            os.replace(tmp_path, str(target))
+                            self.host._fsync_directory(target.parent)
+                        finally:
+                            if os.path.exists(tmp_path):
+                                os.unlink(tmp_path)
+                    finally:
+                        wb.close()
                 return {
                     "success": True, "file": file_path,
-                    "csv_output": csv_path, "sheet": ws.title,
+                    "csv_output": csv_path, "sheet": sheet_title,
                     "rows_exported": row_count,
+                    "neutralized_cells": neutralized_cells,
                 }
             except Exception as e:
                 return {"success": False, "error": str(e)}

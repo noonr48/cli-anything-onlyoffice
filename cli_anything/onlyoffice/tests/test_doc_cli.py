@@ -20,6 +20,19 @@ class OnlyOfficeDocCLITests(unittest.TestCase):
     def _path(self, name: str) -> str:
         return os.path.join(self.base, name)
 
+    def _run_cli(self, argv):
+        stdout = io.StringIO()
+        exit_code = 0
+        with mock.patch("sys.argv", ["cli-anything-onlyoffice", *argv]):
+            with redirect_stdout(stdout):
+                try:
+                    result = cli_module.main()
+                except SystemExit as exc:
+                    exit_code = exc.code if isinstance(exc.code, int) else 1
+                else:
+                    exit_code = result if isinstance(result, int) else 0
+        return json.loads(stdout.getvalue()), exit_code
+
     def test_cli_doc_create_dispatches_via_doc_handler(self):
         path = self._path("dispatch_create.docx")
         stdout = io.StringIO()
@@ -118,6 +131,7 @@ class OnlyOfficeDocCLITests(unittest.TestCase):
                     "--clear-metadata",
                     "--remove-custom-xml",
                     "--set-remove-personal-information",
+                    "--canonicalize-ooxml",
                     "--author",
                     "benbi",
                     "--title",
@@ -142,11 +156,67 @@ class OnlyOfficeDocCLITests(unittest.TestCase):
             clear_metadata=True,
             remove_custom_xml=True,
             set_remove_personal_information=True,
+            canonicalize_ooxml=True,
             author="benbi",
             title="Clean Title",
             subject="Methods",
             keywords="audit,submission",
         )
+
+    def test_cli_doc_sanitize_delimiter_keeps_option_like_output_path_literal(self):
+        path = self._path("delimiter_sanitize.docx")
+        output_path = "--canonicalize-ooxml"
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "sanitize_document",
+            return_value={"success": True, "output_file": output_path},
+        ) as sanitize_document:
+            payload, exit_code = self._run_cli(
+                [
+                    "doc-sanitize",
+                    path,
+                    "--json",
+                    "--",
+                    output_path,
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["success"])
+        sanitize_document.assert_called_once_with(
+            path,
+            output_path=output_path,
+            remove_comments=False,
+            accept_revisions=False,
+            clear_metadata=False,
+            remove_custom_xml=False,
+            set_remove_personal_information=False,
+            canonicalize_ooxml=False,
+            author=None,
+            title=None,
+            subject=None,
+            keywords=None,
+        )
+
+    def test_cli_doc_preview_rejects_unknown_and_missing_options(self):
+        path = self._path("strict_preview.docx")
+        output_dir = self._path("strict_preview")
+        cases = [
+            (["doc-preview", path, output_dir, "--bogus", "--json"], "--bogus"),
+            (["doc-preview", path, output_dir, "--format", "--json"], "--format"),
+        ]
+
+        for argv, expected_text in cases:
+            with self.subTest(argv=argv):
+                with mock.patch.object(cli_module.doc_server, "preview_document") as preview:
+                    payload, exit_code = self._run_cli(argv)
+
+                self.assertNotEqual(exit_code, 0)
+                self.assertFalse(payload["success"])
+                self.assertEqual(payload["error_code"], "usage_error")
+                self.assertIn(expected_text, payload["error"])
+                preview.assert_not_called()
 
     def test_cli_doc_preview_dispatches_via_doc_handler(self):
         path = self._path("dispatch_preview.docx")
@@ -211,6 +281,43 @@ class OnlyOfficeDocCLITests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertTrue(payload["success"])
         doc_render_map.assert_called_once_with(path)
+
+    def test_cli_doc_render_audit_dispatches_profile(self):
+        path = self._path("dispatch_render_audit.docx")
+        pdf_path = self._path("dispatch_render_audit.pdf")
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "rendered_layout_audit",
+            return_value={"success": True, "profile": "generic"},
+        ) as rendered_layout_audit:
+            with mock.patch(
+                "sys.argv",
+                [
+                    "cli-anything-onlyoffice",
+                    "doc-render-audit",
+                    path,
+                    "--pdf",
+                    pdf_path,
+                    "--tolerance-points",
+                    "5.5",
+                    "--profile",
+                    "generic",
+                    "--json",
+                ],
+            ):
+                with redirect_stdout(stdout):
+                    cli_module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(payload["success"])
+        rendered_layout_audit.assert_called_once_with(
+            path,
+            pdf_path=pdf_path,
+            tolerance_points=5.5,
+            profile="generic",
+        )
 
     def test_cli_doc_create_respects_docx_availability_guard(self):
         path = self._path("unavailable.docx")

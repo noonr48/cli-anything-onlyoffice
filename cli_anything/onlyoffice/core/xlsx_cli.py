@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any, Callable, List, Optional
 
 from cli_anything.onlyoffice.core.command_registry import command_usage
+from cli_anything.onlyoffice.core.parse_utils import parse_int
 
 
 def _split_csv(value: str) -> List[str]:
@@ -450,10 +451,10 @@ def handle_xlsx_command(
                 sheet = raw_args[index + 1]
                 index += 2
             elif raw_args[index] == "--limit" and index + 1 < len(raw_args):
-                limit = int(raw_args[index + 1])
+                limit = parse_int(raw_args[index + 1], "--limit")
                 index += 2
             elif raw_args[index] == "--min-length" and index + 1 < len(raw_args):
-                min_length = int(raw_args[index + 1])
+                min_length = parse_int(raw_args[index + 1], "--min-length")
                 index += 2
             else:
                 index += 1
@@ -488,10 +489,10 @@ def handle_xlsx_command(
                 sheet = raw_args[index + 1]
                 index += 2
             elif raw_args[index] == "--top" and index + 1 < len(raw_args):
-                top = int(raw_args[index + 1])
+                top = parse_int(raw_args[index + 1], "--top")
                 index += 2
             elif raw_args[index] == "--min-word-length" and index + 1 < len(raw_args):
-                min_word_length = int(raw_args[index + 1])
+                min_word_length = parse_int(raw_args[index + 1], "--min-word-length")
                 index += 2
             else:
                 index += 1
@@ -579,12 +580,17 @@ def handle_xlsx_command(
                 sheet = raw_args[index + 1]
                 index += 2
             elif not raw_args[index].startswith("--"):
-                count = int(raw_args[index])
+                count = parse_int(raw_args[index], "count")
                 index += 1
             else:
                 index += 1
         print_result(
-            doc_server.delete_rows(raw_args[0], int(raw_args[1]), count=count, sheet_name=sheet),
+            doc_server.delete_rows(
+                raw_args[0],
+                parse_int(raw_args[1], "start_row"),
+                count=count,
+                sheet_name=sheet,
+            ),
             json_output,
         )
         return True
@@ -604,12 +610,17 @@ def handle_xlsx_command(
                 sheet = raw_args[index + 1]
                 index += 2
             elif not raw_args[index].startswith("--"):
-                count = int(raw_args[index])
+                count = parse_int(raw_args[index], "count")
                 index += 1
             else:
                 index += 1
         print_result(
-            doc_server.delete_columns(raw_args[0], int(raw_args[1]), count=count, sheet_name=sheet),
+            doc_server.delete_columns(
+                raw_args[0],
+                parse_int(raw_args[1], "start_col"),
+                count=count,
+                sheet_name=sheet,
+            ),
             json_output,
         )
         return True
@@ -698,7 +709,7 @@ def handle_xlsx_command(
             return True
         position = None
         if len(raw_args) > 3 and raw_args[2] == "--position":
-            position = int(raw_args[3])
+            position = parse_int(raw_args[3], "--position")
         print_result(doc_server.sheet_add(raw_args[0], raw_args[1], position=position), json_output)
         return True
 
@@ -788,7 +799,7 @@ def handle_xlsx_command(
                 options["font_name"] = raw_args[index + 1]
                 index += 2
             elif raw_args[index] == "--font-size" and index + 1 < len(raw_args):
-                options["font_size"] = int(raw_args[index + 1])
+                options["font_size"] = parse_int(raw_args[index + 1], "--font-size")
                 index += 2
             elif raw_args[index] == "--color" and index + 1 < len(raw_args):
                 options["color"] = raw_args[index + 1]
@@ -914,6 +925,9 @@ def handle_xlsx_command(
                 index += 2
             elif raw_args[index] == "--no-blank":
                 allow_blank = False
+                index += 1
+            elif raw_args[index] == "--allow-blank":
+                allow_blank = True
                 index += 1
             else:
                 index += 1
@@ -1043,7 +1057,7 @@ def handle_xlsx_command(
                 sheet = raw_args[index + 1]
                 index += 2
             elif raw_args[index] == "--max-rows" and index + 1 < len(raw_args):
-                max_rows = int(raw_args[index + 1])
+                max_rows = parse_int(raw_args[index + 1], "--max-rows")
                 index += 2
             else:
                 index += 1
@@ -1088,7 +1102,7 @@ def handle_xlsx_command(
                 pages = raw_args[index + 1]
                 index += 2
             elif raw_args[index] == "--dpi" and index + 1 < len(raw_args):
-                dpi = int(raw_args[index + 1])
+                dpi = parse_int(raw_args[index + 1], "--dpi")
                 index += 2
             elif raw_args[index] == "--format" and index + 1 < len(raw_args):
                 fmt = raw_args[index + 1]
@@ -1227,12 +1241,17 @@ def handle_xlsx_command(
                 chart_type=raw_args[1],
                 sheet_name=sheet,
                 title=raw_args[2],
-                start_row=int(start_row) if start_row else 1,
-                start_col=int(start_col) if start_col else 1,
-                num_categories=int(num_cats) if num_cats else None,
-                num_series=int(num_series) if num_series else None,
-                category_col=int(cat_col) if cat_col else 1,
-                value_cols=[int(value) for value in value_cols.split(",")] if value_cols else None,
+                start_row=parse_int(start_row, "--start-row") if start_row else 1,
+                start_col=parse_int(start_col, "--start-col") if start_col else 1,
+                num_categories=parse_int(num_cats, "--cats") if num_cats else None,
+                num_series=parse_int(num_series, "--series") if num_series else None,
+                category_col=parse_int(cat_col, "--cat-col") if cat_col else 1,
+                value_cols=[
+                    parse_int(value, "--value-cols")
+                    for value in value_cols.split(",")
+                ]
+                if value_cols
+                else None,
                 output_cell=output_cell,
                 show_data_labels=show_labels,
                 show_legend=show_legend,

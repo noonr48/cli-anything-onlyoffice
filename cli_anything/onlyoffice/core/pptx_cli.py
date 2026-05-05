@@ -6,6 +6,25 @@ from __future__ import annotations
 from typing import Any, Callable, List
 
 from cli_anything.onlyoffice.core.command_registry import command_usage
+from cli_anything.onlyoffice.core.parse_utils import parse_float, parse_int
+
+
+def _option_value(command: str, raw_args: List[str], index: int, option: str) -> str:
+    if index + 1 >= len(raw_args) or raw_args[index + 1].startswith("--"):
+        raise ValueError(
+            f"{command}: {option} requires a value. Usage: {command_usage(command)}"
+        )
+    return raw_args[index + 1]
+
+
+def _raise_unexpected_option(command: str, token: str) -> None:
+    if token.startswith("--"):
+        raise ValueError(
+            f"{command}: unknown option {token!r}. Usage: {command_usage(command)}"
+        )
+    raise ValueError(
+        f"{command}: unexpected argument {token!r}. Usage: {command_usage(command)}"
+    )
 
 
 def handle_pptx_command(
@@ -129,7 +148,10 @@ def handle_pptx_command(
                 json_output,
             )
             return True
-        print_result(doc_server.delete_slide(raw_args[0], int(raw_args[1])), json_output)
+        print_result(
+            doc_server.delete_slide(raw_args[0], parse_int(raw_args[1], "index")),
+            json_output,
+        )
         return True
 
     if command == "pptx-speaker-notes":
@@ -144,7 +166,11 @@ def handle_pptx_command(
             return True
         notes = " ".join(raw_args[2:]) if len(raw_args) > 2 else None
         print_result(
-            doc_server.speaker_notes(raw_args[0], int(raw_args[1]), notes_text=notes),
+            doc_server.speaker_notes(
+                raw_args[0],
+                parse_int(raw_args[1], "index"),
+                notes_text=notes,
+            ),
             json_output,
         )
         return True
@@ -172,7 +198,12 @@ def handle_pptx_command(
             else:
                 index += 1
         print_result(
-            doc_server.update_slide_text(raw_args[0], int(raw_args[1]), title=title, body=body),
+            doc_server.update_slide_text(
+                raw_args[0],
+                parse_int(raw_args[1], "index"),
+                title=title,
+                body=body,
+            ),
             json_output,
         )
         return True
@@ -202,17 +233,17 @@ def handle_pptx_command(
         prefix = "slide"
         index = 2
         while index < len(raw_args):
-            if raw_args[index] == "--format" and index + 1 < len(raw_args):
-                fmt = raw_args[index + 1]
+            if raw_args[index] == "--format":
+                fmt = _option_value(command, raw_args, index, "--format")
                 index += 2
-            elif raw_args[index] == "--slide" and index + 1 < len(raw_args):
-                slide_index = int(raw_args[index + 1])
+            elif raw_args[index] == "--slide":
+                slide_index = parse_int(_option_value(command, raw_args, index, "--slide"), "--slide")
                 index += 2
-            elif raw_args[index] == "--prefix" and index + 1 < len(raw_args):
-                prefix = raw_args[index + 1]
+            elif raw_args[index] == "--prefix":
+                prefix = _option_value(command, raw_args, index, "--prefix")
                 index += 2
             else:
-                index += 1
+                _raise_unexpected_option(command, raw_args[index])
         print_result(
             doc_server.extract_images_from_pptx(
                 raw_args[0],
@@ -239,7 +270,7 @@ def handle_pptx_command(
         index = 1
         while index < len(raw_args):
             if raw_args[index] == "--slide" and index + 1 < len(raw_args):
-                slide_index = int(raw_args[index + 1])
+                slide_index = parse_int(raw_args[index + 1], "--slide")
                 index += 2
             else:
                 index += 1
@@ -257,7 +288,7 @@ def handle_pptx_command(
             )
             return True
         file_path = raw_args[0]
-        slide_index = int(raw_args[1])
+        slide_index = parse_int(raw_args[1], "slide_index")
         text = raw_args[2]
         left = 1.0
         top = 1.0
@@ -272,19 +303,19 @@ def handle_pptx_command(
         index = 3
         while index < len(raw_args):
             if raw_args[index] == "--left" and index + 1 < len(raw_args):
-                left = float(raw_args[index + 1])
+                left = parse_float(raw_args[index + 1], "--left")
                 index += 2
             elif raw_args[index] == "--top" and index + 1 < len(raw_args):
-                top = float(raw_args[index + 1])
+                top = parse_float(raw_args[index + 1], "--top")
                 index += 2
             elif raw_args[index] == "--width" and index + 1 < len(raw_args):
-                width = float(raw_args[index + 1])
+                width = parse_float(raw_args[index + 1], "--width")
                 index += 2
             elif raw_args[index] == "--height" and index + 1 < len(raw_args):
-                height = float(raw_args[index + 1])
+                height = parse_float(raw_args[index + 1], "--height")
                 index += 2
             elif raw_args[index] == "--font-size" and index + 1 < len(raw_args):
-                font_size = float(raw_args[index + 1])
+                font_size = parse_float(raw_args[index + 1], "--font-size")
                 index += 2
             elif raw_args[index] == "--font-name" and index + 1 < len(raw_args):
                 font_name = raw_args[index + 1]
@@ -334,7 +365,7 @@ def handle_pptx_command(
             )
             return True
         file_path = raw_args[0]
-        slide_index = int(raw_args[1])
+        slide_index = parse_int(raw_args[1], "slide_index")
         shape_name = raw_args[2]
         left = None
         top = None
@@ -346,25 +377,25 @@ def handle_pptx_command(
         index = 3
         while index < len(raw_args):
             if raw_args[index] == "--left" and index + 1 < len(raw_args):
-                left = float(raw_args[index + 1])
+                left = parse_float(raw_args[index + 1], "--left")
                 index += 2
             elif raw_args[index] == "--top" and index + 1 < len(raw_args):
-                top = float(raw_args[index + 1])
+                top = parse_float(raw_args[index + 1], "--top")
                 index += 2
             elif raw_args[index] == "--width" and index + 1 < len(raw_args):
-                width = float(raw_args[index + 1])
+                width = parse_float(raw_args[index + 1], "--width")
                 index += 2
             elif raw_args[index] == "--height" and index + 1 < len(raw_args):
-                height = float(raw_args[index + 1])
+                height = parse_float(raw_args[index + 1], "--height")
                 index += 2
             elif raw_args[index] == "--text" and index + 1 < len(raw_args):
                 text = raw_args[index + 1]
                 index += 2
             elif raw_args[index] == "--font-size" and index + 1 < len(raw_args):
-                font_size = float(raw_args[index + 1])
+                font_size = parse_float(raw_args[index + 1], "--font-size")
                 index += 2
             elif raw_args[index] == "--rotation" and index + 1 < len(raw_args):
-                rotation = float(raw_args[index + 1])
+                rotation = parse_float(raw_args[index + 1], "--rotation")
                 index += 2
             else:
                 index += 1
@@ -399,14 +430,14 @@ def handle_pptx_command(
         dpi = 150
         index = 2
         while index < len(raw_args):
-            if raw_args[index] == "--slide" and index + 1 < len(raw_args):
-                slide_index = int(raw_args[index + 1])
+            if raw_args[index] == "--slide":
+                slide_index = parse_int(_option_value(command, raw_args, index, "--slide"), "--slide")
                 index += 2
-            elif raw_args[index] == "--dpi" and index + 1 < len(raw_args):
-                dpi = int(raw_args[index + 1])
+            elif raw_args[index] == "--dpi":
+                dpi = parse_int(_option_value(command, raw_args, index, "--dpi"), "--dpi")
                 index += 2
             else:
-                index += 1
+                _raise_unexpected_option(command, raw_args[index])
         print_result(
             doc_server.preview_slide(raw_args[0], raw_args[1], slide_index=slide_index, dpi=dpi),
             json_output,

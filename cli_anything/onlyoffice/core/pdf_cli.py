@@ -6,6 +6,25 @@ from __future__ import annotations
 from typing import Any, Callable, List
 
 from cli_anything.onlyoffice.core.command_registry import command_usage
+from cli_anything.onlyoffice.core.parse_utils import parse_int
+
+
+def _option_value(command: str, raw_args: List[str], index: int, option: str) -> str:
+    if index + 1 >= len(raw_args) or raw_args[index + 1].startswith("--"):
+        raise ValueError(
+            f"{command}: {option} requires a value. Usage: {command_usage(command)}"
+        )
+    return raw_args[index + 1]
+
+
+def _raise_unexpected_option(command: str, token: str) -> None:
+    if token.startswith("--"):
+        raise ValueError(
+            f"{command}: unknown option {token!r}. Usage: {command_usage(command)}"
+        )
+    raise ValueError(
+        f"{command}: unexpected argument {token!r}. Usage: {command_usage(command)}"
+    )
 
 
 def handle_pdf_command(
@@ -30,14 +49,14 @@ def handle_pdf_command(
         pages = None
         index = 2
         while index < len(raw_args):
-            if raw_args[index] == "--format" and index + 1 < len(raw_args):
-                fmt = raw_args[index + 1]
+            if raw_args[index] == "--format":
+                fmt = _option_value(command, raw_args, index, "--format")
                 index += 2
-            elif raw_args[index] == "--pages" and index + 1 < len(raw_args):
-                pages = raw_args[index + 1]
+            elif raw_args[index] == "--pages":
+                pages = _option_value(command, raw_args, index, "--pages")
                 index += 2
             else:
-                index += 1
+                _raise_unexpected_option(command, raw_args[index])
         print_result(
             doc_server.pdf_extract_images(raw_args[0], raw_args[1], fmt=fmt, pages=pages),
             json_output,
@@ -59,17 +78,17 @@ def handle_pdf_command(
         fmt = "png"
         index = 2
         while index < len(raw_args):
-            if raw_args[index] == "--pages" and index + 1 < len(raw_args):
-                pages = raw_args[index + 1]
+            if raw_args[index] == "--pages":
+                pages = _option_value(command, raw_args, index, "--pages")
                 index += 2
-            elif raw_args[index] == "--dpi" and index + 1 < len(raw_args):
-                dpi = int(raw_args[index + 1])
+            elif raw_args[index] == "--dpi":
+                dpi = parse_int(_option_value(command, raw_args, index, "--dpi"), "--dpi")
                 index += 2
-            elif raw_args[index] == "--format" and index + 1 < len(raw_args):
-                fmt = raw_args[index + 1]
+            elif raw_args[index] == "--format":
+                fmt = _option_value(command, raw_args, index, "--format")
                 index += 2
             else:
-                index += 1
+                _raise_unexpected_option(command, raw_args[index])
         print_result(
             doc_server.pdf_page_to_image(raw_args[0], raw_args[1], pages=pages, dpi=dpi, fmt=fmt),
             json_output,

@@ -7,7 +7,8 @@ from copy import deepcopy
 from typing import Dict, List
 
 
-VERSION = "4.4.11"
+VERSION = "4.4.15"
+CLI_SCHEMA_VERSION = "1.0"
 
 
 COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
@@ -23,7 +24,7 @@ COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
         "doc-highlight <file> <search_text> [--color <name>]": "Highlight matching text",
         "doc-comment <file> <comment> [--paragraph <index>]": "Attach OOXML comment annotation",
         "doc-layout <file> [--size A4|Letter] [--orientation portrait|landscape] [--margin-* <in>] [--header <text>] [--page-numbers]": "Set page size/layout/margins/header/footer",
-        "doc-formatting-info <file>": "Inspect paragraph/section formatting",
+        "doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]": "Inspect paragraph/section formatting, including indents, tabs, and page breaks",
         "doc-set-style <file> <index> <style>": "Set paragraph style (Heading 1, Normal, etc.)",
         "doc-list-styles <file>": "List all available paragraph/character styles",
         "doc-add-table <file> <headers_csv> <data_csv>": "Add table (rows separated by ;)",
@@ -37,60 +38,61 @@ COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
         "doc-set-metadata <file> [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>]": "Set document properties",
         "doc-get-metadata <file>": "Read document properties",
         "doc-inspect-hidden-data <file>": "Inspect hidden DOCX metadata, comments, revisions, and custom XML",
-        "doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--author <a>]": "Sanitize DOCX for submission",
-        "doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>]": "Run submission-oriented DOCX preflight checks",
+        "doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--set-remove-personal-information] [--canonicalize-ooxml] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>]": "Sanitize DOCX for submission",
+        "doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--rendered-layout] [--profile auto|generic|apa-references]": "Run submission-oriented DOCX preflight checks",
         "doc-word-count <file>": "Word/character/paragraph counts",
         "doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]": "Extract all embedded images from .docx",
-        "doc-to-pdf <file> [output_path]": "Convert .docx to PDF via OnlyOffice",
+        "doc-to-pdf <file> [output_path] [--layout-warnings] [--profile auto|generic|apa-references]": "Convert .docx to PDF via OnlyOffice",
         "doc-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]": "Render DOCX pages as images via OnlyOffice",
         "doc-render-map <file>": "Map DOCX paragraphs/table cells to OnlyOffice-rendered PDF pages and bounding boxes",
+        "doc-render-audit <file> [--pdf <path>] [--tolerance-points <n>] [--profile auto|generic|apa-references]": "Audit rendered PDF margins, page breaks, and hanging indents against DOCX intent",
     },
     "SPREADSHEETS (.xlsx)": {
         "xlsx-create <file> [sheet]": "Create new .xlsx spreadsheet",
         "xlsx-write <file> <headers> <data> [--sheet <name>] [--overwrite] [--coerce-rows] [--text-columns <csv>]": "Write data to sheet (safe update default)",
         "xlsx-read <file> [sheet]": "Read spreadsheet data (all sheets if no sheet specified)",
         "xlsx-append <file> <row-data> [--sheet <name>]": "Append row to spreadsheet",
-        "xlsx-search <file> <text> [--sheet <name>]": "Search for text in spreadsheet",
+        "xlsx-search <file> <search-text> [--sheet <name>]": "Search for text in spreadsheet",
         "xlsx-cell-read <file> <cell> [--sheet <name>]": "Read a single cell (e.g., B5)",
         "xlsx-cell-write <file> <cell> <value> [--sheet <name>] [--text]": "Write to a single cell",
         "xlsx-range-read <file> <range> [--sheet <name>]": "Read a cell range (e.g., A1:D10)",
         "xlsx-delete-rows <file> <start_row> [count] [--sheet <name>]": "Delete rows (1-indexed)",
         "xlsx-delete-cols <file> <start_col> [count] [--sheet <name>]": "Delete columns (1-indexed)",
         "xlsx-sort <file> <column> [--sheet <name>] [--desc] [--numeric]": "Sort by column (preserves header)",
-        "xlsx-filter <file> <column> <op> <value> [--sheet <name>]": "Filter rows (op: eq|ne|gt|lt|ge|le|contains|startswith|endswith)",
-        "xlsx-calc <file> <column> <op> [--sheet <name>] [--include-formulas] [--strict-formulas]": "Column statistics (sum|avg|min|max|all)",
+        "xlsx-filter <file> <column> <op> <value> [--sheet <name>] (op: eq|ne|gt|lt|ge|le|contains|startswith|endswith)": "Filter rows (op: eq|ne|gt|lt|ge|le|contains|startswith|endswith)",
+        "xlsx-calc <file> <column> <operation> [--sheet <name>] [--include-formulas] [--strict-formulas]": "Column statistics (sum|avg|min|max|all)",
         "xlsx-formula <file> <cell> <formula> [--sheet <name>]": "Add formula to cell",
         "xlsx-formula-audit <file> [--sheet <name>]": "Audit formula complexity/risk",
         "xlsx-freq <file> <column> [--sheet <name>] [--valid <csv>]": "Frequency + percentage table",
-        "xlsx-corr <file> <x> <y> [--sheet <name>] [--method pearson|spearman]": "Correlation test with APA output",
-        "xlsx-ttest <file> <val> <grp> <a> <b> [--sheet <name>] [--equal-var]": "Independent t-test (Welch default, Cohen's d)",
-        "xlsx-mannwhitney <file> <val> <grp> <a> <b> [--sheet <name>]": "Mann-Whitney U test (non-parametric)",
-        "xlsx-chi2 <file> <row> <col> [--sheet <name>] [--row-valid <csv>] [--col-valid <csv>]": "Chi-square test (Cramer's V)",
-        "xlsx-research-pack <file> [--sheet <name>] [--profile hlth3112]": "Bundled analysis pack",
-        "xlsx-text-extract <file> <column> [--sheet <name>] [--limit <n>]": "Extract open-text responses",
-        "xlsx-text-keywords <file> <column> [--sheet <name>] [--top <n>]": "Keyword frequency for themes",
+        "xlsx-corr <file> <x_col> <y_col> [--sheet <name>] [--method pearson|spearman]": "Correlation test with APA output",
+        "xlsx-ttest <file> <value_col> <group_col> <group_a> <group_b> [--sheet <name>] [--equal-var]": "Independent t-test (Welch default, Cohen's d)",
+        "xlsx-mannwhitney <file> <value_col> <group_col> <group_a> <group_b> [--sheet <name>]": "Mann-Whitney U test (non-parametric)",
+        "xlsx-chi2 <file> <row_col> <col_col> [--sheet <name>] [--row-valid <csv>] [--col-valid <csv>]": "Chi-square test (Cramer's V)",
+        "xlsx-research-pack <file> [--sheet <name>] [--profile hlth3112] [--require-formula-safe]": "Bundled analysis pack",
+        "xlsx-text-extract <file> <column> [--sheet <name>] [--limit <n>] [--min-length <n>]": "Extract open-text responses",
+        "xlsx-text-keywords <file> <column> [--sheet <name>] [--top <n>] [--min-word-length <n>]": "Keyword frequency for themes",
         "xlsx-sheet-list <file>": "List all sheets with row/column counts",
         "xlsx-sheet-add <file> <name> [--position <n>]": "Add a new sheet",
         "xlsx-sheet-delete <file> <name>": "Delete a sheet",
-        "xlsx-sheet-rename <file> <old> <new>": "Rename a sheet",
+        "xlsx-sheet-rename <file> <old_name> <new_name>": "Rename a sheet",
         "xlsx-merge-cells <file> <range> [--sheet <name>]": "Merge cells (e.g., A1:C1)",
         "xlsx-unmerge-cells <file> <range> [--sheet <name>]": "Unmerge cells",
-        "xlsx-format-cells <file> <range> [--sheet <name>] [--bold] [--italic] [--font-name <n>] [--font-size <n>] [--color <hex>] [--bg-color <hex>] [--number-format <fmt>] [--wrap]": "Format cell range",
+        "xlsx-format-cells <file> <range> [--sheet <name>] [--bold] [--italic] [--font-name <n>] [--font-size <n>] [--color <hex>] [--bg-color <hex>] [--number-format <fmt>] [--align <l|c|r>] [--wrap]": "Format cell range",
         "xlsx-csv-import <xlsx_file> <csv_file> [--sheet <name>] [--delimiter <char>]": "Import CSV into xlsx",
         "xlsx-csv-export <xlsx_file> <csv_file> [--sheet <name>] [--delimiter <char>]": "Export sheet to CSV",
-        "xlsx-add-validation <file> <range> <type> [--operator <op>] [--formula1 <v>] [--formula2 <v>] [--error <msg>]": "Add data validation (list|whole|decimal|textLength|date|custom)",
-        "xlsx-add-dropdown <file> <range> <options_csv> [--prompt <msg>]": "Add dropdown list validation (shortcut)",
+        "xlsx-add-validation <file> <range> <type> [--operator <op>] [--formula1 <v>] [--formula2 <v>] [--sheet <name>] [--error <msg>] [--error-title <title>] [--prompt <msg>] [--prompt-title <title>] [--error-style stop|warning|information] [--no-blank]": "Add data validation (list|whole|decimal|textLength|date|custom)",
+        "xlsx-add-dropdown <file> <range> <options_csv> [--sheet <name>] [--prompt <msg>] [--error <msg>]": "Add dropdown list validation (shortcut)",
         "xlsx-list-validations <file> [--sheet <name>]": "List all validation rules on a sheet",
-        "xlsx-remove-validation <file> [--range <range>] [--all]": "Remove validation rules",
+        "xlsx-remove-validation <file> [--range <range>] [--all] [--sheet <name>]": "Remove validation rules",
         "xlsx-validate-data <file> [--sheet <name>] [--max-rows <n>]": "Audit data against validation rules (pass/fail per cell)",
         "xlsx-to-pdf <file> [output_path]": "Convert a spreadsheet to PDF via OnlyOffice",
         "xlsx-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]": "Render spreadsheet pages as images via OnlyOffice",
     },
     "CHARTS (.xlsx)": {
-        "chart-create <file> <type> <data_range> <cat_range> <title> [options]": "Create chart (bar|line|pie|scatter|bar_horizontal)",
-        "chart-comparison <file> <type> <title> [options]": "Comparison chart from structured data",
-        "chart-grade-dist <file> <grade_col> <title>": "Grade distribution pie chart",
-        "chart-progress <file> <student_col> <grade_col> <title>": "Student progress bar chart",
+        "chart-create <file> <type> <data_range> <cat_range> <title> [--sheet <name>] [--output-sheet <name>] [--x-label <text>] [--y-label <text>] [--labels] [--no-legend] [--legend-pos <pos>] [--colors <hex,hex>]": "Create chart (bar|line|pie|scatter|bar_horizontal)",
+        "chart-comparison <file> <type> <title> [--sheet <name>] [--start-row <n>] [--start-col <n>] [--cats <n>] [--series <n>] [--cat-col <n>] [--value-cols <n,n,n>] [--output <cell>] [--labels] [--no-legend]": "Comparison chart from structured data",
+        "chart-grade-dist <file> <grade_col> <title> [--sheet <name>] [--output <cell>]": "Grade distribution pie chart",
+        "chart-progress <file> <student_col> <grade_col> <title> [--sheet <name>] [--output <cell>] [--labels] [--no-labels]": "Student progress bar chart",
     },
     "PRESENTATIONS (.pptx)": {
         "pptx-create <file> <title> [subtitle]": "Create new presentation",
@@ -100,12 +102,12 @@ COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
         "pptx-add-image <file> <title> <image_path>": "Add image slide",
         "pptx-add-table <file> <title> <headers> <data> [--coerce-rows]": "Add table slide",
         "pptx-delete-slide <file> <index>": "Delete slide by index (0-based)",
-        "pptx-speaker-notes <file> <index> [text]": "Read or set speaker notes (omit text to read)",
-        "pptx-update-text <file> <index> [--title <t>] [--body <b>]": "Update existing slide text",
+        "pptx-speaker-notes <file> <slide_index> [notes_text]": "Read or set speaker notes (omit text to read)",
+        "pptx-update-text <file> <slide_index> [--title <t>] [--body <b>]": "Update existing slide text",
         "pptx-slide-count <file>": "Get slide count and titles",
         "pptx-extract-images <file> <output_dir> [--slide <index>] [--format png|jpg] [--prefix <name>]": "Extract all images from slides",
         "pptx-list-shapes <file> [--slide <index>]": "List all shapes with position/size/text (spatial map)",
-        "pptx-add-textbox <file> <slide_index> <text> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--font-size <pt>] [--font-name <name>] [--bold] [--italic] [--color <hex>] [--align <dir>]": "Add textbox at exact position",
+        "pptx-add-textbox <file> <slide_index> <text> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--font-size <pt>] [--font-name <name>] [--bold] [--italic] [--color <hex>] [--align <left|center|right>]": "Add textbox at exact position",
         "pptx-modify-shape <file> <slide_index> <shape_name> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--text <text>] [--font-size <pt>] [--rotation <deg>]": "Move/resize/edit any shape by name",
         "pptx-preview <file> <output_dir> [--slide <index>] [--dpi <n>]": "Render slides as PNG images (requires OnlyOffice Docker)",
     },
@@ -115,18 +117,18 @@ COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
         "pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]": "Read native PDF text blocks/lines/spans with bounding boxes",
         "pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]": "Search native PDF blocks/spans and return exact block/span anchors",
         "pdf-inspect-hidden-data <file>": "Inspect hidden PDF metadata, annotations, embedded files, and page-size consistency",
-        "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>]": "Sanitize PDF metadata/XMP for submission",
+        "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>] [--creator <c>] [--producer <p>]": "Sanitize PDF metadata/XMP for submission",
     },
     "RDF (Knowledge Graphs)": {
         "rdf-create <file> [--base <uri>] [--format turtle|xml|n3|json-ld] [--prefix <p>=<uri>]": "Create empty RDF graph with prefixes",
         "rdf-read <file> [--limit <n>]": "Read/parse RDF file and show triples",
-        "rdf-add <file> <subject> <predicate> <object> [--type uri|literal|bnode] [--lang <l>] [--datatype <dt>]": "Add a triple",
-        "rdf-remove <file> [--subject <s>] [--predicate <p>] [--object <o>] [--type uri|literal|bnode] [--lang <l>] [--datatype <dt>]": "Remove triples (None = wildcard)",
+        "rdf-add <file> <subject> <predicate> <object> [--type uri|literal|bnode] [--lang <l>] [--datatype <dt>] [--format <f>]": "Add a triple",
+        "rdf-remove <file> (--all | [--subject <s>] [--predicate <p>] [--object <o>]) [--type uri|literal|bnode] [--lang <l>] [--datatype <dt>] [--format <f>] [--dry-run]": "Remove triples matching selectors, or all triples with explicit --all",
         "rdf-query <file> <sparql> [--limit <n>]": "Execute SPARQL query",
         "rdf-export <file> <output> [--format turtle|xml|n3|nt|json-ld|trig]": "Convert/export to different format",
         "rdf-merge <file_a> <file_b> [--output <file>] [--format turtle]": "Merge two RDF graphs",
         "rdf-stats <file>": "Graph statistics (subjects, predicates, types, etc.)",
-        "rdf-namespace <file> [<prefix> <uri>]": "Add namespace prefix or list all",
+        "rdf-namespace <file> [<prefix> <uri>] [--format <f>]": "Add namespace prefix or list all",
         "rdf-validate <file> <shapes_file>": "SHACL validation (requires pyshacl)",
     },
     "GENERAL": {
@@ -136,9 +138,10 @@ COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
         "info <file>": "File info (type, size, sheet/slide/paragraph counts; aliases: document.info, spreadsheet.info, presentation.info, pdf.info)",
         "backup-list <file> [--limit <n>]": "List backups for file",
         "backup-prune [--file <f>] [--keep <n>] [--days <n>]": "Prune old backups",
-        "backup-restore <file> [--backup <p>] [--latest] [--dry-run]": "Restore from backup",
+        "backup-restore <file> [--backup <name|path>] [--latest] [--dry-run]": "Restore from backup",
         "editor-session <file> [--open] [--wait <sec>] [--activate]": "Inspect or open a native OnlyOffice desktop editor session",
-        "editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h]": "Capture a live editor viewport or rendered fallback image",
+        "editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--open] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h] [--wait <sec>] [--settle-ms <n>] [--dpi <n>] [--format png|jpg]": "Capture a live editor viewport or rendered fallback image",
+        "setup-check": "Strict install/update dependency check for cloned checkouts",
         "status": "Check installation and all capabilities",
         "help": "Show this help",
     },
@@ -194,17 +197,21 @@ USAGE_OVERRIDES: Dict[str, str] = {
     "chart-comparison": "chart-comparison <file> <type> <title> [--sheet <name>] [--start-row <n>] [--start-col <n>] [--cats <n>] [--series <n>] [--cat-col <n>] [--value-cols <n,n,n>] [--output <cell>] [--labels] [--no-legend]",
     "chart-create": "chart-create <file> <type> <data_range> <cat_range> <title> [--sheet <name>] [--output-sheet <name>] [--x-label <text>] [--y-label <text>] [--labels] [--no-legend] [--legend-pos <pos>] [--colors <hex,hex>]",
     "chart-grade-dist": "chart-grade-dist <file> <grade_col> <title> [--sheet <name>] [--output <cell>]",
-    "chart-progress": "chart-progress <file> <student_col> <grade_col> <title> [--sheet <name>] [--output <cell>] [--labels]",
+    "chart-progress": "chart-progress <file> <student_col> <grade_col> <title> [--sheet <name>] [--output <cell>] [--labels] [--no-labels]",
     "doc-add-image": "doc-add-image <file> <image_path> [--width <inches>] [--caption <text>] [--paragraph <index>] [--position before|after]",
     "doc-add-list": "doc-add-list <file> <items> [--type bullet|number] (items separated by ;)",
     "doc-add-reference": 'doc-add-reference <file> <ref_json>  (ref_json: {"author":"...","year":"...","title":"...","source":"...","type":"journal|book|website|report|chapter","doi":"..."})',
     "doc-add-table": "doc-add-table <file> <headers_csv> <data_csv>  (rows separated by ';')",
     "doc-build-references": "doc-build-references <file>  (reads <file>.refs.json, appends APA 7th formatted References section)",
     "doc-delete": "doc-delete <file> <paragraph_index>",
+    "doc-formatting-info": "doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]",
     "doc-layout": "doc-layout <file> [--size <A4|Letter>] [--orientation <portrait|landscape>] [--margin-top <in>] [--margin-bottom <in>] [--margin-left <in>] [--margin-right <in>] [--header <text>] [--page-numbers]",
-    "doc-sanitize": "doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--set-remove-personal-information] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>]",
+    "doc-preflight": "doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--rendered-layout] [--profile auto|generic|apa-references]",
+    "doc-render-audit": "doc-render-audit <file> [--pdf <path>] [--tolerance-points <n>] [--profile auto|generic|apa-references]",
+    "doc-sanitize": "doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--set-remove-personal-information] [--canonicalize-ooxml] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>]",
     "doc-set-metadata": "doc-set-metadata <file> [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>] [--comments <c>] [--category <cat>]",
     'doc-set-style': 'doc-set-style <file> <paragraph_index> <style>  (e.g., "Heading 1", "Heading 2", "Normal", "Title")',
+    "doc-to-pdf": "doc-to-pdf <file> [output_path] [--layout-warnings] [--profile auto|generic|apa-references]",
     "pdf-sanitize": "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>] [--creator <c>] [--producer <p>]",
     "pptx-add-textbox": "pptx-add-textbox <file> <slide_index> <text> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--font-size <pt>] [--font-name <name>] [--bold] [--italic] [--color <hex>] [--align <left|center|right>]",
     "pptx-speaker-notes": "pptx-speaker-notes <file> <slide_index> [notes_text]",
@@ -213,10 +220,10 @@ USAGE_OVERRIDES: Dict[str, str] = {
     "rdf-export": "rdf-export <file> <output_file> [--format turtle|xml|n3|nt|json-ld|trig]",
     "rdf-namespace": "rdf-namespace <file> [<prefix> <uri>] [--format <f>]",
     "rdf-query": "rdf-query <file> <sparql_query> [--limit <n>]",
-    "rdf-remove": "rdf-remove <file> [--subject <s>] [--predicate <p>] [--object <o>] [--type uri|literal|bnode] [--lang <l>] [--datatype <dt>] [--format <f>]",
+    "rdf-remove": "rdf-remove <file> (--all | [--subject <s>] [--predicate <p>] [--object <o>]) [--type uri|literal|bnode] [--lang <l>] [--datatype <dt>] [--format <f>] [--dry-run]",
     "rdf-validate": "rdf-validate <data_file> <shapes_file>",
     "xlsx-add-dropdown": "xlsx-add-dropdown <file> <range> <options_csv> [--sheet <name>] [--prompt <msg>] [--error <msg>]",
-    "xlsx-add-validation": "xlsx-add-validation <file> <range> <type> [--operator <op>] [--formula1 <v>] [--formula2 <v>] [--sheet <name>] [--error <msg>] [--prompt <msg>] [--error-style stop|warning|information] [--allow-blank]",
+    "xlsx-add-validation": "xlsx-add-validation <file> <range> <type> [--operator <op>] [--formula1 <v>] [--formula2 <v>] [--sheet <name>] [--error <msg>] [--error-title <title>] [--prompt <msg>] [--prompt-title <title>] [--error-style stop|warning|information] [--no-blank]",
     "xlsx-calc": "xlsx-calc <file> <column> <operation> [--sheet <name>] [--include-formulas] [--strict-formulas]",
     "xlsx-chi2": "xlsx-chi2 <file> <row_col> <col_col> [--sheet <name>] [--row-valid <csv>] [--col-valid <csv>]",
     "xlsx-corr": "xlsx-corr <file> <x_col> <y_col> [--sheet <name>] [--method pearson|spearman]",
@@ -235,8 +242,163 @@ USAGE_OVERRIDES: Dict[str, str] = {
     "info": "info <file>",
     "editor-session": "editor-session <file> [--open] [--wait <sec>] [--activate]",
     "editor-capture": "editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--open] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h] [--wait <sec>] [--settle-ms <n>] [--dpi <n>] [--format png|jpg]",
+    "setup-check": "setup-check",
     "backup-list": "backup-list <file> [--limit <n>]",
     "backup-restore": "backup-restore <file> [--backup <name|path>] [--latest] [--dry-run]",
+}
+
+
+CAPABILITY_DETAILS: Dict[str, Dict[str, object]] = {
+    "python_docx": {
+        "label": "python-docx",
+        "category": "dependency",
+        "description": "DOCX document creation, reading, editing, formatting, metadata, and preflight support.",
+        "commands": ["doc-*"],
+    },
+    "openpyxl": {
+        "label": "openpyxl",
+        "category": "dependency",
+        "description": "XLSX workbook reading, writing, validation, charts, CSV, and statistics support.",
+        "commands": ["xlsx-*", "chart-*"],
+    },
+    "python_pptx": {
+        "label": "python-pptx",
+        "category": "dependency",
+        "description": "PPTX presentation creation, reading, slide, shape, notes, and media support.",
+        "commands": ["pptx-*"],
+    },
+    "rdflib": {
+        "label": "rdflib",
+        "category": "dependency",
+        "description": "RDF graph parsing, mutation, querying, export, and namespace support.",
+        "commands": ["rdf-create", "rdf-read", "rdf-add", "rdf-remove", "rdf-query", "rdf-export", "rdf-merge", "rdf-stats", "rdf-namespace"],
+    },
+    "pyshacl": {
+        "label": "pyshacl",
+        "category": "dependency",
+        "description": "SHACL validation support for rdf-validate.",
+        "commands": ["rdf-validate"],
+    },
+    "docx_create": {
+        "label": "DOCX create",
+        "category": "DOCUMENTS (.docx)",
+        "requires": ["python_docx"],
+        "commands": ["doc-create"],
+    },
+    "docx_read": {
+        "label": "DOCX read",
+        "category": "DOCUMENTS (.docx)",
+        "requires": ["python_docx"],
+        "commands": ["doc-read", "doc-search", "doc-word-count"],
+    },
+    "docx_edit": {
+        "label": "DOCX edit",
+        "category": "DOCUMENTS (.docx)",
+        "requires": ["python_docx"],
+        "commands": ["doc-append", "doc-replace", "doc-insert", "doc-delete"],
+    },
+    "docx_tables": {
+        "label": "DOCX tables",
+        "category": "DOCUMENTS (.docx)",
+        "requires": ["python_docx"],
+        "commands": ["doc-add-table", "doc-read-tables"],
+    },
+    "docx_formatting": {
+        "label": "DOCX formatting",
+        "category": "DOCUMENTS (.docx)",
+        "requires": ["python_docx"],
+        "commands": ["doc-format", "doc-layout", "doc-formatting-info", "doc-render-audit"],
+    },
+    "docx_references": {
+        "label": "DOCX references",
+        "category": "DOCUMENTS (.docx)",
+        "requires": ["python_docx"],
+        "commands": ["doc-add-reference", "doc-build-references"],
+    },
+    "xlsx_create": {
+        "label": "XLSX create",
+        "category": "SPREADSHEETS (.xlsx)",
+        "requires": ["openpyxl"],
+        "commands": ["xlsx-create", "xlsx-write"],
+    },
+    "xlsx_read": {
+        "label": "XLSX read",
+        "category": "SPREADSHEETS (.xlsx)",
+        "requires": ["openpyxl"],
+        "commands": ["xlsx-read", "xlsx-cell-read", "xlsx-range-read", "xlsx-search"],
+    },
+    "xlsx_edit": {
+        "label": "XLSX edit",
+        "category": "SPREADSHEETS (.xlsx)",
+        "requires": ["openpyxl"],
+        "commands": ["xlsx-cell-write", "xlsx-append", "xlsx-delete-rows", "xlsx-delete-cols", "xlsx-format-cells"],
+    },
+    "xlsx_formulas": {
+        "label": "XLSX formulas",
+        "category": "SPREADSHEETS (.xlsx)",
+        "requires": ["openpyxl"],
+        "commands": ["xlsx-formula", "xlsx-formula-audit", "xlsx-calc"],
+    },
+    "xlsx_charts": {
+        "label": "XLSX charts",
+        "category": "CHARTS (.xlsx)",
+        "requires": ["openpyxl"],
+        "commands": ["chart-create", "chart-comparison", "chart-grade-dist", "chart-progress"],
+    },
+    "xlsx_stats": {
+        "label": "XLSX statistics",
+        "category": "SPREADSHEETS (.xlsx)",
+        "requires": ["openpyxl"],
+        "commands": ["xlsx-freq", "xlsx-corr", "xlsx-ttest", "xlsx-mannwhitney", "xlsx-chi2", "xlsx-research-pack"],
+    },
+    "xlsx_csv": {
+        "label": "XLSX CSV import/export",
+        "category": "SPREADSHEETS (.xlsx)",
+        "requires": ["openpyxl"],
+        "commands": ["xlsx-csv-import", "xlsx-csv-export"],
+    },
+    "pptx_create": {
+        "label": "PPTX create",
+        "category": "PRESENTATIONS (.pptx)",
+        "requires": ["python_pptx"],
+        "commands": ["pptx-create", "pptx-add-slide", "pptx-add-bullets"],
+    },
+    "pptx_read": {
+        "label": "PPTX read",
+        "category": "PRESENTATIONS (.pptx)",
+        "requires": ["python_pptx"],
+        "commands": ["pptx-read", "pptx-slide-count", "pptx-list-shapes"],
+    },
+    "pptx_edit": {
+        "label": "PPTX edit",
+        "category": "PRESENTATIONS (.pptx)",
+        "requires": ["python_pptx"],
+        "commands": ["pptx-update-text", "pptx-delete-slide", "pptx-add-textbox", "pptx-modify-shape"],
+    },
+    "pptx_notes": {
+        "label": "PPTX speaker notes",
+        "category": "PRESENTATIONS (.pptx)",
+        "requires": ["python_pptx"],
+        "commands": ["pptx-speaker-notes"],
+    },
+    "rdf_create": {
+        "label": "RDF create/edit",
+        "category": "RDF (Knowledge Graphs)",
+        "requires": ["rdflib"],
+        "commands": ["rdf-create", "rdf-add", "rdf-remove"],
+    },
+    "rdf_query": {
+        "label": "RDF query",
+        "category": "RDF (Knowledge Graphs)",
+        "requires": ["rdflib"],
+        "commands": ["rdf-read", "rdf-query", "rdf-stats", "rdf-namespace"],
+    },
+    "rdf_validate": {
+        "label": "RDF validate",
+        "category": "RDF (Knowledge Graphs)",
+        "requires": ["pyshacl"],
+        "commands": ["rdf-validate"],
+    },
 }
 
 
@@ -260,6 +422,43 @@ def command_usage(command: str) -> str:
     return f"Usage: {command_signature(command)}"
 
 
+def get_usage_map() -> Dict[str, str]:
+    """Return command names mapped to stable usage strings."""
+    return {
+        command: command_usage(command)
+        for command in sorted(COMMAND_SIGNATURES)
+    }
+
+
+def get_command_metadata() -> Dict[str, Dict[str, object]]:
+    """Return additive command metadata keyed by canonical command name."""
+    commands: Dict[str, Dict[str, object]] = {}
+    for category, signatures in COMMAND_CATEGORIES.items():
+        for raw_signature, description in signatures.items():
+            command = raw_signature.split()[0]
+            commands[command] = {
+                "name": command,
+                "category": category,
+                "signature": command_signature(command),
+                "usage": command_usage(command),
+                "description": description,
+            }
+    return {command: commands[command] for command in sorted(commands)}
+
+
+def build_capability_metadata(
+    capabilities: Dict[str, bool]
+) -> Dict[str, Dict[str, object]]:
+    """Annotate capability booleans with stable dependency/command metadata."""
+    metadata: Dict[str, Dict[str, object]] = {}
+    for name in sorted(capabilities):
+        details = deepcopy(CAPABILITY_DETAILS.get(name, {}))
+        details.setdefault("label", name.replace("_", " "))
+        details["available"] = bool(capabilities[name])
+        metadata[name] = details
+    return metadata
+
+
 def usage_error(command: str) -> Dict[str, str]:
     """Build a standard usage error payload for a command."""
     return {"success": False, "error": command_usage(command)}
@@ -269,10 +468,15 @@ def build_help_payload(capabilities: Dict[str, bool]) -> Dict[str, object]:
     """Build the public help payload from the registry."""
     return {
         "success": True,
+        "schema_version": CLI_SCHEMA_VERSION,
         "version": VERSION,
         "categories": get_command_categories(),
         "capabilities": dict(capabilities),
+        "capability_metadata": build_capability_metadata(capabilities),
         "total_commands": TOTAL_COMMANDS,
+        "command_count": TOTAL_COMMANDS,
         "examples": get_help_examples(),
         "category_counts": dict(CATEGORY_COUNTS),
+        "commands": get_command_metadata(),
+        "usage": get_usage_map(),
     }

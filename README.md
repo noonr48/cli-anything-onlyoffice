@@ -1,8 +1,8 @@
-# CLI-Anything OnlyOffice v4.4.11
+# CLI-Anything OnlyOffice v4.4.15
 
 > Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs — designed for AI agents.
 
-**117 commands. 7 categories. Full JSON output. Production-safe.**
+**119 commands. 7 categories. Full JSON output. Production-safe.**
 
 Part of the [SLOANE OS](https://github.com/sloane-os) agent stack. Agents call this via `cli_anything_run(tool='onlyoffice', ...)`.
 
@@ -18,10 +18,9 @@ python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
 pip install -e .
-# or with optional SHACL validation support
-pip install -e ".[shacl]"
 
 # Verify
+cli-anything-onlyoffice setup-check --json
 cli-anything-onlyoffice status --json
 ```
 
@@ -29,6 +28,7 @@ To re-activate in a future shell session:
 ```bash
 source /path/to/cli-anything-onlyoffice/.venv/bin/activate
 cli-anything-onlyoffice status --json
+cli-anything-onlyoffice setup-check --json
 ```
 
 When calling from SLOANE OS or another agent, invoke via the venv binary directly so you don't depend on the shell's active environment:
@@ -48,7 +48,10 @@ When calling from SLOANE OS or another agent, invoke via the venv binary directl
 | `scipy>=1.11.0` | Statistical tests | Core |
 | `PyMuPDF>=1.24.0` | PDF image extraction + native block/span reading + page rendering | Core |
 | `Pillow>=10.0.0` | Image format conversion | Core |
-| `pyshacl>=0.25.0` | SHACL validation | Optional (`[shacl]`) |
+| `pyshacl>=0.25.0` | SHACL validation | Core |
+
+`pip install -e .` installs all Python dependencies, including `pyshacl`.
+`setup-check --json` is the strict post-clone/post-pull gate: it also verifies external runtime dependencies that pip cannot install, including Docker and the `onlyoffice-documentserver` `x2t` converter.
 
 ---
 
@@ -99,7 +102,7 @@ All responses have `{"success": true, ...}` or `{"success": false, "error": "...
 
 ## Mode 1 — Documents (.docx)
 
-**32 commands** — full lifecycle from creation to APA references, plus image extraction, rendered page preview, submission preflight, and hidden-data sanitization.
+**33 commands** — full lifecycle from creation to APA references, plus image extraction, rendered page preview, submission preflight, rendered layout auditing, and hidden-data sanitization.
 
 `.docx` files are OOXML containers, so generic text file readers will often treat them as binary. For agent use, rely on the semantic document commands below (`doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`) rather than raw file reads.
 
@@ -230,11 +233,13 @@ Highlight matching text runs. Colors: `yellow` (default), `cyan`, `green`, `pink
 cli-anything-onlyoffice doc-highlight /tmp/essay.docx "important term" --color yellow --json
 ```
 
-#### `doc-formatting-info <file>`
-Inspect all paragraph and section formatting details.
+#### `doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]`
+Inspect paragraph and section formatting details. The default response keeps the first 10 paragraphs for compatibility; use `--all`, `--start`, or `--limit` to inspect later sections such as References. Paragraph entries include direct and style-resolved indents, raw `w:ind`, tab stops, line spacing, page-break-before, inline page breaks, and OOXML prefix warnings.
 
 ```bash
 cli-anything-onlyoffice doc-formatting-info /tmp/essay.docx --json
+cli-anything-onlyoffice doc-formatting-info /tmp/essay.docx --start 50 --limit 20 --json
+cli-anything-onlyoffice doc-formatting-info /tmp/essay.docx --all --json
 ```
 
 ---
@@ -308,13 +313,14 @@ cli-anything-onlyoffice doc-extract-images /tmp/essay.docx /tmp/extracted_images
 }
 ```
 
-#### `doc-to-pdf <file> [output_path]`
+#### `doc-to-pdf <file> [output_path] [--layout-warnings] [--profile auto|generic|apa-references]`
 Convert a .docx file to PDF using OnlyOffice DocumentServer's x2t converter (runs inside Docker).
 Requires `onlyoffice-documentserver` container to be running.
 
 ```bash
 cli-anything-onlyoffice doc-to-pdf /tmp/report.docx --json
 cli-anything-onlyoffice doc-to-pdf /tmp/report.docx /tmp/final-submission.pdf --json
+cli-anything-onlyoffice doc-to-pdf /tmp/report.docx /tmp/final-submission.pdf --layout-warnings --profile apa-references --json
 ```
 ```json
 {
@@ -350,6 +356,14 @@ Build a deterministic render map that links DOCX paragraphs and table cells to O
 
 ```bash
 cli-anything-onlyoffice doc-render-map /tmp/report.docx --json
+```
+
+#### `doc-render-audit <file> [--pdf <path>] [--tolerance-points <n>] [--profile auto|generic|apa-references]`
+Convert the DOCX to PDF, or audit an existing converted PDF with `--pdf`, then compare rendered line boxes against DOCX reference layout intent. `auto` uses APA References checks when a References heading exists and generic margin-envelope checks otherwise. Externally supplied PDFs are reported as untrusted for submission-ready claims unless they were produced by this conversion pipeline.
+
+```bash
+cli-anything-onlyoffice doc-render-audit /tmp/report.docx --json
+cli-anything-onlyoffice doc-render-audit /tmp/report.docx --pdf /tmp/report.pdf --profile apa-references --json
 ```
 
 #### `doc-add-hyperlink <file> <text> <url> [--paragraph <index>]`
@@ -398,27 +412,30 @@ cli-anything-onlyoffice doc-get-metadata /tmp/essay.docx --json
 ```
 
 #### `doc-inspect-hidden-data <file>`
-Inspect hidden DOCX data relevant to submission workflows: comments, revision markup, custom XML parts, page size, and core/app metadata.
+Inspect hidden DOCX data relevant to submission workflows: comment parts/references, revision markup, custom XML parts, custom document properties, timestamps, page size, and core/app metadata.
 
 ```bash
 cli-anything-onlyoffice doc-inspect-hidden-data /tmp/submission.docx --json
 ```
 
-#### `doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>]`
-Run a submission-oriented DOCX preflight. This wraps hidden-data inspection, section page-size checks, visible text font audits, and inline-image sizing checks into a single pass/fail/warn report.
+#### `doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--rendered-layout] [--profile auto|generic|apa-references]`
+Run a submission-oriented DOCX preflight. This wraps hidden-data inspection, section page-size checks, OOXML prefix checks, visible text font audits, and inline-image sizing checks into a single pass/fail/warn report. Add `--rendered-layout` when submission readiness depends on the OnlyOffice-rendered PDF honoring margins, page breaks, and reference hanging indents.
 
 ```bash
 cli-anything-onlyoffice doc-preflight /tmp/submission.docx --expected-page-size A4 --json
 cli-anything-onlyoffice doc-preflight /tmp/submission.docx \
   --expected-page-size A4 --expected-font "Times New Roman" --expected-font-size 12 --json
+cli-anything-onlyoffice doc-preflight /tmp/submission.docx \
+  --expected-page-size A4 --expected-font "Times New Roman" --expected-font-size 12 \
+  --rendered-layout --profile apa-references --json
 ```
 
 #### `doc-sanitize <file> [output_path] [options]`
-Sanitize a DOCX for submission. Useful options: `--remove-comments`, `--accept-revisions`, `--clear-metadata`, `--remove-custom-xml`, `--set-remove-personal-information`, and metadata overrides such as `--author`.
+Sanitize a DOCX for submission. Useful options: `--remove-comments`, `--accept-revisions`, `--clear-metadata`, `--remove-custom-xml`, `--set-remove-personal-information`, `--canonicalize-ooxml`, and metadata overrides such as `--author`.
 
 ```bash
 cli-anything-onlyoffice doc-sanitize /tmp/submission.docx /tmp/submission-clean.docx \
-  --remove-comments --accept-revisions --clear-metadata --author benbi --json
+  --remove-comments --accept-revisions --clear-metadata --canonicalize-ooxml --author benbi --json
 ```
 
 #### `doc-comment <file> <comment> [--paragraph <index>]`
@@ -1230,9 +1247,9 @@ cli-anything-onlyoffice pdf-search-blocks /tmp/paper.pdf "Results" --pages 2-3 -
 
 ## Mode 6 — RDF Knowledge Graphs
 
-**10 commands** — full CRUD, SPARQL 1.1, multi-format I/O, optional SHACL validation.
+**10 commands** — full CRUD, SPARQL 1.1, multi-format I/O, and SHACL validation.
 
-Requires: `rdflib>=7.0.0` (included in core). Optional: `pyshacl` for `rdf-validate`.
+Requires: `rdflib>=7.0.0` and `pyshacl>=0.25.0` (included in core).
 
 **Supported formats:** `turtle` (.ttl), `xml` (.rdf), `n3`, `nt`, `json-ld`, `trig`
 
@@ -1298,10 +1315,10 @@ cli-anything-onlyoffice rdf-add /tmp/knowledge.ttl \
   --datatype "http://www.w3.org/2001/XMLSchema#date" --json
 ```
 
-#### `rdf-remove <file> [options]`
-Remove triples matching a pattern. `None` / omitting acts as wildcard.
+#### `rdf-remove <file> (--all | [options])`
+Remove triples matching explicit selectors. Full-graph removal requires `--all`; omitting selectors is rejected to prevent accidental data loss.
 
-Options: `--subject <uri>`, `--predicate <uri>`, `--object <value>`, `--type uri|literal|bnode`, `--lang <tag>`, `--datatype <xsd_uri>`, `--format <f>`
+Options: `--all`, `--dry-run`, `--subject <uri>`, `--predicate <uri>`, `--object <value>`, `--type uri|literal|bnode`, `--lang <tag>`, `--datatype <xsd_uri>`, `--format <f>`
 
 ```bash
 # Remove all triples about Alice
@@ -1318,6 +1335,9 @@ cli-anything-onlyoffice rdf-remove /tmp/knowledge.ttl \
 cli-anything-onlyoffice rdf-remove /tmp/knowledge.ttl \
   --predicate "http://www.w3.org/2000/01/rdf-schema#label" \
   --object "Alice" --type literal --lang en --json
+
+# Preview full graph removal without mutating
+cli-anything-onlyoffice rdf-remove /tmp/knowledge.ttl --all --dry-run --json
 ```
 
 #### `rdf-query <file> <sparql_query> [--limit <n>]`
@@ -1484,8 +1504,17 @@ cli-anything-onlyoffice editor-capture /tmp/report.xlsx /tmp/page0.png \
   --backend rendered --page 0 --json
 ```
 
+#### `setup-check`
+Strict post-clone/post-pull dependency gate. Use this after `git pull` and `pip install -e .`; it exits nonzero if required Python packages or external conversion dependencies are missing.
+
+```bash
+cli-anything-onlyoffice setup-check --json
+```
+
+Aliases: `update-check`, `doctor`.
+
 #### `status`
-Check installation and all capability flags.
+Check installation and all capability flags. `status` is informational and includes an `install_check` summary; use `setup-check` when automation must fail on missing dependencies.
 
 ```bash
 cli-anything-onlyoffice status --json
@@ -1493,7 +1522,7 @@ cli-anything-onlyoffice status --json
 ```json
 {
   "success": true,
-  "version": "4.4.11",
+  "version": "4.4.15",
   "python": "/path/to/.venv/bin/python3",
   "python_docx": true,
   "openpyxl": true,
@@ -1552,14 +1581,14 @@ cli-anything-onlyoffice backup-restore /tmp/grades.xlsx --latest --dry-run --jso
 
 | Category | Count | Commands |
 |----------|-------|----------|
-| Documents (.docx) | 32 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, **doc-render-map**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, **doc-inspect-hidden-data**, **doc-preflight**, **doc-sanitize**, doc-word-count |
+| Documents (.docx) | 33 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, **doc-render-map**, **doc-render-audit**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, **doc-inspect-hidden-data**, **doc-preflight**, **doc-sanitize**, doc-word-count |
 | Spreadsheets (.xlsx) | 39 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export, **xlsx-add-validation**, **xlsx-add-dropdown**, **xlsx-list-validations**, **xlsx-remove-validation**, **xlsx-validate-data**, **xlsx-to-pdf**, **xlsx-preview** |
 | Charts (.xlsx) | 4 | chart-create, chart-comparison, chart-grade-dist, chart-progress |
 | Presentations (.pptx) | 15 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text, **pptx-extract-images**, **pptx-list-shapes**, **pptx-add-textbox**, **pptx-modify-shape**, **pptx-preview** |
 | PDF (.pdf) | 6 | **pdf-extract-images**, **pdf-page-to-image**, **pdf-read-blocks**, **pdf-search-blocks**, **pdf-inspect-hidden-data**, **pdf-sanitize** |
 | RDF Knowledge Graphs | 10 | rdf-create, rdf-read, rdf-add, rdf-remove, rdf-query, rdf-export, rdf-merge, rdf-stats, rdf-namespace, rdf-validate |
-| General | 11 | list, open, watch, info, backup-list, backup-prune, backup-restore, **editor-session**, **editor-capture**, status, help |
-| **Total** | **117** | |
+| General | 12 | list, open, watch, info, backup-list, backup-prune, backup-restore, **editor-session**, **editor-capture**, **setup-check**, status, help |
+| **Total** | **119** | |
 
 ---
 
@@ -1717,7 +1746,7 @@ result = cli_anything_run(tool="onlyoffice", args=[
 
 1. **Always use `--json`** — machine-readable, structured, parseable.
 2. **Check `success` first** — every response has `{"success": true/false}`.
-3. **Run `status --json`** on first run to confirm all capabilities are available. Check the `python` field to verify the venv interpreter is active.
+3. **Run `setup-check --json`** after install or `git pull` to confirm all required Python and external dependencies are available; then use `status --json` for routine capability checks.
 4. **Run `help --json`** to get the full command reference programmatically.
 5. **Backups are automatic** — every write is snapshotted. Use `backup-restore --latest` on error.
 6. **Atomic writes** — no partial file corruption, safe to run concurrently from multiple threads or processes.
@@ -1733,7 +1762,7 @@ result = cli_anything_run(tool="onlyoffice", args=[
 
 ```
 agent-harness/
-├── setup.py                          # Package config (v4.4.11)
+├── setup.py                          # Package config (v4.4.15)
 ├── README.md                         # This file
 ├── cli_anything/
 │   └── onlyoffice/
@@ -1781,6 +1810,10 @@ agent-harness/
 
 | Version | Changes |
 |---------|---------|
+| **4.4.15** | **Install/update dependency gate.** `pyshacl` is now a core install dependency so `rdf-validate` is available after normal `pip install -e .`. Added `setup-check` (`update-check`/`doctor` aliases) as a strict post-clone/post-pull readiness check that validates required Python packages plus Docker/OnlyOffice x2t external conversion dependencies. `status` now includes an `install_check` summary while remaining informational. |
+| **4.4.14** | **Rendered-readiness and safety hardening.** Generic DOCX render audits now perform margin-envelope checks instead of passing on text presence alone, externally supplied PDFs block submission-ready claims unless trusted by the conversion pipeline, DOCX hidden-data inspection/sanitization covers timestamps, custom document properties, and all comment parts, RDF removal requires explicit selectors or `--all`, and PDF/PPTX extraction/rendering now enforce path and resource preflights. |
+| **4.4.13** | **DOCX OOXML canonicalization repair.** Added `doc-sanitize --canonicalize-ooxml` to rewrite legacy `ns0:` WordprocessingML parts back to stable canonical `w:` OOXML so OnlyOffice/x2t can honor DOCX page breaks, margins, and hanging indents without relying on Microsoft Word to repair the package. |
+| **4.4.12** | **Rendered DOCX layout auditing + stable OOXML namespace serialization.** Added `doc-render-audit`, optional `doc-preflight --rendered-layout`, and `doc-to-pdf --layout-warnings` to flag PDF-rendered hanging-indent, margin, horizontal-shift, and References page-break mismatches. Expanded `doc-formatting-info` with `--all/--start/--limit` plus paragraph indent, tab, spacing, and page-break details. DOCX sanitization now preserves canonical `w:` prefixes when rewriting OOXML story/settings parts because OnlyOffice x2t can ignore layout properties in `ns0:`-round-tripped WordprocessingML. |
 | **4.4.11** | **General CLI modularization + direct handler coverage.** Moved alias normalization plus the non-prefixed `open/watch/info/editor-* / backup-* / status / help / list` command layer into `core/general_cli.py`, reducing `core/cli.py` to bootstrap and modality routing. Added dedicated `test_general_cli.py` coverage for alias handling, editor-session parsing, backup pruning, usage errors, and unknown-command fallthrough. |
 | **4.4.10** | **Registry-driven handler usage strings.** Extended `core/command_registry.py` with canonical command-usage lookups and usage overrides, then rewired the DOCX/XLSX/PPTX/PDF/RDF handlers plus general command usage errors to consume the registry instead of embedding raw `Usage:` strings. This removes the last large block of duplicated command-surface text from the handler layer. |
 | **4.4.9** | **Registry-driven command/help surface.** Added `core/command_registry.py` as the single source of truth for command catalogue metadata, help examples, category counts, and total command count. `help` and `status` now consume the registry instead of maintaining separate hardcoded counts/descriptions, and regression coverage now verifies the live CLI surface matches the registry. |

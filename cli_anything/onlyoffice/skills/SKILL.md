@@ -1,19 +1,29 @@
 ---
 name: onlyoffice
-version: 4.4.11
+version: 4.4.15
 author: SLOANE OS
-description: 117-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
+description: 119-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
 tags: [productivity, documents, office, onlyoffice, charts, spreadsheets, rdf, apa, pdf, image-extraction, spatial, data-validation]
 ---
 
-# CLI-Anything OnlyOffice v4.4.11
+# CLI-Anything OnlyOffice v4.4.15
 
 Programmatic control over Office documents designed for AI agents. Full JSON output. Production-safe with atomic writes, two-layer file locking, and automatic backups.
 
-## What's New in v4.4.11
-- **General CLI Split** — alias handling plus the non-prefixed `open/watch/info/editor-* / backup-* / status / help / list` command layer now lives in `core/general_cli.py`, so `core/cli.py` is reduced to bootstrap and modality routing
-- **Direct General-Handler Tests** — added dedicated `test_general_cli.py` coverage for alias normalization, editor-session flag parsing, backup-prune parsing, usage errors, and unknown-command fallthrough
-- **Carry Forward** — the registry-driven help/status surface, registry-driven usage strings, and all earlier modality/backend splits remain in place from `v4.4.10`, `v4.4.9`, `v4.4.8`, `v4.4.7`, `v4.4.6`, `v4.4.5`, `v4.4.4`, `v4.4.3`, `v4.4.2`, and `v4.4.1`
+## What's New in v4.4.15
+- **Install/Update Dependency Gate** — `setup-check` (`update-check`/`doctor` aliases) validates required Python packages plus Docker/OnlyOffice x2t after clone, install, or `git pull`; `pyshacl` is now installed by the core package so `rdf-validate` is not accidentally missing
+
+## Carry Forward from v4.4.14
+- **Rendered Readiness Hardening** — generic DOCX render audits now check margin geometry, untrusted external PDFs block submission-ready claims, and APA References audits handle logical indents, section margins, and page-break edge cases more accurately
+- **Hidden Data and Extraction Safety** — DOCX sanitization covers timestamps, custom document properties, and all comment parts; PDF/PPTX image/render operations enforce path, format, and resource preflights; RDF removal requires selectors or explicit `--all`
+
+## Carry Forward from v4.4.13
+- **DOCX OOXML Canonicalization Repair** — `doc-sanitize --canonicalize-ooxml` rewrites legacy `ns0:` WordprocessingML parts back to canonical `w:` XML so OnlyOffice/x2t can honor DOCX layout without Microsoft Word repair
+
+## Carry Forward from v4.4.12
+- **Rendered DOCX Layout Audit** — added `doc-render-audit`, `doc-preflight --rendered-layout`, and `doc-to-pdf --layout-warnings` to catch PDF-rendered hanging-indent, margin, horizontal-shift, and References page-break mismatches
+- **Deep Formatting Inspection** — `doc-formatting-info` now supports `--all`, `--start`, and `--limit`, and reports paragraph indents, raw `w:ind`, tab stops, line spacing, page-break-before, inline page breaks, and OOXML prefix warnings
+- **Stable OOXML Prefixes** — DOCX sanitization preserves canonical `w:` prefixes when rewriting story/settings parts because OnlyOffice x2t can ignore layout properties in `ns0:`-round-tripped WordprocessingML
 
 ## Carry Forward from v4.1.0
 - **Image Extraction** — pull images out of PDFs, .docx, and .pptx files
@@ -41,6 +51,7 @@ cli_anything_run --app onlyoffice <command> [args] --json
 
 Verify the tool is working:
 ```bash
+cli_anything_run --app onlyoffice setup-check --json
 cli_anything_run --app onlyoffice status --json
 ```
 Check the `python` field in the response — it must point to `.venv/bin/python3`.
@@ -50,7 +61,7 @@ Check the `python` field in the response — it must point to `.venv/bin/python3
 `.docx`, `.xlsx`, and `.pptx` are OOXML containers (zip/XML packages), so generic text Read/Write tools will often fail or report them as binary.
 
 **Do not treat that as a capability gap.** Use this tool's semantic commands instead:
-- DOCX: `doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`, `doc-add-image`, `doc-to-pdf`, `doc-preview`, `doc-render-map`
+- DOCX: `doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`, `doc-add-image`, `doc-to-pdf`, `doc-preview`, `doc-render-map`, `doc-render-audit`
 - XLSX: `xlsx-read`, `xlsx-cell-read`, `xlsx-range-read`, `xlsx-write`, `xlsx-cell-write`, `xlsx-preview`
 - PPTX: `pptx-read`, `pptx-add-slide`, `pptx-update-text`, `pptx-preview`
 
@@ -77,7 +88,7 @@ If you need the rendered visual layout, use preview/export commands rather than 
 
 ---
 
-## DOCUMENTS (.docx) — 32 commands
+## DOCUMENTS (.docx) — 33 commands
 
 ### Core CRUD
 - `doc-create <file> <title> <content>`
@@ -94,7 +105,7 @@ If you need the rendered visual layout, use preview/export commands rather than 
 - `doc-set-style <file> <index> <style>`
 - `doc-list-styles <file>`
 - `doc-highlight <file> <text> [--color yellow|cyan|green|pink]`
-- `doc-formatting-info <file>`
+- `doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]`
 
 ### Page Layout
 - `doc-layout <file> [--size A4|Letter] [--orientation portrait|landscape] [--margin-top <in>] [--margin-bottom <in>] [--margin-left <in>] [--margin-right <in>] [--header <text>] [--page-numbers]`
@@ -114,8 +125,8 @@ If you need the rendered visual layout, use preview/export commands rather than 
 - `doc-set-metadata <file> [--author] [--title] [--subject] [--keywords] [--comments] [--category]`
 - `doc-get-metadata <file>`
 - `doc-inspect-hidden-data <file>`
-- `doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>]`
-- `doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--author <a>]`
+- `doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--rendered-layout] [--profile auto|generic|apa-references]`
+- `doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--canonicalize-ooxml] [--author <a>]`
 - `doc-comment <file> <comment> [--paragraph <index>]`
 
 ### References (APA 7th)
@@ -123,13 +134,14 @@ If you need the rendered visual layout, use preview/export commands rather than 
 - `doc-build-references <file>`
 
 ### Rendered Output
-- `doc-to-pdf <file> [output_path]`
+- `doc-to-pdf <file> [output_path] [--layout-warnings] [--profile auto|generic|apa-references]`
 - `doc-preview <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]`
 - `doc-render-map <file>`
+- `doc-render-audit <file> [--pdf <path>] [--tolerance-points <n>] [--profile auto|generic|apa-references]`
 
 ---
 
-## SPREADSHEETS (.xlsx) — 37 commands
+## SPREADSHEETS (.xlsx) — 39 commands
 
 ### Core CRUD
 - `xlsx-create <file> [sheet_name]`
@@ -206,7 +218,7 @@ Types: bar, column, bar_horizontal, line, pie, scatter
 
 ---
 
-## PRESENTATIONS (.pptx) — 16 commands
+## PRESENTATIONS (.pptx) — 15 commands
 
 ### Core
 - `pptx-create <file> <title> [subtitle]` — 16:9 widescreen by default
@@ -262,7 +274,7 @@ Default DPI: 150. Use 300 for print quality.
 - `rdf-create <file> [--base <uri>] [--format turtle|xml|n3|json-ld] [--prefix <p>=<uri>]`
 - `rdf-read <file> [--limit <n>]`
 - `rdf-add <file> <subject> <predicate> <object> [--type uri|literal|bnode] [--lang <tag>] [--datatype <xsd_uri>]`
-- `rdf-remove <file> [--subject <uri>] [--predicate <uri>] [--object <value>] [--type uri|literal|bnode] [--lang <tag>] [--datatype <xsd_uri>]`
+- `rdf-remove <file> (--all | [--subject <uri>] [--predicate <uri>] [--object <value>]) [--type uri|literal|bnode] [--lang <tag>] [--datatype <xsd_uri>] [--dry-run]`
 - `rdf-query <file> <sparql_query> [--limit <n>]`
 - `rdf-export <file> <output_file> [--format <format>]`
 - `rdf-merge <file_a> <file_b> [--output <file>] [--format <f>]`
@@ -280,6 +292,7 @@ Default DPI: 150. Use 300 for print quality.
 - `info <file>`
 - `editor-session <file> [--open] [--wait <sec>] [--activate]`
 - `editor-capture <file> <output_image> [--backend auto|desktop|rendered] [--page <n>] [--range <A1:D20>] [--slide <n>] [--zoom-reset] [--zoom-in <n>] [--zoom-out <n>] [--crop x,y,w,h]`
+- `setup-check` — Strict post-install/post-pull dependency readiness check
 - `status` — Check installation (includes `python` field showing active interpreter)
 - `help`
 - `backup-list <file> [--limit <n>]`
@@ -292,7 +305,7 @@ Default DPI: 150. Use 300 for print quality.
 
 1. **Always `--json`** — every response is `{"success": true/false, ...}`
 2. **Check `success` first**
-3. **Run `status --json` at session start** — verify `python` field = `.venv/bin/python3`
+3. **Run `setup-check --json` after install or update** — then use `status --json` at session start to verify `python` field = `.venv/bin/python3`
 4. **Never install anything** — tool is fully installed, all deps in venv
 5. **Never use system python3/pip3/pip**
 6. **Backups are automatic** — `backup-restore --latest` on any write error
@@ -301,5 +314,5 @@ Default DPI: 150. Use 300 for print quality.
 
 ---
 
-**Last Updated:** 2026-04-21
-**Version:** 4.4.11
+**Last Updated:** 2026-05-05
+**Version:** 4.4.15

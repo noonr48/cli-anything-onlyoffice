@@ -30,6 +30,13 @@ class OnlyOfficeRDFTests(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(content)
 
+    def _run_cli_json(self, *args: str) -> dict:
+        stdout = io.StringIO()
+        with mock.patch("sys.argv", ["cli-anything-onlyoffice", *args, "--json"]):
+            with redirect_stdout(stdout):
+                cli_module.main()
+        return json.loads(stdout.getvalue())
+
     def test_rdf_create_binds_default_and_custom_prefixes(self):
         path = self._path("graph.ttl")
 
@@ -45,6 +52,17 @@ class OnlyOfficeRDFTests(unittest.TestCase):
         self.assertIn("ex", result["prefixes"])
         self.assertIn("rdf", result["prefixes"])
         self.assertEqual(result["prefixes"]["base"], "http://example.org/base/")
+
+    def test_cli_rdf_create_infers_jsonld_format_from_extension(self):
+        path = self._path("graph.jsonld")
+
+        payload = self._run_cli_json("rdf-create", path)
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["format"], "json-ld")
+        parsed = Graph()
+        parsed.parse(path, format="json-ld")
+        self.assertEqual(len(parsed), 0)
 
     def test_rdf_add_read_and_remove_support_literals(self):
         path = self._path("people.ttl")
@@ -179,6 +197,46 @@ ex:Bob a foaf:Person ;
         self.assertTrue(namespace_list["success"])
         self.assertIn("schema", namespace_list["prefixes"])
 
+    def test_rdf_export_merge_and_namespace_infer_target_format(self):
+        a_path = self._path("a_infer.ttl")
+        b_path = self._path("b_infer.ttl")
+        merged_path = self._path("merged_infer.jsonld")
+        export_path = self._path("export_infer.jsonld")
+
+        self._write_turtle(
+            a_path,
+            "@prefix ex: <http://example.org/> . ex:Alice ex:knows ex:Bob .\n",
+        )
+        self._write_turtle(
+            b_path,
+            "@prefix ex: <http://example.org/> . ex:Bob ex:knows ex:Carol .\n",
+        )
+
+        merged = self.client.rdf_merge(a_path, b_path, output_path=merged_path)
+        self.assertTrue(merged["success"])
+        self.assertEqual(merged["format"], "json-ld")
+        parsed_merged = Graph()
+        parsed_merged.parse(merged_path, format="json-ld")
+        self.assertEqual(len(parsed_merged), 2)
+
+        exported = self.client.rdf_export(a_path, export_path)
+        self.assertTrue(exported["success"])
+        self.assertEqual(exported["format"], "json-ld")
+        parsed_export = Graph()
+        parsed_export.parse(export_path, format="json-ld")
+        self.assertEqual(len(parsed_export), 1)
+
+        namespace_added = self.client.rdf_namespace(
+            export_path,
+            prefix="schema",
+            uri="http://schema.org/",
+        )
+        self.assertTrue(namespace_added["success"])
+        self.assertEqual(namespace_added["format"], "json-ld")
+        parsed_namespaced = Graph()
+        parsed_namespaced.parse(export_path, format="json-ld")
+        self.assertEqual(len(parsed_namespaced), 1)
+
     def test_rdf_stats_reports_types_and_top_predicates(self):
         path = self._path("stats.ttl")
         self._write_turtle(
@@ -308,3 +366,30 @@ ex:Bob a foaf:Person ;
         payload = json.loads(stdout.getvalue())
         self.assertTrue(payload["success"])
         rdf_validate.assert_called_once_with(data_path, shapes_path)
+
+    def test_cli_rdf_handlers_reject_malformed_options(self):
+        path = self._path("strict.ttl")
+        self._write_turtle(path, "@prefix ex: <http://example.org/> . ex:A ex:p ex:B .\n")
+
+        missing = self._run_cli_json("rdf-read", path, "--limit")
+        self.assertFalse(missing["success"])
+        self.assertEqual(missing["error_code"], "usage_error")
+        self.assertIn("--limit requires a value", missing["error"])
+
+        unknown = self._run_cli_json("rdf-export", path, self._path("strict.jsonld"), "--bogus")
+        self.assertFalse(unknown["success"])
+        self.assertEqual(unknown["error_code"], "usage_error")
+        self.assertIn("unknown option", unknown["error"])
+
+        bad_type = self._run_cli_json(
+            "rdf-add",
+            path,
+            "http://example.org/A",
+            "http://example.org/p",
+            "value",
+            "--type",
+            "plain",
+        )
+        self.assertFalse(bad_type["success"])
+        self.assertEqual(bad_type["error_code"], "usage_error")
+        self.assertIn("--type must be one of", bad_type["error"])

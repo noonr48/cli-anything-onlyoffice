@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import glob
+import importlib.metadata
+import importlib.util
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -13,11 +17,15 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from cli_anything.onlyoffice.core.command_registry import (
+    CATEGORY_COUNTS,
+    CLI_SCHEMA_VERSION,
     TOTAL_COMMANDS,
     VERSION,
+    build_capability_metadata,
     build_help_payload,
     command_usage,
 )
+from cli_anything.onlyoffice.core.parse_utils import parse_float, parse_int
 
 
 OPEN_COMPATIBILITY_NAMESPACES = {
@@ -34,6 +42,309 @@ OPEN_COMPATIBILITY_NAMESPACES = {
     "file",
     "office",
 }
+
+ONLYOFFICE_DOCKER_CONTAINER = "onlyoffice-documentserver"
+ONLYOFFICE_X2T_PATH = (
+    "/var/www/onlyoffice/documentserver/server/FileConverter/bin/x2t"
+)
+
+PYTHON_REQUIREMENTS = [
+    {
+        "key": "python_docx",
+        "package": "python-docx",
+        "import_name": "docx",
+        "minimum_version": "1.1.0",
+        "purpose": "DOCX create/read/edit/format/preflight support",
+    },
+    {
+        "key": "openpyxl",
+        "package": "openpyxl",
+        "import_name": "openpyxl",
+        "minimum_version": "3.1.2",
+        "purpose": "XLSX workbook, chart, CSV, and validation support",
+    },
+    {
+        "key": "python_pptx",
+        "package": "python-pptx",
+        "import_name": "pptx",
+        "minimum_version": "0.6.23",
+        "purpose": "PPTX creation, editing, shape, notes, and media support",
+    },
+    {
+        "key": "requests",
+        "package": "requests",
+        "import_name": "requests",
+        "minimum_version": "2.31.0",
+        "purpose": "DocumentServer HTTP client support",
+    },
+    {
+        "key": "scipy",
+        "package": "scipy",
+        "import_name": "scipy",
+        "minimum_version": "1.11.0",
+        "purpose": "Spreadsheet statistical tests",
+    },
+    {
+        "key": "rdflib",
+        "package": "rdflib",
+        "import_name": "rdflib",
+        "minimum_version": "7.0.0",
+        "purpose": "RDF graph parsing, querying, and serialization",
+    },
+    {
+        "key": "lxml",
+        "package": "lxml",
+        "import_name": "lxml",
+        "minimum_version": "4.9.0",
+        "purpose": "OOXML/XML support",
+    },
+    {
+        "key": "pymupdf",
+        "package": "PyMuPDF",
+        "import_name": "fitz",
+        "minimum_version": "1.24.0",
+        "purpose": "PDF native block reading, image extraction, and rendering",
+    },
+    {
+        "key": "pillow",
+        "package": "Pillow",
+        "import_name": "PIL",
+        "minimum_version": "10.0.0",
+        "purpose": "Image decoding and format conversion",
+    },
+    {
+        "key": "pyshacl",
+        "package": "pyshacl",
+        "import_name": "pyshacl",
+        "minimum_version": "0.25.0",
+        "purpose": "SHACL validation for rdf-validate",
+    },
+]
+
+
+def _version_tuple(value: object) -> Tuple[int, ...]:
+    parts = re.findall(r"\d+", str(value or ""))
+    if not parts:
+        return ()
+    return tuple(int(part) for part in parts[:4])
+
+
+def _version_ok(installed: Optional[str], minimum: Optional[str]) -> bool:
+    if not installed or not minimum:
+        return bool(installed)
+    installed_tuple = _version_tuple(installed)
+    minimum_tuple = _version_tuple(minimum)
+    if not installed_tuple or not minimum_tuple:
+        return True
+    width = max(len(installed_tuple), len(minimum_tuple))
+    return installed_tuple + (0,) * (width - len(installed_tuple)) >= minimum_tuple + (
+        0,
+    ) * (width - len(minimum_tuple))
+
+
+def detect_python_requirements(
+    *,
+    requirements: Optional[List[Dict[str, str]]] = None,
+    find_spec: Callable[[str], object] = importlib.util.find_spec,
+    version_lookup: Callable[[str], str] = importlib.metadata.version,
+) -> List[Dict[str, object]]:
+    """Return install-time status for required Python distributions."""
+    results = []
+    for req in requirements or PYTHON_REQUIREMENTS:
+        import_name = req["import_name"]
+        package = req["package"]
+        available = find_spec(import_name) is not None
+        installed_version = None
+        version_error = None
+        try:
+            installed_version = version_lookup(package)
+        except importlib.metadata.PackageNotFoundError:
+            if available:
+                installed_version = None
+        except Exception as exc:
+            version_error = str(exc)
+        minimum = req.get("minimum_version")
+        version_satisfied = bool(available and _version_ok(installed_version, minimum))
+        status = "pass" if available and version_satisfied else "fail"
+        entry = {
+            "key": req["key"],
+            "package": package,
+            "import_name": import_name,
+            "required": True,
+            "available": available,
+            "installed_version": installed_version,
+            "minimum_version": minimum,
+            "version_satisfied": version_satisfied,
+            "status": status,
+            "purpose": req.get("purpose", ""),
+            "install_requirement": f"{package}>={minimum}" if minimum else package,
+        }
+        if version_error:
+            entry["version_error"] = version_error
+        results.append(entry)
+    return results
+
+
+def build_installation_check(
+    *,
+    doc_server=None,
+    docx_available: bool,
+    openpyxl_available: bool,
+    pptx_available: bool,
+    conversion_detector: Optional[Callable[[], Dict[str, object]]] = None,
+    python_detector: Callable[[], List[Dict[str, object]]] = detect_python_requirements,
+) -> Dict[str, object]:
+    """Build a strict post-clone/post-pull install readiness report."""
+    if conversion_detector is None:
+        conversion_detector = detect_conversion_capability
+    python_dependencies = python_detector()
+    conversion = conversion_detector()
+    docker_info = conversion.get("docker", {})
+    x2t_info = conversion.get("x2t", {})
+    external_dependencies = [
+        {
+            "key": "docker",
+            "label": "Docker CLI",
+            "required": True,
+            "available": bool(docker_info.get("available")),
+            "path": docker_info.get("path"),
+            "status": "pass" if docker_info.get("available") else "fail",
+            "purpose": "Runs the OnlyOffice DocumentServer conversion probe.",
+            "install_hint": "Install Docker and ensure the current user can run docker commands.",
+        },
+        {
+            "key": "onlyoffice_x2t",
+            "label": "OnlyOffice DocumentServer x2t",
+            "required": True,
+            "available": x2t_info.get("available") is True,
+            "container": x2t_info.get("container"),
+            "path": x2t_info.get("path"),
+            "checked": x2t_info.get("checked"),
+            "status": "pass" if x2t_info.get("available") is True else "fail",
+            "purpose": "Converts Office documents to PDF/images for render-aware audits.",
+            "install_hint": "Start the onlyoffice-documentserver container with x2t available.",
+        },
+    ]
+    missing_python = [
+        item["install_requirement"]
+        for item in python_dependencies
+        if not item.get("available")
+    ]
+    outdated_python = [
+        item["install_requirement"]
+        for item in python_dependencies
+        if item.get("available") and not item.get("version_satisfied")
+    ]
+    missing_external = [
+        item["key"] for item in external_dependencies if not item.get("available")
+    ]
+    python_ok = not missing_python and not outdated_python
+    external_ok = not missing_external
+    install_ready = bool(python_ok and external_ok and doc_server is not None)
+    install_hints = []
+    if missing_python or outdated_python:
+        install_hints.append(
+            "Run the project venv interpreter and reinstall after pulling: "
+            "python -m pip install -e ."
+        )
+    if "docker" in missing_external:
+        install_hints.append("Install Docker and confirm `docker ps` works for this user.")
+    if "onlyoffice_x2t" in missing_external:
+        install_hints.append(
+            "Start or reinstall the onlyoffice-documentserver container so x2t exists."
+        )
+    if doc_server is None:
+        install_hints.append("OnlyOffice client failed to initialize; inspect earlier import errors.")
+
+    return {
+        "success": install_ready,
+        "schema_version": CLI_SCHEMA_VERSION,
+        "version": VERSION,
+        "python": sys.executable,
+        "mode": "setup-check",
+        "install_ready": install_ready,
+        "python_dependencies_ok": python_ok,
+        "external_dependencies_ok": external_ok,
+        "client_available": doc_server is not None,
+        "runtime_import_flags": {
+            "python_docx": docx_available,
+            "openpyxl": openpyxl_available,
+            "python_pptx": pptx_available,
+        },
+        "python_dependencies": python_dependencies,
+        "external_dependencies": external_dependencies,
+        "conversion": conversion,
+        "missing_python": missing_python,
+        "outdated_python": outdated_python,
+        "missing_external": missing_external,
+        "install_hints": install_hints,
+    }
+
+
+def detect_conversion_capability(
+    *,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    timeout: float = 2.0,
+) -> Dict[str, object]:
+    """Return structured, failure-tolerant Docker/x2t conversion status."""
+    docker_path = which("docker")
+    status: Dict[str, object] = {
+        "available": False,
+        "docker": {
+            "available": bool(docker_path),
+            "path": docker_path,
+        },
+        "x2t": {
+            "available": None,
+            "container": ONLYOFFICE_DOCKER_CONTAINER,
+            "path": ONLYOFFICE_X2T_PATH,
+            "checked": False,
+        },
+    }
+    if not docker_path:
+        status["x2t"]["error"] = "docker executable not found"
+        return status
+
+    try:
+        result = run(
+            [
+                docker_path,
+                "exec",
+                ONLYOFFICE_DOCKER_CONTAINER,
+                "test",
+                "-x",
+                ONLYOFFICE_X2T_PATH,
+            ],
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        status["x2t"].update({"available": False, "checked": True, "error": "probe timed out"})
+        return status
+    except Exception as exc:
+        status["x2t"].update({"available": False, "checked": True, "error": str(exc)})
+        return status
+
+    x2t_available = result.returncode == 0
+    status["x2t"].update(
+        {
+            "available": x2t_available,
+            "checked": True,
+            "exit_code": result.returncode,
+        }
+    )
+    if not x2t_available:
+        stderr_raw = result.stderr or b""
+        stderr = (
+            stderr_raw.decode("utf-8", errors="replace")
+            if isinstance(stderr_raw, bytes)
+            else str(stderr_raw)
+        ).strip()
+        if stderr:
+            status["x2t"]["error"] = stderr
+    status["available"] = x2t_available
+    return status
 
 
 def detect_onlyoffice_file_type(file_path: str) -> str:
@@ -380,7 +691,7 @@ def cmd_backup_list(
     if not doc_server:
         print_result({"success": False, "error": "Client not available"}, json_output)
         return
-    result = doc_server.list_backups(file_path, limit=int(limit))
+    result = doc_server.list_backups(file_path, limit=parse_int(limit, "--limit"))
     print_result(result, json_output)
 
 
@@ -399,8 +710,8 @@ def cmd_backup_prune(
         return
     result = doc_server.prune_backups(
         file_path=file_path,
-        keep=int(keep),
-        older_than_days=int(days) if days is not None else None,
+        keep=parse_int(keep, "--keep"),
+        older_than_days=parse_int(days, "--days") if days is not None else None,
     )
     print_result(result, json_output)
 
@@ -454,6 +765,26 @@ def cmd_status(
     except ImportError:
         shacl_available = False
 
+    conversion = detect_conversion_capability()
+    conversion_available = bool(conversion.get("available"))
+    docker_info = conversion.get("docker", {})
+    x2t_info = conversion.get("x2t", {})
+    dependencies = {
+        "python_docx": docx_available,
+        "openpyxl": openpyxl_available,
+        "python_pptx": pptx_available,
+        "rdflib": rdflib_available,
+        "pyshacl": shacl_available,
+        "docker": bool(docker_info.get("available")),
+        "onlyoffice_x2t": x2t_info.get("available") is True,
+    }
+    install_check = build_installation_check(
+        doc_server=doc_server,
+        docx_available=docx_available,
+        openpyxl_available=openpyxl_available,
+        pptx_available=pptx_available,
+        conversion_detector=lambda: conversion,
+    )
     capabilities = {
         "docx_create": docx_available,
         "docx_read": docx_available,
@@ -475,14 +806,25 @@ def cmd_status(
         "rdf_create": rdflib_available,
         "rdf_query": rdflib_available,
         "rdf_validate": shacl_available,
+        "office_to_pdf": conversion_available,
+        "docx_to_pdf": docx_available and conversion_available,
+        "xlsx_to_pdf": openpyxl_available and conversion_available,
+        "pptx_to_pdf": pptx_available and conversion_available,
     }
     print_result(
         {
             "success": True,
+            "schema_version": CLI_SCHEMA_VERSION,
             "version": VERSION,
             "python": sys.executable,
             "document_server": {
                 "healthy": doc_server.check_health() if doc_server else False
+            },
+            "registry": {
+                "version": VERSION,
+                "schema_version": CLI_SCHEMA_VERSION,
+                "total_commands": TOTAL_COMMANDS,
+                "category_counts": dict(CATEGORY_COUNTS),
             },
             "python_docx": docx_available,
             "openpyxl": openpyxl_available,
@@ -490,9 +832,47 @@ def cmd_status(
             "rdflib": rdflib_available,
             "rdflib_version": rdflib_version,
             "pyshacl": shacl_available,
+            "conversion": conversion,
+            "dependencies": dependencies,
+            "install_check": {
+                "install_ready": install_check["install_ready"],
+                "python_dependencies_ok": install_check["python_dependencies_ok"],
+                "external_dependencies_ok": install_check["external_dependencies_ok"],
+                "client_available": install_check["client_available"],
+                "missing_python": install_check["missing_python"],
+                "outdated_python": install_check["outdated_python"],
+                "missing_external": install_check["missing_external"],
+                "install_hints": install_check["install_hints"],
+            },
             "capabilities": capabilities,
+            "capability_metadata": build_capability_metadata(
+                {**dependencies, **capabilities}
+            ),
             "total_commands": TOTAL_COMMANDS,
+            "command_count": TOTAL_COMMANDS,
+            "category_counts": dict(CATEGORY_COUNTS),
         },
+        json_output,
+    )
+
+
+def cmd_setup_check(
+    *,
+    json_output: bool,
+    print_result: Callable[[dict, bool], None],
+    doc_server,
+    docx_available: bool,
+    openpyxl_available: bool,
+    pptx_available: bool,
+) -> None:
+    """Strict install/update readiness check for freshly cloned or pulled checkouts."""
+    print_result(
+        build_installation_check(
+            doc_server=doc_server,
+            docx_available=docx_available,
+            openpyxl_available=openpyxl_available,
+            pptx_available=pptx_available,
+        ),
         json_output,
     )
 
@@ -603,7 +983,7 @@ def handle_general_command(
                     open_if_needed = True
                     i += 1
                 elif raw_args[i] == "--wait" and i + 1 < len(raw_args):
-                    wait_seconds = float(raw_args[i + 1])
+                    wait_seconds = parse_float(raw_args[i + 1], "--wait")
                     i += 2
                 elif raw_args[i] == "--activate":
                     activate = True
@@ -650,34 +1030,34 @@ def handle_general_command(
                     open_if_needed = True
                     i += 1
                 elif raw_args[i] == "--page" and i + 1 < len(raw_args):
-                    page = int(raw_args[i + 1])
+                    page = parse_int(raw_args[i + 1], "--page")
                     i += 2
                 elif raw_args[i] == "--range" and i + 1 < len(raw_args):
                     cell_range = raw_args[i + 1]
                     i += 2
                 elif raw_args[i] == "--slide" and i + 1 < len(raw_args):
-                    slide = int(raw_args[i + 1])
+                    slide = parse_int(raw_args[i + 1], "--slide")
                     i += 2
                 elif raw_args[i] == "--zoom-reset":
                     zoom_reset = True
                     i += 1
                 elif raw_args[i] == "--zoom-in" and i + 1 < len(raw_args):
-                    zoom_in_steps = int(raw_args[i + 1])
+                    zoom_in_steps = parse_int(raw_args[i + 1], "--zoom-in")
                     i += 2
                 elif raw_args[i] == "--zoom-out" and i + 1 < len(raw_args):
-                    zoom_out_steps = int(raw_args[i + 1])
+                    zoom_out_steps = parse_int(raw_args[i + 1], "--zoom-out")
                     i += 2
                 elif raw_args[i] == "--crop" and i + 1 < len(raw_args):
                     crop = raw_args[i + 1]
                     i += 2
                 elif raw_args[i] == "--settle-ms" and i + 1 < len(raw_args):
-                    settle_ms = int(raw_args[i + 1])
+                    settle_ms = parse_int(raw_args[i + 1], "--settle-ms")
                     i += 2
                 elif raw_args[i] == "--wait" and i + 1 < len(raw_args):
-                    wait_seconds = float(raw_args[i + 1])
+                    wait_seconds = parse_float(raw_args[i + 1], "--wait")
                     i += 2
                 elif raw_args[i] == "--dpi" and i + 1 < len(raw_args):
-                    dpi = int(raw_args[i + 1])
+                    dpi = parse_int(raw_args[i + 1], "--dpi")
                     i += 2
                 elif raw_args[i] == "--format" and i + 1 < len(raw_args):
                     fmt = raw_args[i + 1]
@@ -718,7 +1098,7 @@ def handle_general_command(
             i = 0
             while i < len(raw_args):
                 if raw_args[i] == "--limit" and i + 1 < len(raw_args):
-                    limit = int(raw_args[i + 1])
+                    limit = parse_int(raw_args[i + 1], "--limit")
                     i += 2
                 elif not raw_args[i].startswith("--") and file_path is None:
                     file_path = raw_args[i]
@@ -750,10 +1130,10 @@ def handle_general_command(
                 file_path = raw_args[i + 1]
                 i += 2
             elif raw_args[i] == "--keep" and i + 1 < len(raw_args):
-                keep = int(raw_args[i + 1])
+                keep = parse_int(raw_args[i + 1], "--keep")
                 i += 2
             elif raw_args[i] == "--days" and i + 1 < len(raw_args):
-                days = int(raw_args[i + 1])
+                days = parse_int(raw_args[i + 1], "--days")
                 i += 2
             elif not raw_args[i].startswith("--") and file_path is None:
                 file_path = raw_args[i]
@@ -803,6 +1183,17 @@ def handle_general_command(
                 print_result=print_result,
                 doc_server=doc_server,
             )
+        return True
+
+    if command in {"setup-check", "update-check", "doctor"}:
+        cmd_setup_check(
+            json_output=json_output,
+            print_result=print_result,
+            doc_server=doc_server,
+            docx_available=docx_available,
+            openpyxl_available=openpyxl_available,
+            pptx_available=pptx_available,
+        )
         return True
 
     if command == "status":

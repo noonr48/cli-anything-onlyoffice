@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -194,3 +195,127 @@ class OnlyOfficeGeneralCLITests(unittest.TestCase):
             latest=True,
             dry_run=True,
         )
+
+    def test_detect_conversion_capability_reports_docker_and_x2t(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+        result = general_cli.detect_conversion_capability(
+            which=lambda name: "/usr/bin/docker" if name == "docker" else None,
+            run=fake_run,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["docker"]["available"])
+        self.assertEqual(result["docker"]["path"], "/usr/bin/docker")
+        self.assertTrue(result["x2t"]["available"])
+        self.assertEqual(result["x2t"]["container"], "onlyoffice-documentserver")
+        self.assertEqual(calls[0][0][0], "/usr/bin/docker")
+
+    def test_cmd_status_includes_conversion_metadata(self):
+        printed = []
+        doc_server = mock.Mock()
+        doc_server.check_health.return_value = False
+        conversion = {
+            "available": True,
+            "docker": {"available": True, "path": "/usr/bin/docker"},
+            "x2t": {
+                "available": True,
+                "container": "onlyoffice-documentserver",
+                "path": general_cli.ONLYOFFICE_X2T_PATH,
+                "checked": True,
+            },
+        }
+
+        with mock.patch.object(
+            general_cli, "detect_conversion_capability", return_value=conversion
+        ):
+            general_cli.cmd_status(
+                json_output=True,
+                print_result=lambda payload, json_output: printed.append((payload, json_output)),
+                doc_server=doc_server,
+                docx_available=True,
+                openpyxl_available=True,
+                pptx_available=True,
+            )
+
+        payload, json_output = printed[0]
+        self.assertTrue(json_output)
+        self.assertEqual(payload["conversion"], conversion)
+        self.assertTrue(payload["dependencies"]["docker"])
+        self.assertTrue(payload["dependencies"]["onlyoffice_x2t"])
+        self.assertIn("install_check", payload)
+        self.assertTrue(payload["install_check"]["external_dependencies_ok"])
+        self.assertTrue(payload["capabilities"]["office_to_pdf"])
+        self.assertTrue(payload["capabilities"]["docx_to_pdf"])
+
+    def test_build_installation_check_reports_missing_required_dependencies(self):
+        conversion = {
+            "available": False,
+            "docker": {"available": False, "path": None},
+            "x2t": {
+                "available": False,
+                "container": general_cli.ONLYOFFICE_DOCKER_CONTAINER,
+                "path": general_cli.ONLYOFFICE_X2T_PATH,
+                "checked": False,
+            },
+        }
+        python_dependencies = [
+            {
+                "key": "pyshacl",
+                "package": "pyshacl",
+                "import_name": "pyshacl",
+                "required": True,
+                "available": False,
+                "installed_version": None,
+                "minimum_version": "0.25.0",
+                "version_satisfied": False,
+                "status": "fail",
+                "install_requirement": "pyshacl>=0.25.0",
+            }
+        ]
+
+        payload = general_cli.build_installation_check(
+            doc_server=mock.Mock(),
+            docx_available=True,
+            openpyxl_available=True,
+            pptx_available=True,
+            conversion_detector=lambda: conversion,
+            python_detector=lambda: python_dependencies,
+        )
+
+        self.assertFalse(payload["success"])
+        self.assertFalse(payload["install_ready"])
+        self.assertEqual(payload["missing_python"], ["pyshacl>=0.25.0"])
+        self.assertIn("docker", payload["missing_external"])
+        self.assertIn("onlyoffice_x2t", payload["missing_external"])
+        self.assertGreaterEqual(len(payload["install_hints"]), 2)
+
+    def test_cmd_setup_check_uses_strict_installation_report(self):
+        printed = []
+        expected = {
+            "success": True,
+            "install_ready": True,
+            "python_dependencies_ok": True,
+            "external_dependencies_ok": True,
+        }
+
+        with mock.patch.object(
+            general_cli,
+            "build_installation_check",
+            return_value=expected,
+        ) as build_check:
+            general_cli.cmd_setup_check(
+                json_output=True,
+                print_result=lambda payload, json_output: printed.append((payload, json_output)),
+                doc_server=mock.Mock(),
+                docx_available=True,
+                openpyxl_available=True,
+                pptx_available=True,
+            )
+
+        self.assertEqual(printed, [(expected, True)])
+        build_check.assert_called_once()

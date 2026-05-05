@@ -1,3 +1,4 @@
+import csv
 import os
 import tempfile
 import unittest
@@ -66,6 +67,137 @@ class OnlyOfficeXLSXOpsTests(unittest.TestCase):
         self.assertIn("XLOOKUP", result["unsupported_functions"])
         self.assertFalse(result["safe_for_cli_formula_eval"])
         self.assertGreaterEqual(len(result["risks"]), 1)
+
+    def test_xlsx_ops_write_neutralizes_formula_like_text_and_resolves_text_columns(self):
+        path = self._path("neutralized_write.xlsx")
+
+        result = self.ops.write_spreadsheet(
+            path,
+            ["ID", "Value", "Comment"],
+            [["00123", "=1+1", "+cmd"], ["00045", "42", "-cmd"]],
+            sheet_name="Data",
+            overwrite_workbook=True,
+            text_columns=["ID", "C"],
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["text_columns"], [1, 3])
+        self.assertEqual(result["neutralized_cells"], 3)
+
+        wb = load_workbook(path, data_only=False)
+        ws = wb["Data"]
+        self.assertEqual(ws["A2"].value, "00123")
+        self.assertEqual(ws["B2"].value, "'=1+1")
+        self.assertEqual(ws["B2"].data_type, "s")
+        self.assertEqual(ws["B3"].value, 42)
+        self.assertEqual(ws["C2"].value, "'+cmd")
+        self.assertEqual(ws["C3"].value, "'-cmd")
+        wb.close()
+
+        audit = self.ops.audit_spreadsheet_formulas(path, sheet_name="Data")
+        self.assertTrue(audit["success"])
+        self.assertEqual(audit["formula_count"], 0)
+
+        formula_result = self.ops.add_formula(path, "B4", "=SUM(B3:B3)", sheet_name="Data")
+        self.assertTrue(formula_result["success"])
+        audit = self.ops.audit_spreadsheet_formulas(path, sheet_name="Data")
+        self.assertTrue(audit["success"])
+        self.assertEqual(audit["formula_count"], 1)
+
+    def test_xlsx_ops_append_and_cell_write_neutralize_formula_like_text(self):
+        path = self._path("neutralized_cells.xlsx")
+        self.ops.create_spreadsheet(path, sheet_name="Data")
+
+        append = self.ops.append_to_spreadsheet(
+            path, ["=1+1", "@cmd", "-cmd"], sheet_name="Data"
+        )
+        cell = self.ops.cell_write(path, "D1", "=2+2", sheet_name="Data")
+
+        self.assertTrue(append["success"])
+        self.assertEqual(append["neutralized_cells"], 3)
+        self.assertTrue(cell["success"])
+        self.assertTrue(cell["neutralized"])
+
+        wb = load_workbook(path, data_only=False)
+        ws = wb["Data"]
+        self.assertEqual(ws["A2"].value, "'=1+1")
+        self.assertEqual(ws["B2"].value, "'@cmd")
+        self.assertEqual(ws["C2"].value, "'-cmd")
+        self.assertEqual(ws["D1"].value, "'=2+2")
+        self.assertEqual(ws["D1"].data_type, "s")
+        wb.close()
+
+    def test_xlsx_ops_csv_import_export_neutralizes_and_export_uses_locks(self):
+        path = self._path("csv_safe.xlsx")
+        csv_input = self._path("unsafe.csv")
+        csv_output = self._path("safe.csv")
+        with open(csv_input, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["ID", "FormulaLike", "AtSign"])
+            writer.writerow(["00123", "=1+1", "@cmd"])
+            writer.writerow(["00045", "+cmd", "-cmd"])
+
+        imported = self.ops.csv_import(
+            path, csv_input, sheet_name="Data", text_columns=["A"]
+        )
+        self.assertTrue(imported["success"])
+        self.assertEqual(imported["text_columns"], [1])
+        self.assertEqual(imported["neutralized_cells"], 4)
+        self.ops.add_formula(path, "D2", "=SUM(A2:A3)", sheet_name="Data")
+
+        with mock.patch.object(
+            self.client, "_file_locks", wraps=self.client._file_locks
+        ) as file_locks:
+            exported = self.ops.csv_export(path, csv_output, sheet_name="Data")
+
+        self.assertTrue(exported["success"])
+        self.assertGreaterEqual(exported["neutralized_cells"], 1)
+        file_locks.assert_called_once_with(path, csv_output)
+
+        wb = load_workbook(path, data_only=False)
+        ws = wb["Data"]
+        self.assertEqual(ws["A2"].value, "00123")
+        self.assertEqual(ws["B2"].value, "'=1+1")
+        self.assertEqual(ws["C2"].value, "'@cmd")
+        self.assertEqual(ws["B3"].value, "'+cmd")
+        self.assertEqual(ws["C3"].value, "'-cmd")
+        wb.close()
+
+        with open(csv_output, newline="", encoding="utf-8") as handle:
+            rows = list(csv.reader(handle))
+        self.assertEqual(rows[1][1], "'=1+1")
+        self.assertEqual(rows[1][3], "'=SUM(A2:A3)")
+
+    def test_xlsx_ops_csv_export_rejects_source_workbook_path(self):
+        path = self._path("same_path.xlsx")
+        result = self.ops.write_spreadsheet(
+            path,
+            ["A"],
+            [[1]],
+            sheet_name="Data",
+            overwrite_workbook=True,
+        )
+        self.assertTrue(result["success"])
+
+        exported = self.ops.csv_export(path, path, sheet_name="Data")
+
+        self.assertFalse(exported["success"])
+        self.assertEqual(exported["error_code"], "source_output_same_path")
+        wb = load_workbook(path)
+        self.assertEqual(wb["Data"]["A2"].value, 1)
+        wb.close()
+
+    def test_xlsx_ops_missing_requested_sheet_fails_for_search_and_formula_audit(self):
+        path = self._path("missing_sheet.xlsx")
+        self.ops.create_spreadsheet(path, sheet_name="Data")
+
+        search = self.ops.search_spreadsheet(path, "anything", sheet_name="Missing")
+        audit = self.ops.audit_spreadsheet_formulas(path, sheet_name="Missing")
+
+        self.assertFalse(search["success"])
+        self.assertIn("Sheet 'Missing' not found", search["error"])
+        self.assertFalse(audit["success"])
+        self.assertIn("Sheet 'Missing' not found", audit["error"])
 
     def test_xlsx_ops_preview_uses_host_spreadsheet_pdf_pipeline(self):
         path = self._path("preview.xlsx")
