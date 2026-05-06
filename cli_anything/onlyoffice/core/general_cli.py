@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -191,6 +192,7 @@ def build_installation_check(
     docx_available: bool,
     openpyxl_available: bool,
     pptx_available: bool,
+    live_smoke: bool = False,
     conversion_detector: Optional[Callable[[], Dict[str, object]]] = None,
     python_detector: Callable[[], List[Dict[str, object]]] = detect_python_requirements,
 ) -> Dict[str, object]:
@@ -241,6 +243,14 @@ def build_installation_check(
     python_ok = not missing_python and not outdated_python
     external_ok = not missing_external
     install_ready = bool(python_ok and external_ok and doc_server is not None)
+    live_smoke_result = None
+    if live_smoke:
+        live_smoke_result = run_live_docx_pdf_smoke(doc_server) if install_ready else {
+            "success": False,
+            "skipped": True,
+            "reason": "Base dependency checks did not pass.",
+        }
+        install_ready = install_ready and bool(live_smoke_result.get("success"))
     install_hints = []
     if missing_python or outdated_python:
         install_hints.append(
@@ -263,6 +273,8 @@ def build_installation_check(
         "python": sys.executable,
         "mode": "setup-check",
         "install_ready": install_ready,
+        "live_smoke_requested": live_smoke,
+        "live_smoke": live_smoke_result,
         "python_dependencies_ok": python_ok,
         "external_dependencies_ok": external_ok,
         "client_available": doc_server is not None,
@@ -279,6 +291,82 @@ def build_installation_check(
         "missing_external": missing_external,
         "install_hints": install_hints,
     }
+
+
+def run_live_docx_pdf_smoke(doc_server) -> Dict[str, object]:
+    """Run an optional real DOCX->PDF smoke through the installed converter."""
+    if doc_server is None:
+        return {"success": False, "error": "OnlyOffice client is unavailable."}
+    try:
+        from docx import Document
+        from docx.shared import Pt
+    except Exception as exc:
+        return {"success": False, "error": f"python-docx unavailable for smoke test: {exc}"}
+
+    sentinel = "ONLYOFFICE_LIVE_SMOKE_SENTINEL"
+    try:
+        with tempfile.TemporaryDirectory(prefix="onlyoffice-live-smoke-") as tmpdir:
+            docx_path = os.path.join(tmpdir, "smoke.docx")
+            pdf_path = os.path.join(tmpdir, "smoke.pdf")
+            doc = Document()
+            paragraph = doc.add_paragraph()
+            run = paragraph.add_run(sentinel)
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
+            doc.save(docx_path)
+
+            conversion = doc_server.doc_to_pdf(docx_path, output_path=pdf_path)
+            pdf_exists = os.path.exists(pdf_path)
+            pdf_header_ok = False
+            if pdf_exists:
+                with open(pdf_path, "rb") as handle:
+                    pdf_header_ok = handle.read(5) == b"%PDF-"
+            blocks = (
+                doc_server.pdf_read_blocks(
+                    pdf_path,
+                    include_spans=True,
+                    include_images=False,
+                    include_empty=False,
+                )
+                if conversion.get("success") and pdf_header_ok
+                else {"success": False, "error": "PDF conversion/header check failed."}
+            )
+            text = ""
+            span_has_font = False
+            span_has_size = False
+            if blocks.get("success"):
+                for page in blocks.get("pages", []):
+                    for block in page.get("blocks", []):
+                        text += "\n" + str(block.get("text") or "")
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                if span.get("font"):
+                                    span_has_font = True
+                                if span.get("size") is not None:
+                                    span_has_size = True
+            checks = {
+                "conversion_success": bool(conversion.get("success")),
+                "pdf_exists": pdf_exists,
+                "pdf_header_ok": pdf_header_ok,
+                "pdf_blocks_read": bool(blocks.get("success")),
+                "sentinel_text_present": sentinel in text,
+                "span_font_metadata_present": span_has_font,
+                "span_size_metadata_present": span_has_size,
+            }
+            return {
+                "success": all(checks.values()),
+                "checks": checks,
+                "conversion": conversion,
+                "blocks_summary": {
+                    "success": blocks.get("success"),
+                    "total_pages": blocks.get("total_pages"),
+                    "pages_scanned": blocks.get("pages_scanned"),
+                    "span_count": blocks.get("span_count"),
+                    "error": blocks.get("error"),
+                },
+            }
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 
 def detect_conversion_capability(
@@ -791,6 +879,7 @@ def cmd_status(
         "docx_edit": docx_available,
         "docx_tables": docx_available,
         "docx_formatting": docx_available,
+        "docx_submission": docx_available,
         "docx_references": docx_available,
         "xlsx_create": openpyxl_available,
         "xlsx_read": openpyxl_available,
@@ -864,6 +953,7 @@ def cmd_setup_check(
     docx_available: bool,
     openpyxl_available: bool,
     pptx_available: bool,
+    live_smoke: bool = False,
 ) -> None:
     """Strict install/update readiness check for freshly cloned or pulled checkouts."""
     print_result(
@@ -872,6 +962,7 @@ def cmd_setup_check(
             docx_available=docx_available,
             openpyxl_available=openpyxl_available,
             pptx_available=pptx_available,
+            live_smoke=live_smoke,
         ),
         json_output,
     )
@@ -1186,6 +1277,9 @@ def handle_general_command(
         return True
 
     if command in {"setup-check", "update-check", "doctor"}:
+        live_smoke = "--live-smoke" in raw_args or os.environ.get(
+            "ONLYOFFICE_LIVE_SMOKE"
+        ) == "1"
         cmd_setup_check(
             json_output=json_output,
             print_result=print_result,
@@ -1193,6 +1287,7 @@ def handle_general_command(
             docx_available=docx_available,
             openpyxl_available=openpyxl_available,
             pptx_available=pptx_available,
+            live_smoke=live_smoke,
         )
         return True
 

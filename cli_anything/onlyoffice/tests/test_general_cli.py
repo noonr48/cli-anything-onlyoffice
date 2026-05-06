@@ -319,3 +319,35 @@ class OnlyOfficeGeneralCLITests(unittest.TestCase):
 
         self.assertEqual(printed, [(expected, True)])
         build_check.assert_called_once()
+
+    def test_build_installation_check_can_request_live_smoke(self):
+        conversion = {
+            "available": True,
+            "docker": {"available": True, "path": "/usr/bin/docker"},
+            "x2t": {
+                "available": True,
+                "container": general_cli.ONLYOFFICE_DOCKER_CONTAINER,
+                "path": general_cli.ONLYOFFICE_X2T_PATH,
+                "checked": True,
+            },
+        }
+
+        with mock.patch.object(
+            general_cli,
+            "run_live_docx_pdf_smoke",
+            return_value={"success": True, "checks": {"conversion_success": True}},
+        ) as live_smoke:
+            payload = general_cli.build_installation_check(
+                doc_server=mock.Mock(),
+                docx_available=True,
+                openpyxl_available=True,
+                pptx_available=True,
+                live_smoke=True,
+                conversion_detector=lambda: conversion,
+                python_detector=lambda: [],
+            )
+
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["live_smoke_requested"])
+        self.assertTrue(payload["live_smoke"]["success"])
+        live_smoke.assert_called_once()

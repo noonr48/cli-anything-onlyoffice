@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import re
+import shutil
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -1549,3 +1550,263 @@ class OnlyOfficeDocOpsTests(unittest.TestCase):
         self.assertEqual(pixel_limited["images_skipped"], 1)
         self.assertEqual(pixel_limited["images"][0]["error_code"], "image_pixel_limit_exceeded")
         image_save.assert_not_called()
+
+    def test_doc_ops_normalize_format_updates_whole_document_and_preserves_text(self):
+        path = self._path("normalize_source.docx")
+        output_path = self._path("normalize_output.docx")
+        doc = Document()
+        doc.sections[0].header.paragraphs[0].text = "Running header"
+        title = doc.add_paragraph("Assignment title")
+        title.style = doc.styles["Title"]
+        title.add_run(" extra")
+        doc.add_paragraph("Body paragraph.")
+        doc.add_paragraph("References")
+        ref = doc.add_paragraph("Smith, J. (2025). Example source. Example Journal.")
+        ref.paragraph_format.left_indent = Inches(0)
+        ref.paragraph_format.first_line_indent = Inches(0)
+        doc.save(path)
+
+        result = self.ops.normalize_document_format(
+            path,
+            output_path=output_path,
+            font_name="Times New Roman",
+            body_font_size=11,
+            title_font_size=12,
+            line_spacing="double",
+            paragraph_after=12,
+            clear_theme_fonts=True,
+            remove_style_borders=True,
+            reference_hanging_inches=0.5,
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertTrue(result["text_preserved"])
+        self.assertEqual(result["font_audit"]["unexpected_font_run_count"], 0)
+        self.assertGreater(result["stats"]["runs_updated"], 0)
+        self.assertGreaterEqual(result["stats"]["reference_paragraphs_updated"], 1)
+        info = self.ops.get_formatting_info(output_path, all_paragraphs=True)
+        ref_info = next(
+            paragraph
+            for paragraph in info["paragraphs"]
+            if paragraph["text_preview"].startswith("Smith")
+        )
+        self.assertEqual(ref_info["indents"]["style_resolved"]["hanging"]["pt"], 36.0)
+        self.assertEqual(
+            result["font_audit"]["theme_font_attributes"]["theme_font_attribute_count"],
+            0,
+        )
+
+    def test_doc_ops_font_audit_can_check_rendered_pdf_spans(self):
+        path = self._path("font_rendered.docx")
+        self._make_reference_fixture(path)
+        payload = self._pdf_block_payload(good=True)
+        payload["pages"][0]["blocks"][0]["lines"][1]["spans"] = [
+            {
+                "text": payload["pages"][0]["blocks"][0]["lines"][1]["text"],
+                "font": "Times New Roman",
+                "size": 12.0,
+                "bbox": payload["pages"][0]["blocks"][0]["lines"][1]["bbox"],
+            }
+        ]
+        payload["pages"][0]["blocks"][0]["lines"][2]["spans"] = [
+            {
+                "text": payload["pages"][0]["blocks"][0]["lines"][2]["text"],
+                "font": "Times New Roman",
+                "size": 12.0,
+                "bbox": payload["pages"][0]["blocks"][0]["lines"][2]["bbox"],
+            }
+        ]
+
+        with mock.patch.object(self.client, "pdf_read_blocks", return_value=payload):
+            result = self.ops.audit_document_fonts(
+                path,
+                expected_font_name="Times New Roman",
+                expected_font_size=12,
+                rendered=True,
+                pdf_path=self._path("font_rendered.pdf"),
+            )
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["overall_status"], "pass")
+        self.assertEqual(result["rendered"]["overall_status"], "pass")
+        self.assertFalse(result["rendered"]["trusted_pdf"])
+        self.assertEqual(result["rendered"]["unexpected_font_span_count"], 0)
+
+    def test_doc_ops_rendered_layout_audit_ignores_repeated_page_headers(self):
+        path = self._path("render_audit_headers.docx")
+        self._make_reference_fixture(path)
+        doc = Document(path)
+        doc.sections[0].header.paragraphs[0].text = "Running header"
+        doc.save(path)
+        payload = {
+            "success": True,
+            "total_pages": 3,
+            "pages_scanned": 3,
+            "pages": [
+                {
+                    "page_index": 0,
+                    "page_number": 1,
+                    "width": 595.3,
+                    "height": 841.9,
+                    "blocks": [
+                        {
+                            "type": "text",
+                            "lines": [
+                                {
+                                    "line_id": "body",
+                                    "bbox": {"left": 72, "top": 90, "right": 240, "bottom": 106},
+                                    "text": "Body before References.",
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "page_index": 1,
+                    "page_number": 2,
+                    "width": 595.3,
+                    "height": 841.9,
+                    "blocks": [
+                        {
+                            "type": "text",
+                            "lines": [
+                                {
+                                    "line_id": "header_2",
+                                    "bbox": {"left": 72, "top": 34, "right": 190, "bottom": 48},
+                                    "text": "Running header",
+                                },
+                                {
+                                    "line_id": "heading",
+                                    "bbox": {"left": 72, "top": 74, "right": 150, "bottom": 90},
+                                    "text": "References",
+                                },
+                                {
+                                    "line_id": "ref_1",
+                                    "bbox": {"left": 72, "top": 112, "right": 520, "bottom": 128},
+                                    "text": (
+                                        "Del Re, A. C., Fluckiger, C., Horvath, A. O., & Wampold, B. E. "
+                                        "(2021). Examining therapist"
+                                    ),
+                                },
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "page_index": 2,
+                    "page_number": 3,
+                    "width": 595.3,
+                    "height": 841.9,
+                    "blocks": [
+                        {
+                            "type": "text",
+                            "lines": [
+                                {
+                                    "line_id": "header_3",
+                                    "bbox": {"left": 72, "top": 34, "right": 190, "bottom": 48},
+                                    "text": "Running header",
+                                },
+                                {
+                                    "line_id": "ref_2",
+                                    "bbox": {"left": 108, "top": 90, "right": 520, "bottom": 106},
+                                    "text": (
+                                        "effects in the alliance-outcome relationship: A multilevel meta-analysis. "
+                                        "Journal of Consulting"
+                                    ),
+                                },
+                            ],
+                        }
+                    ],
+                },
+            ],
+        }
+
+        with mock.patch.object(self.client, "pdf_read_blocks", return_value=payload):
+            result = self.ops.rendered_layout_audit(
+                path,
+                pdf_path=self._path("render_audit_headers.pdf"),
+                trusted_pdf=True,
+            )
+
+        self.assertTrue(result["success"], result)
+        statuses = {check["name"]: check["status"] for check in result["checks"]}
+        self.assertEqual(statuses["references_page_break"], "pass")
+        self.assertEqual(statuses["hanging_indents_rendered"], "pass")
+        self.assertEqual(statuses["rendered_margins"], "pass")
+        artifact_check = next(
+            check
+            for check in result["checks"]
+            if check["name"] == "rendered_header_footer_artifacts"
+        )
+        self.assertEqual(artifact_check["details"]["ignored_line_count"], 2)
+
+    def test_doc_ops_submission_pack_creates_clean_bundle_manifest(self):
+        path = self._path("submission_pack.docx")
+        self._make_reference_fixture(path)
+        doc = Document(path)
+        doc.sections[0].page_width = Inches(8.27)
+        doc.sections[0].page_height = Inches(11.69)
+        doc.save(path)
+        output_dir = self._path("submission_pack_out")
+        payload = self._pdf_block_payload(good=True)
+        for line in payload["pages"][0]["blocks"][0]["lines"]:
+            line["spans"] = [
+                {
+                    "text": line["text"],
+                    "font": "Times New Roman",
+                    "size": 12.0,
+                    "bbox": line["bbox"],
+                }
+            ]
+
+        def fake_office_to_pdf(file_path, output_path=None):
+            self.assertIsNotNone(output_path)
+            with open(output_path, "wb") as handle:
+                handle.write(b"%PDF-1.4 fake")
+            return {"success": True, "output_file": output_path, "pages": 2}
+
+        def fake_pdf_sanitize(file_path, output_path=None, **kwargs):
+            shutil.copy2(file_path, output_path)
+            return {
+                "success": True,
+                "file": output_path,
+                "output_file": output_path,
+                "clear_metadata": kwargs.get("clear_metadata"),
+                "remove_xml_metadata": kwargs.get("remove_xml_metadata"),
+            }
+
+        clean_pdf_hidden = {
+            "success": True,
+            "nonempty_metadata": {},
+            "has_xml_metadata": False,
+            "annotations_count": 0,
+            "embedded_files_count": 0,
+            "has_forms": False,
+            "pages": 2,
+        }
+
+        with mock.patch.object(self.client, "_office_to_pdf", side_effect=fake_office_to_pdf):
+            with mock.patch.object(self.client, "pdf_read_blocks", return_value=payload):
+                with mock.patch.object(self.client, "pdf_sanitize", side_effect=fake_pdf_sanitize):
+                    with mock.patch.object(
+                        self.client,
+                        "inspect_pdf_hidden_data",
+                        return_value=clean_pdf_hidden,
+                    ):
+                        result = self.ops.submission_pack(
+                            path,
+                            output_dir,
+                            basename="final",
+                            expected_page_size="A4",
+                            expected_font_name="Times New Roman",
+                            expected_font_size=12,
+                            render_profile="apa-references",
+                        )
+
+        self.assertTrue(result["success"], result)
+        self.assertTrue(result["submission_ready"], result["readiness_blockers"])
+        self.assertTrue(os.path.exists(result["clean_docx"]))
+        self.assertTrue(os.path.exists(result["pdf_file"]))
+        self.assertTrue(os.path.exists(result["manifest_file"]))
+        self.assertTrue(result["text_preserved"])
+        self.assertTrue(result["font_audit"]["rendered"]["trusted_pdf"])

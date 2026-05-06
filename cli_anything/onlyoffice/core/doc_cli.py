@@ -532,6 +532,63 @@ def handle_doc_command(
         )
         return True
 
+    if command == "doc-normalize-format":
+        if not raw_args:
+            print_result(
+                {"success": False, "error": command_usage("doc-normalize-format")},
+                json_output,
+            )
+            return True
+        if not docx_available:
+            return _docx_unavailable(json_output, print_result)
+        parsed = _parse_options(
+            command,
+            raw_args,
+            1,
+            json_output,
+            print_result,
+            value_options=(
+                "--font",
+                "--body-size",
+                "--title-size",
+                "--line-spacing",
+                "--paragraph-after",
+                "--reference-hanging",
+            ),
+            flag_options=(
+                "--clear-theme-fonts",
+                "--skip-header-footer",
+                "--remove-style-borders",
+            ),
+            converters={
+                "--body-size": parse_float,
+                "--title-size": parse_float,
+                "--paragraph-after": parse_float,
+                "--reference-hanging": parse_float,
+            },
+            max_positionals=1,
+        )
+        if parsed is None:
+            return True
+        values, flags, positionals = parsed
+        print_result(
+            doc_server.normalize_document_format(
+                raw_args[0],
+                output_path=positionals[0] if positionals else None,
+                font_name=values.get("font"),
+                body_font_size=values.get("body_size"),
+                title_font_size=values.get("title_size"),
+                line_spacing=values.get("line_spacing"),
+                paragraph_after=values.get("paragraph_after"),
+                clear_theme_fonts=flags["clear_theme_fonts"],
+                include_header_footer=not flags["skip_header_footer"],
+                remove_style_borders=flags["remove_style_borders"],
+                reference_hanging_inches=values.get("reference_hanging"),
+            ),
+            json_output,
+        )
+        return True
+
     if command == "doc-formatting-info":
         if not raw_args:
             print_result(
@@ -566,6 +623,40 @@ def handle_doc_command(
                 start=start,
                 limit=limit,
                 all_paragraphs=all_paragraphs,
+            ),
+            json_output,
+        )
+        return True
+
+    if command == "doc-font-audit":
+        if not raw_args:
+            print_result(
+                {"success": False, "error": command_usage("doc-font-audit")},
+                json_output,
+            )
+            return True
+        if not docx_available:
+            return _docx_unavailable(json_output, print_result)
+        parsed = _parse_options(
+            command,
+            raw_args,
+            1,
+            json_output,
+            print_result,
+            value_options=("--expected-font", "--expected-font-size", "--pdf"),
+            flag_options=("--rendered",),
+            converters={"--expected-font-size": parse_float},
+        )
+        if parsed is None:
+            return True
+        values, flags, _positionals = parsed
+        print_result(
+            doc_server.audit_document_fonts(
+                raw_args[0],
+                expected_font_name=values.get("expected_font"),
+                expected_font_size=values.get("expected_font_size"),
+                rendered=flags["rendered"],
+                pdf_path=values.get("pdf"),
             ),
             json_output,
         )
@@ -918,6 +1009,55 @@ def handle_doc_command(
                 expected_font_size=expected_font_size,
                 rendered_layout=rendered_layout,
                 render_profile=render_profile,
+            ),
+            json_output,
+        )
+        return True
+
+    if command == "doc-submission-pack":
+        if len(raw_args) < 2:
+            print_result(
+                {"success": False, "error": command_usage("doc-submission-pack")},
+                json_output,
+            )
+            return True
+        if not docx_available:
+            return _docx_unavailable(json_output, print_result)
+        parsed = _parse_options(
+            command,
+            raw_args,
+            2,
+            json_output,
+            print_result,
+            value_options=(
+                "--basename",
+                "--expected-page-size",
+                "--expected-font",
+                "--expected-font-size",
+                "--profile",
+            ),
+            flag_options=(
+                "--skip-docx-sanitize",
+                "--skip-pdf-sanitize",
+                "--skip-rendered-layout",
+            ),
+            converters={"--expected-font-size": parse_float},
+        )
+        if parsed is None:
+            return True
+        values, flags, _positionals = parsed
+        print_result(
+            doc_server.submission_pack(
+                raw_args[0],
+                raw_args[1],
+                basename=values.get("basename"),
+                expected_page_size=values.get("expected_page_size"),
+                expected_font_name=values.get("expected_font"),
+                expected_font_size=values.get("expected_font_size"),
+                render_profile=values.get("profile", "auto"),
+                sanitize_docx=not flags["skip_docx_sanitize"],
+                sanitize_pdf=not flags["skip_pdf_sanitize"],
+                rendered_layout=not flags["skip_rendered_layout"],
             ),
             json_output,
         )

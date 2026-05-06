@@ -474,12 +474,15 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             "doc-layout <file> [--size A4|Letter] [--orientation portrait|landscape] [--margin-* <in>] [--header <text>] [--page-numbers]",
             docs,
         )
+        self.assertIn(command_signature("doc-normalize-format"), docs)
+        self.assertIn(command_signature("doc-font-audit"), docs)
         self.assertIn("doc-inspect-hidden-data <file>", docs)
         self.assertIn(command_signature("doc-sanitize"), docs)
         self.assertIn(
             "doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--rendered-layout] [--profile auto|generic|apa-references]",
             docs,
         )
+        self.assertIn(command_signature("doc-submission-pack"), docs)
         self.assertIn(
             "doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]",
             docs,

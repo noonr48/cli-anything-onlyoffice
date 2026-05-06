@@ -1,17 +1,23 @@
 ---
 name: onlyoffice
-version: 4.4.15
+version: 4.4.16
 author: SLOANE OS
-description: 119-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
+description: 122-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
 tags: [productivity, documents, office, onlyoffice, charts, spreadsheets, rdf, apa, pdf, image-extraction, spatial, data-validation]
 ---
 
-# CLI-Anything OnlyOffice v4.4.15
+# CLI-Anything OnlyOffice v4.4.16
 
 Programmatic control over Office documents designed for AI agents. Full JSON output. Production-safe with atomic writes, two-layer file locking, and automatic backups.
 
-## What's New in v4.4.15
-- **Install/Update Dependency Gate** — `setup-check` (`update-check`/`doctor` aliases) validates required Python packages plus Docker/OnlyOffice x2t after clone, install, or `git pull`; `pyshacl` is now installed by the core package so `rdf-validate` is not accidentally missing
+## What's New in v4.4.16
+- **Submission Pack Workflow** — `doc-submission-pack` creates a cleaned DOCX/PDF bundle with hidden-data checks, rendered layout/font evidence, text-preservation fingerprint, and a JSON manifest
+- **Whole-Document Formatting** — `doc-normalize-format` applies academic formatting across styles, runs, headers/footers, and References hanging indents without treating DOCX as text
+- **Rendered Font Audit** — `doc-font-audit --rendered` compares declared DOCX fonts with actual PDF span fonts after OnlyOffice conversion
+- **Cleaner Render Audits** — `doc-render-audit` filters repeated DOCX/PDF header-footer artifacts before checking body/reference margins and hanging indents
+
+## Carry Forward from v4.4.15
+- **Install/Update Dependency Gate** — `setup-check` (`update-check`/`doctor` aliases) validates required Python packages plus Docker/OnlyOffice x2t after clone, install, or `git pull`; `setup-check --live-smoke` can run a real DOCX-to-PDF smoke when requested
 
 ## Carry Forward from v4.4.14
 - **Rendered Readiness Hardening** — generic DOCX render audits now check margin geometry, untrusted external PDFs block submission-ready claims, and APA References audits handle logical indents, section margins, and page-break edge cases more accurately
@@ -88,7 +94,7 @@ If you need the rendered visual layout, use preview/export commands rather than 
 
 ---
 
-## DOCUMENTS (.docx) — 33 commands
+## DOCUMENTS (.docx) — 36 commands
 
 ### Core CRUD
 - `doc-create <file> <title> <content>`
@@ -105,7 +111,9 @@ If you need the rendered visual layout, use preview/export commands rather than 
 - `doc-set-style <file> <index> <style>`
 - `doc-list-styles <file>`
 - `doc-highlight <file> <text> [--color yellow|cyan|green|pink]`
+- `doc-normalize-format <file> [output_path] [--font <name>] [--body-size <pt>] [--title-size <pt>] [--line-spacing <single|1.5|double>] [--paragraph-after <pt>] [--clear-theme-fonts] [--skip-header-footer] [--remove-style-borders] [--reference-hanging <in>]`
 - `doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]`
+- `doc-font-audit <file> [--expected-font <name>] [--expected-font-size <pt>] [--rendered] [--pdf <path>]`
 
 ### Page Layout
 - `doc-layout <file> [--size A4|Letter] [--orientation portrait|landscape] [--margin-top <in>] [--margin-bottom <in>] [--margin-left <in>] [--margin-right <in>] [--header <text>] [--page-numbers]`
@@ -126,6 +134,7 @@ If you need the rendered visual layout, use preview/export commands rather than 
 - `doc-get-metadata <file>`
 - `doc-inspect-hidden-data <file>`
 - `doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--rendered-layout] [--profile auto|generic|apa-references]`
+- `doc-submission-pack <file> <output_dir> [--basename <name>] [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--profile auto|generic|apa-references]`
 - `doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--canonicalize-ooxml] [--author <a>]`
 - `doc-comment <file> <comment> [--paragraph <index>]`
 
@@ -305,7 +314,7 @@ Default DPI: 150. Use 300 for print quality.
 
 1. **Always `--json`** — every response is `{"success": true/false, ...}`
 2. **Check `success` first**
-3. **Run `setup-check --json` after install or update** — then use `status --json` at session start to verify `python` field = `.venv/bin/python3`
+3. **Run `setup-check --json` after install or update** — use `setup-check --live-smoke --json` when converter proof is needed; then use `status --json` at session start to verify `python` field = `.venv/bin/python3`
 4. **Never install anything** — tool is fully installed, all deps in venv
 5. **Never use system python3/pip3/pip**
 6. **Backups are automatic** — `backup-restore --latest` on any write error
@@ -314,5 +323,5 @@ Default DPI: 150. Use 300 for print quality.
 
 ---
 
-**Last Updated:** 2026-05-05
-**Version:** 4.4.15
+**Last Updated:** 2026-05-06
+**Version:** 4.4.16

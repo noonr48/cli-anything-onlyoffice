@@ -319,6 +319,132 @@ class OnlyOfficeDocCLITests(unittest.TestCase):
             profile="generic",
         )
 
+    def test_cli_doc_normalize_format_dispatches_options(self):
+        path = self._path("dispatch_normalize.docx")
+        output_path = self._path("dispatch_normalize_out.docx")
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "normalize_document_format",
+            return_value={"success": True, "output_file": output_path},
+        ) as normalize_document_format:
+            payload, exit_code = self._run_cli(
+                [
+                    "doc-normalize-format",
+                    path,
+                    output_path,
+                    "--font",
+                    "Times New Roman",
+                    "--body-size",
+                    "11",
+                    "--title-size",
+                    "12",
+                    "--line-spacing",
+                    "double",
+                    "--paragraph-after",
+                    "12",
+                    "--clear-theme-fonts",
+                    "--remove-style-borders",
+                    "--reference-hanging",
+                    "0.5",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["success"])
+        normalize_document_format.assert_called_once_with(
+            path,
+            output_path=output_path,
+            font_name="Times New Roman",
+            body_font_size=11.0,
+            title_font_size=12.0,
+            line_spacing="double",
+            paragraph_after=12.0,
+            clear_theme_fonts=True,
+            include_header_footer=True,
+            remove_style_borders=True,
+            reference_hanging_inches=0.5,
+        )
+
+    def test_cli_doc_font_audit_dispatches_rendered_options(self):
+        path = self._path("dispatch_font_audit.docx")
+        pdf_path = self._path("dispatch_font_audit.pdf")
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "audit_document_fonts",
+            return_value={"success": True, "overall_status": "pass"},
+        ) as audit_document_fonts:
+            payload, exit_code = self._run_cli(
+                [
+                    "doc-font-audit",
+                    path,
+                    "--expected-font",
+                    "Times New Roman",
+                    "--expected-font-size",
+                    "12",
+                    "--rendered",
+                    "--pdf",
+                    pdf_path,
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["success"])
+        audit_document_fonts.assert_called_once_with(
+            path,
+            expected_font_name="Times New Roman",
+            expected_font_size=12.0,
+            rendered=True,
+            pdf_path=pdf_path,
+        )
+
+    def test_cli_doc_submission_pack_dispatches_options(self):
+        path = self._path("dispatch_pack.docx")
+        output_dir = self._path("dispatch_pack_out")
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "submission_pack",
+            return_value={"success": True, "submission_ready": True},
+        ) as submission_pack:
+            payload, exit_code = self._run_cli(
+                [
+                    "doc-submission-pack",
+                    path,
+                    output_dir,
+                    "--basename",
+                    "final",
+                    "--expected-page-size",
+                    "A4",
+                    "--expected-font",
+                    "Times New Roman",
+                    "--expected-font-size",
+                    "12",
+                    "--profile",
+                    "apa-references",
+                    "--skip-pdf-sanitize",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["success"])
+        submission_pack.assert_called_once_with(
+            path,
+            output_dir,
+            basename="final",
+            expected_page_size="A4",
+            expected_font_name="Times New Roman",
+            expected_font_size=12.0,
+            render_profile="apa-references",
+            sanitize_docx=True,
+            sanitize_pdf=False,
+            rendered_layout=True,
+        )
+
     def test_cli_doc_create_respects_docx_availability_guard(self):
         path = self._path("unavailable.docx")
         stdout = io.StringIO()

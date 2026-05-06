@@ -1087,6 +1087,35 @@ class DocumentServerClient:
             page_size,
         )
 
+    def normalize_document_format(
+        self,
+        file_path: str,
+        *,
+        output_path: Optional[str] = None,
+        font_name: Optional[str] = None,
+        body_font_size: Optional[float] = None,
+        title_font_size: Optional[float] = None,
+        line_spacing: Optional[str] = None,
+        paragraph_after: Optional[float] = None,
+        clear_theme_fonts: bool = False,
+        include_header_footer: bool = True,
+        remove_style_borders: bool = False,
+        reference_hanging_inches: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        return self._doc_ops.normalize_document_format(
+            file_path,
+            output_path=output_path,
+            font_name=font_name,
+            body_font_size=body_font_size,
+            title_font_size=title_font_size,
+            line_spacing=line_spacing,
+            paragraph_after=paragraph_after,
+            clear_theme_fonts=clear_theme_fonts,
+            include_header_footer=include_header_footer,
+            remove_style_borders=remove_style_borders,
+            reference_hanging_inches=reference_hanging_inches,
+        )
+
     def _parse_range(self, range_str: str):
         from openpyxl.utils.cell import range_boundaries
 
@@ -1712,11 +1741,18 @@ class DocumentServerClient:
         file_path: str,
         expected_font_name: str = None,
         expected_font_size: float = None,
+        *,
+        rendered: bool = False,
+        pdf_path: Optional[str] = None,
+        trusted_pdf: bool = False,
     ) -> Dict[str, Any]:
         return self._doc_ops.audit_document_fonts(
             file_path,
             expected_font_name=expected_font_name,
             expected_font_size=expected_font_size,
+            rendered=rendered,
+            pdf_path=pdf_path,
+            trusted_pdf=trusted_pdf,
         )
 
     def audit_document_images(self, file_path: str) -> Dict[str, Any]:
@@ -2438,6 +2474,33 @@ class DocumentServerClient:
             output_path=output_path,
             layout_warnings=layout_warnings,
             render_profile=render_profile,
+        )
+
+    def submission_pack(
+        self,
+        file_path: str,
+        output_dir: str,
+        *,
+        basename: Optional[str] = None,
+        expected_page_size: Optional[str] = None,
+        expected_font_name: Optional[str] = None,
+        expected_font_size: Optional[float] = None,
+        render_profile: str = "auto",
+        sanitize_docx: bool = True,
+        sanitize_pdf: bool = True,
+        rendered_layout: bool = True,
+    ) -> Dict[str, Any]:
+        return self._doc_ops.submission_pack(
+            file_path,
+            output_dir,
+            basename=basename,
+            expected_page_size=expected_page_size,
+            expected_font_name=expected_font_name,
+            expected_font_size=expected_font_size,
+            render_profile=render_profile,
+            sanitize_docx=sanitize_docx,
+            sanitize_pdf=sanitize_pdf,
+            rendered_layout=rendered_layout,
         )
 
     def spreadsheet_to_pdf(

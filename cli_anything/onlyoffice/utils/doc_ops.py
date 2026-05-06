@@ -11,6 +11,7 @@ import os
 import posixpath
 import re
 import shutil
+import subprocess
 import tempfile
 import warnings
 import xml.etree.ElementTree as ET
@@ -2480,6 +2481,382 @@ class DocumentOperations:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def _iter_container_paragraphs(self, container: Any):
+        for paragraph in getattr(container, "paragraphs", []):
+            yield paragraph
+        for table in getattr(container, "tables", []):
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from self._iter_container_paragraphs(cell)
+
+    def _iter_document_paragraphs(
+        self,
+        doc: Any,
+        *,
+        include_header_footer: bool = True,
+    ):
+        yield from self._iter_container_paragraphs(doc)
+        if include_header_footer:
+            for section in doc.sections:
+                for part in (
+                    section.header,
+                    section.first_page_header,
+                    section.even_page_header,
+                    section.footer,
+                    section.first_page_footer,
+                    section.even_page_footer,
+                ):
+                    yield from self._iter_container_paragraphs(part)
+
+    def _visible_text_fingerprint(
+        self,
+        doc: Any,
+        *,
+        include_header_footer: bool = True,
+    ) -> Dict[str, Any]:
+        texts = [
+            self._normalize_text(paragraph.text)
+            for paragraph in self._iter_document_paragraphs(
+                doc, include_header_footer=include_header_footer
+            )
+            if self._normalize_text(paragraph.text)
+        ]
+        joined = "\n".join(texts)
+        return {
+            "sha256": hashlib.sha256(joined.encode("utf-8")).hexdigest(),
+            "text_unit_count": len(texts),
+            "character_count": len(joined),
+        }
+
+    @staticmethod
+    def _line_spacing_value(value: Optional[str]) -> Optional[float]:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        aliases = {
+            "single": 1.0,
+            "1": 1.0,
+            "1.0": 1.0,
+            "one": 1.0,
+            "1.5": 1.5,
+            "one-point-five": 1.5,
+            "one_point_five": 1.5,
+            "double": 2.0,
+            "2": 2.0,
+            "2.0": 2.0,
+        }
+        if normalized in aliases:
+            return aliases[normalized]
+        try:
+            numeric = float(normalized)
+        except (TypeError, ValueError):
+            raise ValueError("line spacing must be single, 1.5, double, or a number")
+        if not math.isfinite(numeric) or numeric <= 0:
+            raise ValueError("line spacing must be a positive finite value")
+        return numeric
+
+    @staticmethod
+    def _paragraph_is_title(paragraph: Any, first_nonempty_seen: bool) -> bool:
+        style_name = getattr(getattr(paragraph, "style", None), "name", "") or ""
+        return style_name.strip().lower() == "title" or not first_nonempty_seen
+
+    def _apply_ooxml_format_postprocess(
+        self,
+        file_path: str,
+        *,
+        font_name: Optional[str] = None,
+        clear_theme_fonts: bool = False,
+        remove_style_borders: bool = False,
+    ) -> Dict[str, Any]:
+        files, package_preflight, preflight_error = self._read_docx_zip_parts(file_path)
+        if preflight_error:
+            return preflight_error
+
+        stats = {
+            "xml_parts_seen": 0,
+            "xml_parts_rewritten": 0,
+            "theme_font_attributes_removed": 0,
+            "rfonts_elements_updated": 0,
+            "style_border_elements_removed": 0,
+            "skipped_parts": 0,
+        }
+        target_parts = set(self.host._docx_story_xml_parts(list(files.keys())))
+        if "word/styles.xml" in files:
+            target_parts.add("word/styles.xml")
+
+        theme_attrs = {
+            f"{{{OOXML_NS['w']}}}asciiTheme",
+            f"{{{OOXML_NS['w']}}}hAnsiTheme",
+            f"{{{OOXML_NS['w']}}}eastAsiaTheme",
+            f"{{{OOXML_NS['w']}}}csTheme",
+        }
+        font_attrs = {
+            f"{{{OOXML_NS['w']}}}ascii",
+            f"{{{OOXML_NS['w']}}}hAnsi",
+            f"{{{OOXML_NS['w']}}}eastAsia",
+            f"{{{OOXML_NS['w']}}}cs",
+        }
+        for part_name in sorted(target_parts):
+            if part_name not in files:
+                continue
+            stats["xml_parts_seen"] += 1
+            try:
+                root = ET.fromstring(files[part_name])
+            except ET.ParseError:
+                stats["skipped_parts"] += 1
+                continue
+            changed = False
+            for rfonts in root.findall(".//w:rFonts", OOXML_NS):
+                removed = 0
+                if clear_theme_fonts:
+                    for attr in theme_attrs:
+                        if attr in rfonts.attrib:
+                            del rfonts.attrib[attr]
+                            removed += 1
+                    stats["theme_font_attributes_removed"] += removed
+                if font_name:
+                    for attr in font_attrs:
+                        if rfonts.get(attr) != font_name:
+                            rfonts.set(attr, font_name)
+                            changed = True
+                    stats["rfonts_elements_updated"] += 1
+                if removed:
+                    changed = True
+            if remove_style_borders and part_name == "word/styles.xml":
+                for p_bdr in list(root.findall(".//w:pBdr", OOXML_NS)):
+                    parent = self._find_parent(root, p_bdr)
+                    if parent is not None:
+                        parent.remove(p_bdr)
+                        stats["style_border_elements_removed"] += 1
+                        changed = True
+            if changed:
+                files[part_name] = serialize_ooxml_element(root)
+                stats["xml_parts_rewritten"] += 1
+
+        if stats["xml_parts_rewritten"]:
+            self.host._atomic_zip_write(files, file_path)
+
+        return {
+            "success": True,
+            "ooxml_preflight": package_preflight,
+            "stats": stats,
+        }
+
+    @staticmethod
+    def _find_parent(root: ET.Element, child: ET.Element) -> Optional[ET.Element]:
+        for parent in root.iter():
+            for candidate in list(parent):
+                if candidate is child:
+                    return parent
+        return None
+
+    def normalize_document_format(
+        self,
+        file_path: str,
+        *,
+        output_path: Optional[str] = None,
+        font_name: Optional[str] = None,
+        body_font_size: Optional[float] = None,
+        title_font_size: Optional[float] = None,
+        line_spacing: Optional[str] = None,
+        paragraph_after: Optional[float] = None,
+        clear_theme_fonts: bool = False,
+        include_header_footer: bool = True,
+        remove_style_borders: bool = False,
+        reference_hanging_inches: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Normalize common academic DOCX formatting across styles, runs, and headers."""
+        if not DOCX_AVAILABLE:
+            return {"success": False, "error": "python-docx not installed"}
+        if not any(
+            [
+                font_name,
+                body_font_size is not None,
+                title_font_size is not None,
+                line_spacing is not None,
+                paragraph_after is not None,
+                clear_theme_fonts,
+                remove_style_borders,
+                reference_hanging_inches is not None,
+            ]
+        ):
+            return {"success": False, "error": "No formatting options provided"}
+
+        try:
+            abs_path = str(Path(file_path).resolve())
+            out_path = str(Path(output_path).resolve()) if output_path else abs_path
+            overwrite = out_path == abs_path
+            spacing_value = self._line_spacing_value(line_spacing)
+            body_size = (
+                round(float(body_font_size), 2)
+                if body_font_size is not None
+                else None
+            )
+            title_size = (
+                round(float(title_font_size), 2)
+                if title_font_size is not None
+                else None
+            )
+            after_pt = (
+                round(float(paragraph_after), 2)
+                if paragraph_after is not None
+                else None
+            )
+            reference_hanging = (
+                float(reference_hanging_inches)
+                if reference_hanging_inches is not None
+                else None
+            )
+            if body_size is not None and body_size <= 0:
+                return {"success": False, "error": "body font size must be positive"}
+            if title_size is not None and title_size <= 0:
+                return {"success": False, "error": "title font size must be positive"}
+            if after_pt is not None and after_pt < 0:
+                return {"success": False, "error": "paragraph-after must be non-negative"}
+            if reference_hanging is not None and reference_hanging < 0:
+                return {"success": False, "error": "reference hanging indent must be non-negative"}
+
+            with self.host._file_locks(abs_path, out_path):
+                backup_target = abs_path if overwrite else out_path
+                backup = (
+                    self.host._snapshot_backup(backup_target)
+                    if Path(backup_target).exists()
+                    else None
+                )
+                doc = Document(abs_path)
+                before_text = self._visible_text_fingerprint(
+                    doc, include_header_footer=include_header_footer
+                )
+                stats = {
+                    "styles_seen": 0,
+                    "styles_updated": 0,
+                    "paragraphs_seen": 0,
+                    "paragraphs_updated": 0,
+                    "runs_seen": 0,
+                    "runs_updated": 0,
+                    "reference_paragraphs_updated": 0,
+                }
+
+                for style in doc.styles:
+                    stats["styles_seen"] += 1
+                    changed = False
+                    try:
+                        style_name = (getattr(style, "name", "") or "").strip().lower()
+                        style_size = title_size if style_name == "title" and title_size else body_size
+                        if font_name and hasattr(style, "font"):
+                            style.font.name = font_name
+                            changed = True
+                        if style_size and hasattr(style, "font"):
+                            style.font.size = Pt(style_size)
+                            changed = True
+                        if hasattr(style, "paragraph_format"):
+                            if spacing_value is not None:
+                                style.paragraph_format.line_spacing = spacing_value
+                                changed = True
+                            if after_pt is not None:
+                                style.paragraph_format.space_after = Pt(after_pt)
+                                changed = True
+                    except Exception:
+                        continue
+                    if changed:
+                        stats["styles_updated"] += 1
+
+                first_nonempty_seen = False
+                references_seen = False
+                for paragraph in self._iter_document_paragraphs(
+                    doc, include_header_footer=include_header_footer
+                ):
+                    para_text = self._normalize_text(paragraph.text)
+                    if para_text.lower() == "references":
+                        references_seen = True
+                    is_title = bool(para_text) and self._paragraph_is_title(
+                        paragraph, first_nonempty_seen
+                    )
+                    if para_text and not first_nonempty_seen:
+                        first_nonempty_seen = True
+                    stats["paragraphs_seen"] += 1
+                    para_changed = False
+                    if spacing_value is not None:
+                        paragraph.paragraph_format.line_spacing = spacing_value
+                        para_changed = True
+                    if after_pt is not None:
+                        paragraph.paragraph_format.space_after = Pt(after_pt)
+                        para_changed = True
+                    if (
+                        reference_hanging is not None
+                        and references_seen
+                        and para_text
+                        and para_text.lower() != "references"
+                    ):
+                        paragraph.paragraph_format.left_indent = Inches(reference_hanging)
+                        paragraph.paragraph_format.first_line_indent = Inches(
+                            -reference_hanging
+                        )
+                        para_changed = True
+                        stats["reference_paragraphs_updated"] += 1
+                    for run in paragraph.runs:
+                        stats["runs_seen"] += 1
+                        run_changed = False
+                        if font_name:
+                            run.font.name = font_name
+                            run_changed = True
+                        effective_size = title_size if is_title and title_size else body_size
+                        if effective_size:
+                            run.font.size = Pt(effective_size)
+                            run_changed = True
+                        if run_changed:
+                            stats["runs_updated"] += 1
+                    if para_changed:
+                        stats["paragraphs_updated"] += 1
+
+                self.host._safe_save(doc, out_path)
+                postprocess = self._apply_ooxml_format_postprocess(
+                    out_path,
+                    font_name=font_name,
+                    clear_theme_fonts=clear_theme_fonts,
+                    remove_style_borders=remove_style_borders,
+                )
+                if not postprocess.get("success"):
+                    return postprocess
+                after_doc = Document(out_path)
+                after_text = self._visible_text_fingerprint(
+                    after_doc, include_header_footer=include_header_footer
+                )
+                hidden = self.inspect_hidden_data(out_path)
+                if not hidden.get("success"):
+                    return hidden
+                font_audit = self.audit_document_fonts(
+                    out_path,
+                    expected_font_name=font_name,
+                    expected_font_size=body_size,
+                )
+
+            return {
+                "success": True,
+                "file": out_path,
+                "input_file": abs_path,
+                "output_file": out_path,
+                "backup": backup or None,
+                "font_name": font_name,
+                "body_font_size": body_size,
+                "title_font_size": title_size,
+                "line_spacing": spacing_value,
+                "paragraph_after": after_pt,
+                "clear_theme_fonts": clear_theme_fonts,
+                "include_header_footer": include_header_footer,
+                "remove_style_borders": remove_style_borders,
+                "reference_hanging_inches": reference_hanging,
+                "stats": stats,
+                "ooxml_postprocess": postprocess,
+                "text_before": before_text,
+                "text_after": after_text,
+                "text_preserved": before_text["sha256"] == after_text["sha256"],
+                "hidden_data": hidden,
+                "font_audit": font_audit,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def insert_paragraph(
         self, file_path: str, text: str, index: int, style: str = None
     ) -> Dict[str, Any]:
@@ -3211,13 +3588,18 @@ class DocumentOperations:
         file_path: str,
         expected_font_name: str = None,
         expected_font_size: float = None,
+        *,
+        rendered: bool = False,
+        pdf_path: Optional[str] = None,
+        trusted_pdf: bool = False,
     ) -> Dict[str, Any]:
-        """Audit font consistency across visible text runs."""
+        """Audit font consistency across DOCX declarations and optionally rendered PDF spans."""
         if not DOCX_AVAILABLE:
             return {"success": False, "error": "python-docx not installed"}
         try:
-            doc = Document(file_path)
-            runs_payload = self.host._collect_text_runs(doc)
+            abs_path = str(Path(file_path).resolve())
+            doc = Document(abs_path)
+            runs_payload = self._collect_document_text_runs(doc)
             font_name_counts = Counter(
                 run["font_name"] or "<unspecified>" for run in runs_payload
             )
@@ -3248,9 +3630,36 @@ class DocumentOperations:
 
             mixed_fonts = len(font_name_counts) > 1
             mixed_sizes = len(font_size_counts) > 1
+            theme_font_attributes = self._docx_theme_font_attribute_report(abs_path)
+            fontconfig = self._fontconfig_match(expected_font_name)
+            rendered_audit = None
+            if rendered:
+                rendered_audit = self._rendered_pdf_font_audit(
+                    abs_path,
+                    pdf_path=pdf_path,
+                    expected_font_name=expected_font_name,
+                    expected_font_size=expected_font_size,
+                    trusted_pdf=trusted_pdf,
+                )
+                if not rendered_audit.get("success"):
+                    return rendered_audit
+
+            overall_status = "pass"
+            if expected_font_name and unexpected_font_runs:
+                overall_status = "warn"
+            if expected_font_size is not None and unexpected_size_runs:
+                overall_status = "warn"
+            if not expected_font_name and mixed_fonts:
+                overall_status = "warn"
+            if rendered_audit and rendered_audit.get("overall_status") != "pass":
+                overall_status = (
+                    "fail" if rendered_audit.get("overall_status") == "fail" else "warn"
+                )
+
             return {
                 "success": True,
-                "file": file_path,
+                "file": abs_path,
+                "overall_status": overall_status,
                 "text_run_count": len(runs_payload),
                 "font_name_counts": dict(font_name_counts),
                 "font_size_counts": dict(font_size_counts),
@@ -3264,9 +3673,265 @@ class DocumentOperations:
                 "unexpected_size_run_count": len(unexpected_size_runs),
                 "unexpected_font_examples": unexpected_font_runs[:10],
                 "unexpected_size_examples": unexpected_size_runs[:10],
+                "theme_font_attributes": theme_font_attributes,
+                "fontconfig": fontconfig,
+                "rendered": rendered_audit,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _collect_document_text_runs(
+        self,
+        doc: Any,
+        *,
+        include_header_footer: bool = True,
+    ) -> List[Dict[str, Any]]:
+        normal_style = doc.styles["Normal"] if "Normal" in [s.name for s in doc.styles] else None
+        runs_payload = []
+        for paragraph_index, paragraph in enumerate(
+            self._iter_document_paragraphs(
+                doc, include_header_footer=include_header_footer
+            )
+        ):
+            style_font = paragraph.style.font if paragraph.style is not None else None
+            style_name = getattr(paragraph.style, "name", None)
+            for run_index, run in enumerate(paragraph.runs):
+                text = str(run.text or "")
+                if not text.strip():
+                    continue
+                font_name = (
+                    run.font.name
+                    or (style_font.name if style_font is not None else None)
+                    or (normal_style.font.name if normal_style is not None else None)
+                )
+                font_size = (
+                    (run.font.size.pt if run.font.size else None)
+                    or (
+                        style_font.size.pt
+                        if style_font is not None and style_font.size is not None
+                        else None
+                    )
+                    or (
+                        normal_style.font.size.pt
+                        if normal_style is not None and normal_style.font.size is not None
+                        else None
+                    )
+                )
+                runs_payload.append(
+                    {
+                        "paragraph_index": paragraph_index,
+                        "run_index": run_index,
+                        "style_name": style_name,
+                        "text_preview": text[:60],
+                        "font_name": font_name,
+                        "font_name_normalized": self.host._normalized_font_name(font_name),
+                        "font_size": round(float(font_size), 2) if font_size else None,
+                        "bold": bool(run.bold) if run.bold is not None else False,
+                        "italic": bool(run.italic) if run.italic is not None else False,
+                    }
+                )
+        return runs_payload
+
+    def _docx_theme_font_attribute_report(self, file_path: str) -> Dict[str, Any]:
+        try:
+            files, _package_preflight, preflight_error = self._read_docx_zip_parts(file_path)
+            if preflight_error:
+                return {
+                    "success": False,
+                    "theme_font_attribute_count": 0,
+                    "error": preflight_error.get("error"),
+                }
+            theme_attrs = {
+                f"{{{OOXML_NS['w']}}}asciiTheme": "asciiTheme",
+                f"{{{OOXML_NS['w']}}}hAnsiTheme": "hAnsiTheme",
+                f"{{{OOXML_NS['w']}}}eastAsiaTheme": "eastAsiaTheme",
+                f"{{{OOXML_NS['w']}}}csTheme": "csTheme",
+            }
+            examples = []
+            count = 0
+            target_parts = set(self.host._docx_story_xml_parts(list(files.keys())))
+            if "word/styles.xml" in files:
+                target_parts.add("word/styles.xml")
+            for part_name in sorted(target_parts):
+                try:
+                    root = ET.fromstring(files[part_name])
+                except ET.ParseError:
+                    continue
+                for rfonts in root.findall(".//w:rFonts", OOXML_NS):
+                    attrs = {
+                        label: rfonts.get(attr)
+                        for attr, label in theme_attrs.items()
+                        if rfonts.get(attr) is not None
+                    }
+                    if attrs:
+                        count += len(attrs)
+                        if len(examples) < 10:
+                            examples.append({"part": part_name, "attributes": attrs})
+            return {
+                "success": True,
+                "theme_font_attribute_count": count,
+                "examples": examples,
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "theme_font_attribute_count": 0,
+                "error": str(exc),
+            }
+
+    @staticmethod
+    def _fontconfig_match(font_name: Optional[str]) -> Dict[str, Any]:
+        if not font_name:
+            return {"checked": False, "reason": "No expected font provided."}
+        fc_match = shutil.which("fc-match")
+        if not fc_match:
+            return {
+                "checked": False,
+                "available": False,
+                "reason": "fc-match executable not found.",
+            }
+        try:
+            result = subprocess.run(
+                [fc_match, str(font_name)],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+        except Exception as exc:
+            return {
+                "checked": True,
+                "available": False,
+                "error": str(exc),
+            }
+        output = (result.stdout or "").strip()
+        return {
+            "checked": True,
+            "available": result.returncode == 0,
+            "command": fc_match,
+            "requested_font": font_name,
+            "exit_code": result.returncode,
+            "match": output,
+            "stderr": (result.stderr or "").strip(),
+        }
+
+    @staticmethod
+    def _normalized_rendered_font_name(name: Optional[str]) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+    def _rendered_font_matches(self, rendered_font: Optional[str], expected: str) -> bool:
+        rendered_norm = self._normalized_rendered_font_name(rendered_font)
+        expected_norm = self._normalized_rendered_font_name(expected)
+        if not rendered_norm or not expected_norm:
+            return False
+        return rendered_norm == expected_norm or rendered_norm.startswith(expected_norm)
+
+    def _rendered_pdf_font_audit(
+        self,
+        file_path: str,
+        *,
+        pdf_path: Optional[str] = None,
+        expected_font_name: Optional[str] = None,
+        expected_font_size: Optional[float] = None,
+        trusted_pdf: bool = False,
+    ) -> Dict[str, Any]:
+        temp_pdf = None
+        conversion = None
+        try:
+            if pdf_path:
+                audit_pdf_path = str(Path(pdf_path).resolve())
+                pdf_trusted = bool(trusted_pdf)
+            else:
+                fd, temp_pdf = tempfile.mkstemp(
+                    prefix="onlyoffice-font-audit-", suffix=".pdf"
+                )
+                os.close(fd)
+                conversion = self.host._office_to_pdf(file_path, output_path=temp_pdf)
+                if not conversion.get("success"):
+                    return conversion
+                audit_pdf_path = temp_pdf
+                pdf_trusted = True
+
+            block_payload = self.host.pdf_read_blocks(
+                audit_pdf_path,
+                include_spans=True,
+                include_images=False,
+                include_empty=False,
+            )
+            if not block_payload.get("success"):
+                return block_payload
+
+            spans = []
+            font_counts: Counter = Counter()
+            size_counts: Counter = Counter()
+            unexpected_fonts = []
+            unexpected_sizes = []
+            target_size = (
+                round(float(expected_font_size), 2)
+                if expected_font_size is not None
+                else None
+            )
+            for page in block_payload.get("pages", []):
+                for block in page.get("blocks", []):
+                    if block.get("type") != "text":
+                        continue
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            text = str(span.get("text") or "")
+                            if not text.strip():
+                                continue
+                            font = span.get("font") or "<unspecified>"
+                            size = (
+                                round(float(span.get("size")), 2)
+                                if span.get("size") is not None
+                                else None
+                            )
+                            payload = {
+                                "page_number": page.get("page_number"),
+                                "text_preview": text[:80],
+                                "font": font,
+                                "size": size,
+                                "bbox": span.get("bbox") or line.get("bbox"),
+                            }
+                            spans.append(payload)
+                            font_counts[font] += 1
+                            size_counts[size if size is not None else "<unspecified>"] += 1
+                            if expected_font_name and not self._rendered_font_matches(
+                                font, expected_font_name
+                            ):
+                                unexpected_fonts.append(payload)
+                            if target_size is not None and size != target_size:
+                                unexpected_sizes.append(payload)
+
+            status = "pass"
+            if not spans:
+                status = "fail"
+            elif unexpected_fonts or unexpected_sizes:
+                status = "warn"
+
+            return {
+                "success": True,
+                "overall_status": status,
+                "pdf_file": audit_pdf_path if pdf_path else None,
+                "temporary_pdf_used": pdf_path is None,
+                "trusted_pdf": pdf_trusted,
+                "conversion": conversion,
+                "span_count": len(spans),
+                "font_counts": dict(font_counts),
+                "size_counts": dict(size_counts),
+                "expected_font_name": expected_font_name,
+                "expected_font_size": expected_font_size,
+                "unexpected_font_span_count": len(unexpected_fonts),
+                "unexpected_size_span_count": len(unexpected_sizes),
+                "unexpected_font_examples": unexpected_fonts[:10],
+                "unexpected_size_examples": unexpected_sizes[:10],
+            }
+        finally:
+            if temp_pdf:
+                try:
+                    os.unlink(temp_pdf)
+                except OSError:
+                    pass
 
     def audit_document_images(self, file_path: str) -> Dict[str, Any]:
         """Audit inline image sizing against available page content area."""
@@ -3586,7 +4251,6 @@ class DocumentOperations:
                     f"Detected {fonts['unexpected_size_run_count']} run(s) not matching expected font size {expected_font_size}."
                 )
             elif fonts["mixed_sizes"]:
-                size_status = "warn"
                 size_message = (
                     f"Multiple font sizes detected; dominant size is {fonts['dominant_font_size']}."
                 )
@@ -3938,6 +4602,100 @@ class DocumentOperations:
                     )
         return lines
 
+    def _header_footer_texts(self, doc: Any) -> set:
+        texts = set()
+        for section in doc.sections:
+            for part in (
+                section.header,
+                section.first_page_header,
+                section.even_page_header,
+                section.footer,
+                section.first_page_footer,
+                section.even_page_footer,
+            ):
+                for paragraph in self._iter_container_paragraphs(part):
+                    text = self._normalize_text(paragraph.text).lower()
+                    if text:
+                        texts.add(text)
+        return texts
+
+    def _rendered_header_footer_line_indexes(
+        self,
+        lines: List[Dict[str, Any]],
+        sections: List[Dict[str, Any]],
+        header_footer_texts: set,
+        tolerance_points: float,
+    ) -> Dict[str, Any]:
+        """Identify rendered header/footer artifacts so body/reference audits ignore them."""
+        if not lines:
+            return {"ignored_indexes": set(), "ignored_lines": [], "repeated_candidates": []}
+        default_margins = self._section_margin_points(sections, 0)
+
+        def in_artifact_band(line: Dict[str, Any]) -> bool:
+            page_height = float(line.get("page_height") or 0)
+            if page_height <= 0:
+                return False
+            top_band_bottom = default_margins["top"] + max(12.0, tolerance_points * 2)
+            bottom_band_top = page_height - default_margins["bottom"] - max(
+                12.0, tolerance_points * 2
+            )
+            return line["top"] <= top_band_bottom or line["bottom"] >= bottom_band_top
+
+        banded_by_text: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+        for idx, line in enumerate(lines):
+            normalized = self._normalize_text(line.get("text", "")).lower()
+            if not normalized or not in_artifact_band(line):
+                continue
+            banded_by_text.setdefault(normalized, []).append((idx, line))
+
+        repeated_texts = set()
+        repeated_candidates = []
+        for normalized, entries in banded_by_text.items():
+            pages = {entry[1].get("page_index") for entry in entries}
+            if len(pages) < 2:
+                continue
+            tops = [float(entry[1].get("top") or 0) for entry in entries]
+            if max(tops) - min(tops) <= max(8.0, tolerance_points * 1.5):
+                repeated_texts.add(normalized)
+                repeated_candidates.append(
+                    {
+                        "text": normalized[:120],
+                        "page_count": len(pages),
+                        "top_min": round(min(tops), 3),
+                        "top_max": round(max(tops), 3),
+                    }
+                )
+
+        ignored_indexes = set()
+        ignored_lines = []
+        for idx, line in enumerate(lines):
+            normalized = self._normalize_text(line.get("text", "")).lower()
+            if not normalized or not in_artifact_band(line):
+                continue
+            reason = None
+            if normalized in header_footer_texts:
+                reason = "matches_docx_header_footer_text"
+            elif normalized in repeated_texts:
+                reason = "repeated_header_footer_band_text"
+            if reason:
+                ignored_indexes.add(idx)
+                ignored_lines.append(
+                    {
+                        "line_index": idx,
+                        "page_number": line.get("page_number"),
+                        "text": line.get("text", "")[:120],
+                        "top": round(line.get("top", 0), 3),
+                        "bottom": round(line.get("bottom", 0), 3),
+                        "reason": reason,
+                    }
+                )
+
+        return {
+            "ignored_indexes": ignored_indexes,
+            "ignored_lines": ignored_lines,
+            "repeated_candidates": repeated_candidates[:10],
+        }
+
     def _line_matches_reference_start(self, line_text: str, reference_text: str) -> bool:
         line_norm = self._normalize_text(line_text).lower()
         ref_norm = self._normalize_text(reference_text).lower()
@@ -4023,7 +4781,19 @@ class DocumentOperations:
             if not block_payload.get("success"):
                 return block_payload
 
-            lines = self._pdf_lines_from_blocks(block_payload)
+            all_lines = self._pdf_lines_from_blocks(block_payload)
+            artifact_report = self._rendered_header_footer_line_indexes(
+                all_lines,
+                sections,
+                self._header_footer_texts(doc),
+                tolerance_points,
+            )
+            ignored_indexes = artifact_report["ignored_indexes"]
+            lines = [
+                {**line, "original_line_index": idx}
+                for idx, line in enumerate(all_lines)
+                if idx not in ignored_indexes
+            ]
             checks: List[Dict[str, Any]] = []
 
             def add_check(
@@ -4103,6 +4873,20 @@ class DocumentOperations:
                 },
             )
             add_check(
+                "rendered_header_footer_artifacts",
+                "pass",
+                (
+                    f"Ignored {len(artifact_report['ignored_lines'])} rendered header/footer artifact line(s)."
+                    if artifact_report["ignored_lines"]
+                    else "No rendered header/footer artifacts needed filtering."
+                ),
+                {
+                    "ignored_line_count": len(artifact_report["ignored_lines"]),
+                    "ignored_lines": artifact_report["ignored_lines"][:20],
+                    "repeated_candidates": artifact_report["repeated_candidates"],
+                },
+            )
+            add_check(
                 "pdf_text_rendered",
                 "pass" if lines else "warn",
                 (
@@ -4110,7 +4894,11 @@ class DocumentOperations:
                     if lines
                     else "Rendered PDF did not expose extractable text lines for geometry checks."
                 ),
-                {"line_count": len(lines)},
+                {
+                    "line_count": len(lines),
+                    "raw_line_count": len(all_lines),
+                    "ignored_header_footer_line_count": len(artifact_report["ignored_lines"]),
+                },
             )
 
             def finalize(
@@ -4734,6 +5522,7 @@ class DocumentOperations:
                     if app_name in files and clear_metadata:
                         root = ET.fromstring(files[app_name])
                         for tag in [
+                            "{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}Application",
                             "{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}Manager",
                             "{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}Company",
                             "{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}HyperlinkBase",
@@ -5158,6 +5947,300 @@ class DocumentOperations:
         result["submission_ready"] = audit.get("submission_ready") is True
         result["readiness_blockers"] = audit.get("readiness_blockers", [])
         return result
+
+    @staticmethod
+    def _safe_submission_basename(value: str) -> str:
+        stem = Path(value).stem if value else "submission"
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-")
+        return safe[:80] or "submission"
+
+    def _atomic_write_json(self, path: Path, payload: Dict[str, Any]) -> None:
+        data = json.dumps(payload, indent=2, default=str).encode("utf-8")
+        self._atomic_write_bytes(path, data)
+
+    @staticmethod
+    def _pdf_hidden_clean(pdf_hidden: Dict[str, Any]) -> bool:
+        return bool(
+            pdf_hidden.get("success")
+            and not pdf_hidden.get("nonempty_metadata")
+            and not pdf_hidden.get("has_xml_metadata")
+            and int(pdf_hidden.get("annotations_count") or 0) == 0
+            and int(pdf_hidden.get("embedded_files_count") or 0) == 0
+            and pdf_hidden.get("has_forms") in {False, None}
+        )
+
+    def submission_pack(
+        self,
+        file_path: str,
+        output_dir: str,
+        *,
+        basename: Optional[str] = None,
+        expected_page_size: Optional[str] = None,
+        expected_font_name: Optional[str] = None,
+        expected_font_size: Optional[float] = None,
+        render_profile: str = "auto",
+        sanitize_docx: bool = True,
+        sanitize_pdf: bool = True,
+        rendered_layout: bool = True,
+    ) -> Dict[str, Any]:
+        """Create a cleaned DOCX/PDF bundle with submission-readiness evidence."""
+        if not DOCX_AVAILABLE:
+            return {"success": False, "error": "python-docx not installed"}
+        try:
+            abs_path = str(Path(file_path).resolve())
+            if not os.path.exists(abs_path):
+                return {"success": False, "error": f"File not found: {file_path}"}
+            out_root = Path(output_dir).expanduser().resolve()
+            out_root.mkdir(parents=True, exist_ok=True)
+            base = self._safe_submission_basename(basename or abs_path)
+            clean_docx = str(out_root / f"{base}.clean.docx")
+            raw_pdf = str(out_root / f"{base}.raw.pdf")
+            final_pdf = str(out_root / f"{base}.pdf")
+            manifest_path = out_root / f"{base}.submission-pack.json"
+
+            source_doc = Document(abs_path)
+            source_text = self._visible_text_fingerprint(source_doc)
+
+            steps: List[Dict[str, Any]] = []
+            working_docx = abs_path
+            sanitize_result = None
+            if sanitize_docx:
+                sanitize_result = self.sanitize_document(
+                    abs_path,
+                    output_path=clean_docx,
+                    remove_comments=True,
+                    accept_revisions=True,
+                    clear_metadata=True,
+                    remove_custom_xml=True,
+                    set_remove_personal_information=True,
+                    canonicalize_ooxml=True,
+                )
+                steps.append(
+                    {
+                        "name": "docx_sanitize",
+                        "status": "pass" if sanitize_result.get("success") else "fail",
+                        "output_file": sanitize_result.get("output_file"),
+                        "error": sanitize_result.get("error"),
+                    }
+                )
+                if not sanitize_result.get("success"):
+                    payload = {
+                        "success": False,
+                        "file": abs_path,
+                        "output_dir": str(out_root),
+                        "submission_ready": False,
+                        "steps": steps,
+                        "sanitize_docx": sanitize_result,
+                    }
+                    self._atomic_write_json(manifest_path, payload)
+                    payload["manifest_file"] = str(manifest_path)
+                    return payload
+                working_docx = clean_docx
+            else:
+                shutil.copy2(abs_path, clean_docx)
+                working_docx = clean_docx
+                steps.append(
+                    {
+                        "name": "docx_sanitize",
+                        "status": "skipped",
+                        "output_file": clean_docx,
+                    }
+                )
+
+            cleaned_doc = Document(working_docx)
+            cleaned_text = self._visible_text_fingerprint(cleaned_doc)
+            text_preserved = source_text["sha256"] == cleaned_text["sha256"]
+
+            preflight = self.document_preflight(
+                working_docx,
+                expected_page_size=expected_page_size,
+                expected_font_name=expected_font_name,
+                expected_font_size=expected_font_size,
+                rendered_layout=rendered_layout,
+                render_profile=render_profile,
+            )
+            steps.append(
+                {
+                    "name": "docx_preflight",
+                    "status": preflight.get("overall_status", "fail")
+                    if preflight.get("success")
+                    else "fail",
+                    "submission_ready": preflight.get("submission_ready"),
+                    "error": preflight.get("error"),
+                }
+            )
+            if not preflight.get("success"):
+                payload = {
+                    "success": False,
+                    "file": abs_path,
+                    "clean_docx": working_docx,
+                    "output_dir": str(out_root),
+                    "submission_ready": False,
+                    "steps": steps,
+                    "docx_preflight": preflight,
+                }
+                self._atomic_write_json(manifest_path, payload)
+                payload["manifest_file"] = str(manifest_path)
+                return payload
+
+            conversion = self.doc_to_pdf(
+                working_docx,
+                output_path=raw_pdf,
+                layout_warnings=True,
+                render_profile=render_profile,
+            )
+            steps.append(
+                {
+                    "name": "docx_to_pdf",
+                    "status": conversion.get("layout_audit_status", "pass")
+                    if conversion.get("success")
+                    else "fail",
+                    "output_file": conversion.get("output_file"),
+                    "submission_ready": conversion.get("submission_ready"),
+                    "error": conversion.get("error"),
+                }
+            )
+            if not conversion.get("success"):
+                payload = {
+                    "success": False,
+                    "file": abs_path,
+                    "clean_docx": working_docx,
+                    "output_dir": str(out_root),
+                    "submission_ready": False,
+                    "steps": steps,
+                    "conversion": conversion,
+                }
+                self._atomic_write_json(manifest_path, payload)
+                payload["manifest_file"] = str(manifest_path)
+                return payload
+
+            pdf_sanitize_result = None
+            if sanitize_pdf:
+                pdf_sanitize_result = self.host.pdf_sanitize(
+                    raw_pdf,
+                    output_path=final_pdf,
+                    clear_metadata=True,
+                    remove_xml_metadata=True,
+                )
+                steps.append(
+                    {
+                        "name": "pdf_sanitize",
+                        "status": "pass" if pdf_sanitize_result.get("success") else "fail",
+                        "output_file": pdf_sanitize_result.get("output_file"),
+                        "error": pdf_sanitize_result.get("error"),
+                    }
+                )
+                if not pdf_sanitize_result.get("success"):
+                    payload = {
+                        "success": False,
+                        "file": abs_path,
+                        "clean_docx": working_docx,
+                        "raw_pdf": raw_pdf,
+                        "output_dir": str(out_root),
+                        "submission_ready": False,
+                        "steps": steps,
+                        "pdf_sanitize": pdf_sanitize_result,
+                    }
+                    self._atomic_write_json(manifest_path, payload)
+                    payload["manifest_file"] = str(manifest_path)
+                    return payload
+                try:
+                    if os.path.exists(raw_pdf) and raw_pdf != final_pdf:
+                        os.unlink(raw_pdf)
+                except OSError:
+                    pass
+            else:
+                if raw_pdf != final_pdf:
+                    os.replace(raw_pdf, final_pdf)
+                steps.append(
+                    {
+                        "name": "pdf_sanitize",
+                        "status": "skipped",
+                        "output_file": final_pdf,
+                    }
+                )
+
+            pdf_hidden = self.host.inspect_pdf_hidden_data(final_pdf)
+            steps.append(
+                {
+                    "name": "pdf_hidden_data",
+                    "status": "pass" if self._pdf_hidden_clean(pdf_hidden) else "warn",
+                    "output_file": final_pdf,
+                }
+            )
+
+            rendered_font = self.audit_document_fonts(
+                working_docx,
+                expected_font_name=expected_font_name,
+                expected_font_size=expected_font_size,
+                rendered=True,
+                pdf_path=final_pdf,
+                trusted_pdf=True,
+            )
+            steps.append(
+                {
+                    "name": "font_audit",
+                    "status": rendered_font.get("overall_status", "fail")
+                    if rendered_font.get("success")
+                    else "fail",
+                }
+            )
+
+            blockers = []
+            if not text_preserved:
+                blockers.append(
+                    {
+                        "name": "text_preservation",
+                        "status": "fail",
+                        "message": "Visible text changed while creating the submission pack.",
+                    }
+                )
+            for source in (preflight, conversion):
+                blockers.extend(source.get("readiness_blockers", []) or [])
+            if not self._pdf_hidden_clean(pdf_hidden):
+                blockers.append(
+                    {
+                        "name": "pdf_hidden_data",
+                        "status": "warn",
+                        "message": "Final PDF still contains metadata, annotations, forms, or embedded files requiring review.",
+                        "details": pdf_hidden,
+                    }
+                )
+            if rendered_font.get("overall_status") != "pass":
+                blockers.append(
+                    {
+                        "name": "font_audit",
+                        "status": rendered_font.get("overall_status", "fail"),
+                        "message": "DOCX/PDF font audit did not fully pass.",
+                        "details": rendered_font,
+                    }
+                )
+
+            submission_ready = not blockers and preflight.get("submission_ready") is True
+            payload = {
+                "success": True,
+                "file": abs_path,
+                "output_dir": str(out_root),
+                "clean_docx": working_docx,
+                "pdf_file": final_pdf,
+                "manifest_file": str(manifest_path),
+                "submission_ready": submission_ready,
+                "readiness_blockers": blockers,
+                "steps": steps,
+                "text_before": source_text,
+                "text_after": cleaned_text,
+                "text_preserved": text_preserved,
+                "sanitize_docx": sanitize_result,
+                "docx_preflight": preflight,
+                "conversion": conversion,
+                "pdf_sanitize": pdf_sanitize_result,
+                "pdf_hidden_data": pdf_hidden,
+                "font_audit": rendered_font,
+            }
+            self._atomic_write_json(manifest_path, payload)
+            return payload
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     def preview_document(
         self,

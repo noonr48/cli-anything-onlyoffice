@@ -1,8 +1,8 @@
-# CLI-Anything OnlyOffice v4.4.15
+# CLI-Anything OnlyOffice v4.4.16
 
 > Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs — designed for AI agents.
 
-**119 commands. 7 categories. Full JSON output. Production-safe.**
+**122 commands. 7 categories. Full JSON output. Production-safe.**
 
 Part of the [SLOANE OS](https://github.com/sloane-os) agent stack. Agents call this via `cli_anything_run(tool='onlyoffice', ...)`.
 
@@ -52,6 +52,7 @@ When calling from SLOANE OS or another agent, invoke via the venv binary directl
 
 `pip install -e .` installs all Python dependencies, including `pyshacl`.
 `setup-check --json` is the strict post-clone/post-pull gate: it also verifies external runtime dependencies that pip cannot install, including Docker and the `onlyoffice-documentserver` `x2t` converter.
+Use `setup-check --live-smoke --json` when you also want a real DOCX-to-PDF smoke through the running OnlyOffice converter.
 
 ---
 
@@ -102,7 +103,7 @@ All responses have `{"success": true, ...}` or `{"success": false, "error": "...
 
 ## Mode 1 — Documents (.docx)
 
-**33 commands** — full lifecycle from creation to APA references, plus image extraction, rendered page preview, submission preflight, rendered layout auditing, and hidden-data sanitization.
+**36 commands** — full lifecycle from creation to APA references, plus image extraction, rendered page preview, submission preflight, rendered layout/font auditing, whole-document normalization, submission packaging, and hidden-data sanitization.
 
 `.docx` files are OOXML containers, so generic text file readers will often treat them as binary. For agent use, rely on the semantic document commands below (`doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`) rather than raw file reads.
 
@@ -242,6 +243,18 @@ cli-anything-onlyoffice doc-formatting-info /tmp/essay.docx --start 50 --limit 2
 cli-anything-onlyoffice doc-formatting-info /tmp/essay.docx --all --json
 ```
 
+#### `doc-font-audit <file> [--expected-font <name>] [--expected-font-size <pt>] [--rendered] [--pdf <path>]`
+Audit declared DOCX fonts and, with `--rendered`, actual PDF span fonts after OnlyOffice conversion. The report includes DOCX run counts, theme-font leftovers, optional fontconfig matching, rendered PDF font names/sizes, and examples of mismatches.
+
+```bash
+cli-anything-onlyoffice doc-font-audit /tmp/submission.docx \
+  --expected-font "Times New Roman" --expected-font-size 12 --json
+cli-anything-onlyoffice doc-font-audit /tmp/submission.docx \
+  --expected-font "Times New Roman" --expected-font-size 12 --rendered --json
+cli-anything-onlyoffice doc-font-audit /tmp/submission.docx \
+  --expected-font "Times New Roman" --rendered --pdf /tmp/submission.pdf --json
+```
+
 ---
 
 ### Page Layout
@@ -257,6 +270,18 @@ cli-anything-onlyoffice doc-layout /tmp/essay.docx --orientation landscape --jso
 cli-anything-onlyoffice doc-layout /tmp/report.docx \
   --margin-top 1.0 --margin-bottom 1.0 --margin-left 1.25 --margin-right 1.25 \
   --header "Research Report 2026" --page-numbers --json
+```
+
+#### `doc-normalize-format <file> [output_path] [options]`
+Normalize common academic formatting across styles, visible runs, headers/footers, and reference paragraphs while reporting a text-preservation hash. Useful for applying a consistent student-submission format before rendered checks.
+
+Options include `--font`, `--body-size`, `--title-size`, `--line-spacing`, `--paragraph-after`, `--clear-theme-fonts`, `--skip-header-footer`, `--remove-style-borders`, and `--reference-hanging`.
+
+```bash
+cli-anything-onlyoffice doc-normalize-format /tmp/submission.docx /tmp/submission-formatted.docx \
+  --font "Times New Roman" --body-size 11 --title-size 12 \
+  --line-spacing double --paragraph-after 12 --clear-theme-fonts \
+  --remove-style-borders --reference-hanging 0.5 --json
 ```
 
 ---
@@ -359,7 +384,7 @@ cli-anything-onlyoffice doc-render-map /tmp/report.docx --json
 ```
 
 #### `doc-render-audit <file> [--pdf <path>] [--tolerance-points <n>] [--profile auto|generic|apa-references]`
-Convert the DOCX to PDF, or audit an existing converted PDF with `--pdf`, then compare rendered line boxes against DOCX reference layout intent. `auto` uses APA References checks when a References heading exists and generic margin-envelope checks otherwise. Externally supplied PDFs are reported as untrusted for submission-ready claims unless they were produced by this conversion pipeline.
+Convert the DOCX to PDF, or audit an existing converted PDF with `--pdf`, then compare rendered line boxes against DOCX reference layout intent. `auto` uses APA References checks when a References heading exists and generic margin-envelope checks otherwise. Repeated header/footer artifacts are filtered before body/reference checks. Externally supplied PDFs are reported as untrusted for submission-ready claims unless they were produced by this conversion pipeline.
 
 ```bash
 cli-anything-onlyoffice doc-render-audit /tmp/report.docx --json
@@ -429,6 +454,20 @@ cli-anything-onlyoffice doc-preflight /tmp/submission.docx \
   --expected-page-size A4 --expected-font "Times New Roman" --expected-font-size 12 \
   --rendered-layout --profile apa-references --json
 ```
+
+#### `doc-submission-pack <file> <output_dir> [options]`
+Create a clean submission bundle in one pass: sanitized/canonicalized DOCX, rendered PDF, sanitized PDF, hidden-data reports, rendered layout audit, rendered font audit, text-preservation fingerprint, and a JSON manifest. The manifest contains `submission_ready` plus exact blockers.
+
+```bash
+cli-anything-onlyoffice doc-submission-pack /tmp/submission.docx /tmp/submission-pack \
+  --basename final-submission \
+  --expected-page-size A4 \
+  --expected-font "Times New Roman" \
+  --expected-font-size 12 \
+  --profile apa-references --json
+```
+
+Use `--skip-docx-sanitize`, `--skip-pdf-sanitize`, or `--skip-rendered-layout` only when you deliberately want a partial pack; skipped rendered layout blocks submission-ready claims.
 
 #### `doc-sanitize <file> [output_path] [options]`
 Sanitize a DOCX for submission. Useful options: `--remove-comments`, `--accept-revisions`, `--clear-metadata`, `--remove-custom-xml`, `--set-remove-personal-information`, `--canonicalize-ooxml`, and metadata overrides such as `--author`.
@@ -1509,9 +1548,10 @@ Strict post-clone/post-pull dependency gate. Use this after `git pull` and `pip 
 
 ```bash
 cli-anything-onlyoffice setup-check --json
+cli-anything-onlyoffice setup-check --live-smoke --json
 ```
 
-Aliases: `update-check`, `doctor`.
+Aliases: `update-check`, `doctor`. The optional `--live-smoke` flag creates a temporary DOCX, renders it to PDF through x2t, reads the rendered PDF blocks, and checks stable facts such as PDF header, sentinel text, and font/size span metadata.
 
 #### `status`
 Check installation and all capability flags. `status` is informational and includes an `install_check` summary; use `setup-check` when automation must fail on missing dependencies.
@@ -1522,7 +1562,7 @@ cli-anything-onlyoffice status --json
 ```json
 {
   "success": true,
-  "version": "4.4.15",
+  "version": "4.4.16",
   "python": "/path/to/.venv/bin/python3",
   "python_docx": true,
   "openpyxl": true,
@@ -1581,14 +1621,14 @@ cli-anything-onlyoffice backup-restore /tmp/grades.xlsx --latest --dry-run --jso
 
 | Category | Count | Commands |
 |----------|-------|----------|
-| Documents (.docx) | 33 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, doc-formatting-info, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, **doc-render-map**, **doc-render-audit**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, **doc-inspect-hidden-data**, **doc-preflight**, **doc-sanitize**, doc-word-count |
+| Documents (.docx) | 36 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, **doc-normalize-format**, doc-formatting-info, **doc-font-audit**, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, **doc-render-map**, **doc-render-audit**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, **doc-inspect-hidden-data**, **doc-preflight**, **doc-submission-pack**, **doc-sanitize**, doc-word-count |
 | Spreadsheets (.xlsx) | 39 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export, **xlsx-add-validation**, **xlsx-add-dropdown**, **xlsx-list-validations**, **xlsx-remove-validation**, **xlsx-validate-data**, **xlsx-to-pdf**, **xlsx-preview** |
 | Charts (.xlsx) | 4 | chart-create, chart-comparison, chart-grade-dist, chart-progress |
 | Presentations (.pptx) | 15 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text, **pptx-extract-images**, **pptx-list-shapes**, **pptx-add-textbox**, **pptx-modify-shape**, **pptx-preview** |
 | PDF (.pdf) | 6 | **pdf-extract-images**, **pdf-page-to-image**, **pdf-read-blocks**, **pdf-search-blocks**, **pdf-inspect-hidden-data**, **pdf-sanitize** |
 | RDF Knowledge Graphs | 10 | rdf-create, rdf-read, rdf-add, rdf-remove, rdf-query, rdf-export, rdf-merge, rdf-stats, rdf-namespace, rdf-validate |
 | General | 12 | list, open, watch, info, backup-list, backup-prune, backup-restore, **editor-session**, **editor-capture**, **setup-check**, status, help |
-| **Total** | **119** | |
+| **Total** | **122** | |
 
 ---
 
@@ -1762,7 +1802,7 @@ result = cli_anything_run(tool="onlyoffice", args=[
 
 ```
 agent-harness/
-├── setup.py                          # Package config (v4.4.15)
+├── setup.py                          # Package config (v4.4.16)
 ├── README.md                         # This file
 ├── cli_anything/
 │   └── onlyoffice/
@@ -1810,6 +1850,7 @@ agent-harness/
 
 | Version | Changes |
 |---------|---------|
+| **4.4.16** | **Submission workflow hardening.** Added `doc-normalize-format`, `doc-font-audit`, and `doc-submission-pack`; rendered layout audits now filter repeated DOCX/PDF header-footer artifacts before body/reference checks; `setup-check --live-smoke` optionally runs a real DOCX-to-PDF converter smoke; DOCX sanitization clears extended `Application` metadata. |
 | **4.4.15** | **Install/update dependency gate.** `pyshacl` is now a core install dependency so `rdf-validate` is available after normal `pip install -e .`. Added `setup-check` (`update-check`/`doctor` aliases) as a strict post-clone/post-pull readiness check that validates required Python packages plus Docker/OnlyOffice x2t external conversion dependencies. `status` now includes an `install_check` summary while remaining informational. |
 | **4.4.14** | **Rendered-readiness and safety hardening.** Generic DOCX render audits now perform margin-envelope checks instead of passing on text presence alone, externally supplied PDFs block submission-ready claims unless trusted by the conversion pipeline, DOCX hidden-data inspection/sanitization covers timestamps, custom document properties, and all comment parts, RDF removal requires explicit selectors or `--all`, and PDF/PPTX extraction/rendering now enforce path and resource preflights. |
 | **4.4.13** | **DOCX OOXML canonicalization repair.** Added `doc-sanitize --canonicalize-ooxml` to rewrite legacy `ns0:` WordprocessingML parts back to stable canonical `w:` OOXML so OnlyOffice/x2t can honor DOCX page breaks, margins, and hanging indents without relying on Microsoft Word to repair the package. |

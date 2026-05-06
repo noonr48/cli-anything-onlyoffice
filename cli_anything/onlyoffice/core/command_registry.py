@@ -7,7 +7,7 @@ from copy import deepcopy
 from typing import Dict, List
 
 
-VERSION = "4.4.15"
+VERSION = "4.4.16"
 CLI_SCHEMA_VERSION = "1.0"
 
 
@@ -24,7 +24,9 @@ COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
         "doc-highlight <file> <search_text> [--color <name>]": "Highlight matching text",
         "doc-comment <file> <comment> [--paragraph <index>]": "Attach OOXML comment annotation",
         "doc-layout <file> [--size A4|Letter] [--orientation portrait|landscape] [--margin-* <in>] [--header <text>] [--page-numbers]": "Set page size/layout/margins/header/footer",
+        "doc-normalize-format <file> [output_path] [--font <name>] [--body-size <pt>] [--title-size <pt>] [--line-spacing <single|1.5|double>] [--paragraph-after <pt>] [--clear-theme-fonts] [--skip-header-footer] [--remove-style-borders] [--reference-hanging <in>]": "Normalize whole-document academic formatting",
         "doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]": "Inspect paragraph/section formatting, including indents, tabs, and page breaks",
+        "doc-font-audit <file> [--expected-font <name>] [--expected-font-size <pt>] [--rendered] [--pdf <path>]": "Audit DOCX-declared and optionally PDF-rendered fonts",
         "doc-set-style <file> <index> <style>": "Set paragraph style (Heading 1, Normal, etc.)",
         "doc-list-styles <file>": "List all available paragraph/character styles",
         "doc-add-table <file> <headers_csv> <data_csv>": "Add table (rows separated by ;)",
@@ -40,6 +42,7 @@ COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
         "doc-inspect-hidden-data <file>": "Inspect hidden DOCX metadata, comments, revisions, and custom XML",
         "doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--set-remove-personal-information] [--canonicalize-ooxml] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>]": "Sanitize DOCX for submission",
         "doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--rendered-layout] [--profile auto|generic|apa-references]": "Run submission-oriented DOCX preflight checks",
+        "doc-submission-pack <file> <output_dir> [--basename <name>] [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--profile auto|generic|apa-references] [--skip-docx-sanitize] [--skip-pdf-sanitize] [--skip-rendered-layout]": "Create cleaned DOCX/PDF submission pack with manifest",
         "doc-word-count <file>": "Word/character/paragraph counts",
         "doc-extract-images <file> <output_dir> [--format png|jpg] [--prefix <name>]": "Extract all embedded images from .docx",
         "doc-to-pdf <file> [output_path] [--layout-warnings] [--profile auto|generic|apa-references]": "Convert .docx to PDF via OnlyOffice",
@@ -205,12 +208,15 @@ USAGE_OVERRIDES: Dict[str, str] = {
     "doc-build-references": "doc-build-references <file>  (reads <file>.refs.json, appends APA 7th formatted References section)",
     "doc-delete": "doc-delete <file> <paragraph_index>",
     "doc-formatting-info": "doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]",
+    "doc-font-audit": "doc-font-audit <file> [--expected-font <name>] [--expected-font-size <pt>] [--rendered] [--pdf <path>]",
     "doc-layout": "doc-layout <file> [--size <A4|Letter>] [--orientation <portrait|landscape>] [--margin-top <in>] [--margin-bottom <in>] [--margin-left <in>] [--margin-right <in>] [--header <text>] [--page-numbers]",
+    "doc-normalize-format": "doc-normalize-format <file> [output_path] [--font <name>] [--body-size <pt>] [--title-size <pt>] [--line-spacing <single|1.5|double>] [--paragraph-after <pt>] [--clear-theme-fonts] [--skip-header-footer] [--remove-style-borders] [--reference-hanging <in>]",
     "doc-preflight": "doc-preflight <file> [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--rendered-layout] [--profile auto|generic|apa-references]",
     "doc-render-audit": "doc-render-audit <file> [--pdf <path>] [--tolerance-points <n>] [--profile auto|generic|apa-references]",
     "doc-sanitize": "doc-sanitize <file> [output_path] [--remove-comments] [--accept-revisions] [--clear-metadata] [--remove-custom-xml] [--set-remove-personal-information] [--canonicalize-ooxml] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>]",
     "doc-set-metadata": "doc-set-metadata <file> [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>] [--comments <c>] [--category <cat>]",
     'doc-set-style': 'doc-set-style <file> <paragraph_index> <style>  (e.g., "Heading 1", "Heading 2", "Normal", "Title")',
+    "doc-submission-pack": "doc-submission-pack <file> <output_dir> [--basename <name>] [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--profile auto|generic|apa-references] [--skip-docx-sanitize] [--skip-pdf-sanitize] [--skip-rendered-layout]",
     "doc-to-pdf": "doc-to-pdf <file> [output_path] [--layout-warnings] [--profile auto|generic|apa-references]",
     "pdf-sanitize": "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>] [--creator <c>] [--producer <p>]",
     "pptx-add-textbox": "pptx-add-textbox <file> <slide_index> <text> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--font-size <pt>] [--font-name <name>] [--bold] [--italic] [--color <hex>] [--align <left|center|right>]",
@@ -307,7 +313,25 @@ CAPABILITY_DETAILS: Dict[str, Dict[str, object]] = {
         "label": "DOCX formatting",
         "category": "DOCUMENTS (.docx)",
         "requires": ["python_docx"],
-        "commands": ["doc-format", "doc-layout", "doc-formatting-info", "doc-render-audit"],
+        "commands": [
+            "doc-format",
+            "doc-layout",
+            "doc-normalize-format",
+            "doc-formatting-info",
+            "doc-font-audit",
+            "doc-render-audit",
+        ],
+    },
+    "docx_submission": {
+        "label": "DOCX submission readiness",
+        "category": "DOCUMENTS (.docx)",
+        "requires": ["python_docx"],
+        "commands": [
+            "doc-inspect-hidden-data",
+            "doc-sanitize",
+            "doc-preflight",
+            "doc-submission-pack",
+        ],
     },
     "docx_references": {
         "label": "DOCX references",
