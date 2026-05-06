@@ -363,6 +363,38 @@ def handle_doc_command(
         print_result(doc_server.build_references(raw_args[0]), json_output)
         return True
 
+    if command == "doc-citation-audit":
+        if not raw_args:
+            print_result(
+                {
+                    "success": False,
+                    "error": command_usage("doc-citation-audit"),
+                },
+                json_output,
+            )
+            return True
+        if not docx_available:
+            return _docx_unavailable(json_output, print_result)
+        parsed = _parse_options(
+            command,
+            raw_args,
+            1,
+            json_output,
+            print_result,
+            flag_options=("--include-sidecar",),
+        )
+        if parsed is None:
+            return True
+        _values, flags, _positionals = parsed
+        print_result(
+            doc_server.citation_audit(
+                raw_args[0],
+                include_sidecar=flags["include_sidecar"],
+            ),
+            json_output,
+        )
+        return True
+
     if command == "doc-add-table":
         if len(raw_args) < 3:
             print_result(

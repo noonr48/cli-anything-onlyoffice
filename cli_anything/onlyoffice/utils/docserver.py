@@ -1046,6 +1046,17 @@ class DocumentServerClient:
     def build_references(self, file_path: str) -> Dict[str, Any]:
         return self._doc_ops.build_references(file_path)
 
+    def citation_audit(
+        self,
+        file_path: str,
+        *,
+        include_sidecar: bool = False,
+    ) -> Dict[str, Any]:
+        return self._doc_ops.citation_audit(
+            file_path,
+            include_sidecar=include_sidecar,
+        )
+
     def add_image(
         self,
         file_path: str,
@@ -2121,6 +2132,27 @@ class DocumentServerClient:
     ) -> Dict[str, Any]:
         return self._pdf_ops.page_to_image(file_path, output_dir, pages=pages, dpi=dpi, fmt=fmt)
 
+    def pdf_map_page(
+        self,
+        file_path: str,
+        page_index: int,
+        output_image: str,
+        *,
+        dpi: int = 150,
+        fmt: str = "png",
+        labels: bool = True,
+        include_images: bool = True,
+    ) -> Dict[str, Any]:
+        return self._pdf_ops.map_page(
+            file_path,
+            page_index,
+            output_image,
+            dpi=dpi,
+            fmt=fmt,
+            labels=labels,
+            include_images=include_images,
+        )
+
     def pdf_sanitize(
         self,
         file_path: str,
@@ -2128,6 +2160,9 @@ class DocumentServerClient:
         *,
         clear_metadata: bool = False,
         remove_xml_metadata: bool = False,
+        remove_annotations: bool = False,
+        remove_embedded_files: bool = False,
+        flatten_forms: bool = False,
         author: Optional[str] = None,
         title: Optional[str] = None,
         subject: Optional[str] = None,
@@ -2140,12 +2175,151 @@ class DocumentServerClient:
             output_path=output_path,
             clear_metadata=clear_metadata,
             remove_xml_metadata=remove_xml_metadata,
+            remove_annotations=remove_annotations,
+            remove_embedded_files=remove_embedded_files,
+            flatten_forms=flatten_forms,
             author=author,
             title=title,
             subject=subject,
             keywords=keywords,
             creator=creator,
             producer=producer,
+        )
+
+    def pdf_compact(
+        self,
+        file_path: str,
+        output_path: str = None,
+        *,
+        garbage: int = 4,
+        deflate: bool = True,
+        clean: bool = True,
+        linearize: bool = False,
+    ) -> Dict[str, Any]:
+        return self._pdf_ops.compact(
+            file_path,
+            output_path=output_path,
+            garbage=garbage,
+            deflate=deflate,
+            clean=clean,
+            linearize=linearize,
+        )
+
+    def pdf_merge(self, input_files: List[str], output_path: str) -> Dict[str, Any]:
+        return self._pdf_ops.merge(input_files, output_path)
+
+    def pdf_split(
+        self,
+        file_path: str,
+        output_dir: str,
+        *,
+        pages: str = None,
+        prefix: str = "page",
+    ) -> Dict[str, Any]:
+        return self._pdf_ops.split(file_path, output_dir, pages=pages, prefix=prefix)
+
+    def pdf_reorder(
+        self,
+        file_path: str,
+        page_order: str,
+        output_path: str = None,
+    ) -> Dict[str, Any]:
+        return self._pdf_ops.reorder(file_path, page_order, output_path=output_path)
+
+    def pdf_add_text(
+        self,
+        file_path: str,
+        page_index: int,
+        text: str,
+        output_path: str = None,
+        *,
+        x: float = 72.0,
+        y: float = 72.0,
+        width: float = 300.0,
+        height: float = 72.0,
+        font_size: float = 11.0,
+        font_name: str = "helv",
+        color: str = "000000",
+        rotation: int = 0,
+    ) -> Dict[str, Any]:
+        return self._pdf_ops.add_text(
+            file_path,
+            page_index,
+            text,
+            output_path=output_path,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            font_size=font_size,
+            font_name=font_name,
+            color=color,
+            rotation=rotation,
+        )
+
+    def pdf_add_image(
+        self,
+        file_path: str,
+        page_index: int,
+        image_path: str,
+        output_path: str = None,
+        *,
+        x: float = 72.0,
+        y: float = 72.0,
+        width: float = 144.0,
+        height: float = 144.0,
+        keep_proportion: bool = True,
+    ) -> Dict[str, Any]:
+        return self._pdf_ops.add_image(
+            file_path,
+            page_index,
+            image_path,
+            output_path=output_path,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            keep_proportion=keep_proportion,
+        )
+
+    def pdf_redact(
+        self,
+        file_path: str,
+        output_path: str = None,
+        *,
+        text: str = None,
+        rects: Optional[List[str]] = None,
+        pages: str = None,
+        case_sensitive: bool = False,
+        fill: str = "000000",
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        return self._pdf_ops.redact(
+            file_path,
+            output_path=output_path,
+            text=text,
+            rects=rects,
+            pages=pages,
+            case_sensitive=case_sensitive,
+            fill=fill,
+            dry_run=dry_run,
+        )
+
+    def pdf_redact_block(
+        self,
+        file_path: str,
+        block_id: str,
+        output_path: str = None,
+        *,
+        fill: str = "000000",
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        return self._pdf_ops.redact_block(
+            file_path,
+            block_id,
+            output_path=output_path,
+            fill=fill,
+            dry_run=dry_run,
         )
 
     @staticmethod

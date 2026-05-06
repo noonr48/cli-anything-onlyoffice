@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLI-Anything OnlyOffice v4.4.16 - FULL OFFICE SUITE + RDF CONTROL
+CLI-Anything OnlyOffice v4.4.19 - FULL OFFICE SUITE + RDF CONTROL
 Programmatic control over Documents (.docx), Spreadsheets (.xlsx),
 Presentations (.pptx), and RDF Knowledge Graphs.
 

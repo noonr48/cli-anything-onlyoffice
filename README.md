@@ -1,8 +1,8 @@
-# CLI-Anything OnlyOffice v4.4.16
+# CLI-Anything OnlyOffice v4.4.19
 
 > Programmatic control over Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs — designed for AI agents.
 
-**122 commands. 7 categories. Full JSON output. Production-safe.**
+**132 commands. 7 categories. Full JSON output. Production-safe.**
 
 Part of the [SLOANE OS](https://github.com/sloane-os) agent stack. Agents call this via `cli_anything_run(tool='onlyoffice', ...)`.
 
@@ -103,7 +103,7 @@ All responses have `{"success": true, ...}` or `{"success": false, "error": "...
 
 ## Mode 1 — Documents (.docx)
 
-**36 commands** — full lifecycle from creation to APA references, plus image extraction, rendered page preview, submission preflight, rendered layout/font auditing, whole-document normalization, submission packaging, and hidden-data sanitization.
+**37 commands** — full lifecycle from creation to APA references and citation/reference audits, plus image extraction, rendered page preview, submission preflight, rendered layout/font auditing, whole-document normalization, submission packaging, and hidden-data sanitization.
 
 `.docx` files are OOXML containers, so generic text file readers will often treat them as binary. For agent use, rely on the semantic document commands below (`doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`) rather than raw file reads.
 
@@ -503,6 +503,14 @@ Build a formatted APA 7th edition References section from the sidecar `.refs.jso
 
 ```bash
 cli-anything-onlyoffice doc-build-references /tmp/essay.docx --json
+```
+
+#### `doc-citation-audit <file> [--include-sidecar]`
+Run a read-only APA-like internal consistency audit between in-text citations and the DOCX References section. This does not use the network and does not verify source existence, DOI correctness, or whether a claim is supported by the source.
+
+```bash
+cli-anything-onlyoffice doc-citation-audit /tmp/essay.docx --json
+cli-anything-onlyoffice doc-citation-audit /tmp/essay.docx --include-sidecar --json
 ```
 
 ---
@@ -1215,7 +1223,9 @@ cli-anything-onlyoffice pptx-preview /tmp/lecture.pptx /tmp/previews --slide 1 -
 
 ## Mode 5 — PDF Native Blocks + Image Operations
 
-**6 commands** — read/search native PDF blocks, extract/render images, inspect hidden PDF data, or sanitize PDF metadata using PyMuPDF.
+**15 commands** — read/search native PDF blocks, extract/render images, inspect hidden PDF data, sanitize metadata, and perform opt-in PDF compaction, stitching, page extraction/reorder, redaction, and text/image overlays using PyMuPDF.
+
+**PDF page indexing:** PDF page numbers and page ranges are zero-based and inclusive across PDF commands. Human-visible page 1 is CLI page `0`; visible pages 1-4 are `--pages 0-3`; visible pages 2 and 4 are `--pages 1,3`.
 
 #### `pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]`
 Extract embedded image objects (photos, figures, charts) from a PDF.
@@ -1253,6 +1263,13 @@ cli-anything-onlyoffice pdf-page-to-image /tmp/paper.pdf /tmp/pages --pages 0,3,
 
 Page ranges: `0-3` (pages 0 through 3), `1,3,5` (specific pages), omit for all. Default DPI: 150.
 
+#### `pdf-map-page <file> <page> <output_image> [--dpi <n>] [--format png|jpg] [--no-labels] [--no-images]`
+Render one PDF page with visible native block boxes and `block_id` labels. Use this before block-guided redaction or manual coordinate work.
+
+```bash
+cli-anything-onlyoffice pdf-map-page /tmp/form.pdf 0 /tmp/form-map.png --json
+```
+
 #### `pdf-inspect-hidden-data <file>`
 Inspect hidden PDF metadata, XMP/XML metadata presence, annotations, embedded files, form usage, and page-size consistency.
 
@@ -1261,11 +1278,75 @@ cli-anything-onlyoffice pdf-inspect-hidden-data /tmp/submission.pdf --json
 ```
 
 #### `pdf-sanitize <file> [output_path] [options]`
-Clear PDF metadata/XMP and optionally set replacement metadata such as `--author`.
+Clear PDF metadata/XMP and, only when explicitly requested, remove annotations, remove embedded files/attachments, or flatten form fields.
 
 ```bash
 cli-anything-onlyoffice pdf-sanitize /tmp/submission.pdf /tmp/submission-clean.pdf \
   --clear-metadata --remove-xml-metadata --author benbi --json
+cli-anything-onlyoffice pdf-sanitize /tmp/submission.pdf /tmp/submission-clean.pdf \
+  --clear-metadata --remove-xml-metadata --remove-annotations \
+  --remove-embedded-files --flatten-forms --json
+```
+
+#### `pdf-compact <file> [output_path] [options]`
+Explicitly compact/optimize a PDF. This is never applied by default by `doc-to-pdf`, `pdf-sanitize`, or `doc-submission-pack`; run this command only when compression is intended.
+
+```bash
+cli-anything-onlyoffice pdf-compact /tmp/large.pdf /tmp/large-compact.pdf --json
+cli-anything-onlyoffice pdf-compact /tmp/large.pdf /tmp/large-linear.pdf --linearize --json
+```
+
+#### `pdf-merge <input_file> <input_file> [input_file ...] --output <file>`
+Stitch multiple PDFs into a single output file.
+
+```bash
+cli-anything-onlyoffice pdf-merge /tmp/a.pdf /tmp/b.pdf --output /tmp/combined.pdf --json
+```
+
+#### `pdf-split <file> <output_dir> [--pages <range>] [--prefix <name>]`
+Split selected zero-based pages into one-page PDF files.
+
+```bash
+# Split human-visible pages 1-4
+cli-anything-onlyoffice pdf-split /tmp/combined.pdf /tmp/pages --pages 0-3 --prefix page --json
+```
+
+#### `pdf-reorder <file> <page_order> [output_path]`
+Create a PDF with pages in an explicit zero-based order. Unlike read/render page ranges, duplicates and order are preserved.
+
+```bash
+cli-anything-onlyoffice pdf-reorder /tmp/combined.pdf 2,0,1 /tmp/reordered.pdf --json
+```
+
+#### `pdf-add-text <file> <page> <text> [options]`
+Overlay bounded text onto a PDF page. Coordinates are points from the top-left page origin.
+
+```bash
+cli-anything-onlyoffice pdf-add-text /tmp/form.pdf 0 "Reviewed" \
+  --output /tmp/form-reviewed.pdf --x 72 --y 72 --width 180 --height 36 --font-size 14 --json
+```
+
+#### `pdf-add-image <file> <page> <image_path> [options]`
+Overlay an image onto a PDF page. Image inputs are safety-checked with the existing bounded decode path.
+
+```bash
+cli-anything-onlyoffice pdf-add-image /tmp/form.pdf 0 /tmp/stamp.png \
+  --output /tmp/form-stamped.pdf --x 72 --y 120 --width 96 --height 96 --json
+```
+
+#### `pdf-redact <file> [output_path] (--text <query> | --rect <page,left,top,right,bottom>) [options]`
+Apply true PDF redactions by exact text match or rectangle. Use `--dry-run` first to inspect matches.
+
+```bash
+cli-anything-onlyoffice pdf-redact /tmp/form.pdf /tmp/form-redacted.pdf --text "SECRET" --json
+cli-anything-onlyoffice pdf-redact /tmp/form.pdf --rect 0,72,72,220,120 --dry-run --json
+```
+
+#### `pdf-redact-block <file> <block_id> [output_path] [--fill <hex>] [--dry-run]`
+Apply true PDF redaction to one native `block_id` from `pdf-read-blocks` or `pdf-map-page`.
+
+```bash
+cli-anything-onlyoffice pdf-redact-block /tmp/form.pdf page_0_block_3 /tmp/form-redacted.pdf --json
 ```
 
 #### `pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]`
@@ -1562,7 +1643,7 @@ cli-anything-onlyoffice status --json
 ```json
 {
   "success": true,
-  "version": "4.4.16",
+  "version": "4.4.19",
   "python": "/path/to/.venv/bin/python3",
   "python_docx": true,
   "openpyxl": true,
@@ -1621,14 +1702,14 @@ cli-anything-onlyoffice backup-restore /tmp/grades.xlsx --latest --dry-run --jso
 
 | Category | Count | Commands |
 |----------|-------|----------|
-| Documents (.docx) | 36 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, **doc-normalize-format**, doc-formatting-info, **doc-font-audit**, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, **doc-render-map**, **doc-render-audit**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, doc-set-metadata, doc-get-metadata, **doc-inspect-hidden-data**, **doc-preflight**, **doc-submission-pack**, **doc-sanitize**, doc-word-count |
+| Documents (.docx) | 37 | doc-create, doc-read, doc-append, doc-replace, doc-search, doc-insert, doc-delete, doc-format, doc-set-style, doc-list-styles, doc-highlight, doc-comment, doc-layout, **doc-normalize-format**, doc-formatting-info, **doc-font-audit**, doc-add-table, doc-read-tables, doc-add-image, doc-extract-images, **doc-to-pdf**, **doc-preview**, **doc-render-map**, **doc-render-audit**, doc-add-hyperlink, doc-add-page-break, doc-add-list, doc-add-reference, doc-build-references, **doc-citation-audit**, doc-set-metadata, doc-get-metadata, **doc-inspect-hidden-data**, **doc-preflight**, **doc-submission-pack**, **doc-sanitize**, doc-word-count |
 | Spreadsheets (.xlsx) | 39 | xlsx-create, xlsx-write, xlsx-read, xlsx-append, xlsx-search, xlsx-cell-read, xlsx-cell-write, xlsx-range-read, xlsx-delete-rows, xlsx-delete-cols, xlsx-sort, xlsx-filter, xlsx-calc, xlsx-formula, xlsx-formula-audit, xlsx-freq, xlsx-corr, xlsx-ttest, xlsx-mannwhitney, xlsx-chi2, xlsx-research-pack, xlsx-text-extract, xlsx-text-keywords, xlsx-sheet-list, xlsx-sheet-add, xlsx-sheet-delete, xlsx-sheet-rename, xlsx-merge-cells, xlsx-unmerge-cells, xlsx-format-cells, xlsx-csv-import, xlsx-csv-export, **xlsx-add-validation**, **xlsx-add-dropdown**, **xlsx-list-validations**, **xlsx-remove-validation**, **xlsx-validate-data**, **xlsx-to-pdf**, **xlsx-preview** |
 | Charts (.xlsx) | 4 | chart-create, chart-comparison, chart-grade-dist, chart-progress |
 | Presentations (.pptx) | 15 | pptx-create, pptx-add-slide, pptx-add-bullets, pptx-add-table, pptx-add-image, pptx-read, pptx-slide-count, pptx-delete-slide, pptx-speaker-notes, pptx-update-text, **pptx-extract-images**, **pptx-list-shapes**, **pptx-add-textbox**, **pptx-modify-shape**, **pptx-preview** |
-| PDF (.pdf) | 6 | **pdf-extract-images**, **pdf-page-to-image**, **pdf-read-blocks**, **pdf-search-blocks**, **pdf-inspect-hidden-data**, **pdf-sanitize** |
+| PDF (.pdf) | 15 | **pdf-extract-images**, **pdf-page-to-image**, **pdf-map-page**, **pdf-read-blocks**, **pdf-search-blocks**, **pdf-inspect-hidden-data**, **pdf-sanitize**, **pdf-compact**, **pdf-merge**, **pdf-split**, **pdf-reorder**, **pdf-add-text**, **pdf-add-image**, **pdf-redact**, **pdf-redact-block** |
 | RDF Knowledge Graphs | 10 | rdf-create, rdf-read, rdf-add, rdf-remove, rdf-query, rdf-export, rdf-merge, rdf-stats, rdf-namespace, rdf-validate |
 | General | 12 | list, open, watch, info, backup-list, backup-prune, backup-restore, **editor-session**, **editor-capture**, **setup-check**, status, help |
-| **Total** | **122** | |
+| **Total** | **132** | |
 
 ---
 
@@ -1765,6 +1846,7 @@ cli-anything-onlyoffice doc-add-reference /tmp/essay.docx \
 
 # Build references section
 cli-anything-onlyoffice doc-build-references /tmp/essay.docx --json
+cli-anything-onlyoffice doc-citation-audit /tmp/essay.docx --json
 cli-anything-onlyoffice doc-word-count /tmp/essay.docx --json
 ```
 
@@ -1802,7 +1884,7 @@ result = cli_anything_run(tool="onlyoffice", args=[
 
 ```
 agent-harness/
-├── setup.py                          # Package config (v4.4.16)
+├── setup.py                          # Package config (v4.4.19)
 ├── README.md                         # This file
 ├── cli_anything/
 │   └── onlyoffice/
@@ -1850,6 +1932,9 @@ agent-harness/
 
 | Version | Changes |
 |---------|---------|
+| **4.4.19** | **Explicit PDF cleanup and block-guided redaction.** `pdf-sanitize` can now explicitly remove annotations, remove embedded files/attachments, and flatten form fields when requested. Added `pdf-map-page` and `pdf-redact-block` for visual block-id mapping and block-level redaction without OCR. |
+| **4.4.18** | **Citation audit and exact text redaction.** Added read-only `doc-citation-audit` for deterministic APA-like in-text/reference-list consistency checks without network/source verification. Hardened `pdf-redact --text` to use exact character-level match geometry instead of redacting the entire surrounding text span. |
+| **4.4.17** | **Opt-in PDF compaction and editing.** Added standalone `pdf-compact`, `pdf-merge`, `pdf-split`, `pdf-reorder`, `pdf-add-text`, `pdf-add-image`, and `pdf-redact`. Compression/compaction is explicit only and is not applied by default in `doc-to-pdf`, `pdf-sanitize`, or `doc-submission-pack`. Mutating PDF operations use locked atomic saves and safety preflights. |
 | **4.4.16** | **Submission workflow hardening.** Added `doc-normalize-format`, `doc-font-audit`, and `doc-submission-pack`; rendered layout audits now filter repeated DOCX/PDF header-footer artifacts before body/reference checks; `setup-check --live-smoke` optionally runs a real DOCX-to-PDF converter smoke; DOCX sanitization clears extended `Application` metadata. |
 | **4.4.15** | **Install/update dependency gate.** `pyshacl` is now a core install dependency so `rdf-validate` is available after normal `pip install -e .`. Added `setup-check` (`update-check`/`doctor` aliases) as a strict post-clone/post-pull readiness check that validates required Python packages plus Docker/OnlyOffice x2t external conversion dependencies. `status` now includes an `install_check` summary while remaining informational. |
 | **4.4.14** | **Rendered-readiness and safety hardening.** Generic DOCX render audits now perform margin-envelope checks instead of passing on text presence alone, externally supplied PDFs block submission-ready claims unless trusted by the conversion pipeline, DOCX hidden-data inspection/sanitization covers timestamps, custom document properties, and all comment parts, RDF removal requires explicit selectors or `--all`, and PDF/PPTX extraction/rendering now enforce path and resource preflights. |

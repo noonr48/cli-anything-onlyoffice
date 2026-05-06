@@ -1,16 +1,28 @@
 ---
 name: onlyoffice
-version: 4.4.16
+version: 4.4.19
 author: SLOANE OS
-description: 122-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
+description: 132-command CLI for Documents (.docx), Spreadsheets (.xlsx), Presentations (.pptx), PDFs, and RDF Knowledge Graphs
 tags: [productivity, documents, office, onlyoffice, charts, spreadsheets, rdf, apa, pdf, image-extraction, spatial, data-validation]
 ---
 
-# CLI-Anything OnlyOffice v4.4.16
+# CLI-Anything OnlyOffice v4.4.19
 
 Programmatic control over Office documents designed for AI agents. Full JSON output. Production-safe with atomic writes, two-layer file locking, and automatic backups.
 
-## What's New in v4.4.16
+## What's New in v4.4.19
+- **Explicit PDF Cleanup** — `pdf-sanitize` can remove annotations, embedded files/attachments, and flatten form fields only when explicitly requested
+- **Block-Guided PDF Editing** — `pdf-map-page` renders block-id overlays and `pdf-redact-block` redacts a selected native block without OCR
+
+## Carry Forward from v4.4.18
+- **Citation Audit** — `doc-citation-audit` checks APA-like in-text citations against the DOCX References section without network/source verification
+- **Exact Text Redaction** — `pdf-redact --text` uses character-level match rectangles so it does not redact the whole surrounding text span
+
+## Carry Forward from v4.4.17
+- **Opt-In PDF Editing** — `pdf-compact`, `pdf-merge`, `pdf-split`, `pdf-reorder`, `pdf-add-text`, `pdf-add-image`, and `pdf-redact` add explicit PDF compaction/stitching/editing commands
+- **No Default Compression** — PDF compaction/compression only runs when the user explicitly calls `pdf-compact`; it is not a default step in `doc-to-pdf`, `pdf-sanitize`, or `doc-submission-pack`
+
+## Carry Forward from v4.4.16
 - **Submission Pack Workflow** — `doc-submission-pack` creates a cleaned DOCX/PDF bundle with hidden-data checks, rendered layout/font evidence, text-preservation fingerprint, and a JSON manifest
 - **Whole-Document Formatting** — `doc-normalize-format` applies academic formatting across styles, runs, headers/footers, and References hanging indents without treating DOCX as text
 - **Rendered Font Audit** — `doc-font-audit --rendered` compares declared DOCX fonts with actual PDF span fonts after OnlyOffice conversion
@@ -67,7 +79,7 @@ Check the `python` field in the response — it must point to `.venv/bin/python3
 `.docx`, `.xlsx`, and `.pptx` are OOXML containers (zip/XML packages), so generic text Read/Write tools will often fail or report them as binary.
 
 **Do not treat that as a capability gap.** Use this tool's semantic commands instead:
-- DOCX: `doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`, `doc-add-image`, `doc-to-pdf`, `doc-preview`, `doc-render-map`, `doc-render-audit`
+- DOCX: `doc-read`, `doc-append`, `doc-replace`, `doc-search`, `doc-read-tables`, `doc-citation-audit`, `doc-add-image`, `doc-to-pdf`, `doc-preview`, `doc-render-map`, `doc-render-audit`
 - XLSX: `xlsx-read`, `xlsx-cell-read`, `xlsx-range-read`, `xlsx-write`, `xlsx-cell-write`, `xlsx-preview`
 - PPTX: `pptx-read`, `pptx-add-slide`, `pptx-update-text`, `pptx-preview`
 
@@ -94,7 +106,7 @@ If you need the rendered visual layout, use preview/export commands rather than 
 
 ---
 
-## DOCUMENTS (.docx) — 36 commands
+## DOCUMENTS (.docx) — 37 commands
 
 ### Core CRUD
 - `doc-create <file> <title> <content>`
@@ -141,6 +153,7 @@ If you need the rendered visual layout, use preview/export commands rather than 
 ### References (APA 7th)
 - `doc-add-reference <file> <ref_json>` — types: journal, book, website, report, chapter
 - `doc-build-references <file>`
+- `doc-citation-audit <file> [--include-sidecar]`
 
 ### Rendered Output
 - `doc-to-pdf <file> [output_path] [--layout-warnings] [--profile auto|generic|apa-references]`
@@ -264,17 +277,27 @@ Types: bar, column, bar_horizontal, line, pie, scatter
 
 ---
 
-## PDF (.pdf) — 6 commands
+## PDF (.pdf) — 15 commands
 
 - `pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]` — extract embedded image objects (PyMuPDF)
 - `pdf-page-to-image <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]` — render full pages as images
+- `pdf-map-page <file> <page> <output_image> [--dpi <n>] [--format png|jpg] [--no-labels] [--no-images]` — render block-id overlays for visual selection
 - `pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]` — read native PDF blocks/lines/spans with bbox metadata
 - `pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]` — search exact PDF blocks/spans and return native anchors
 - `pdf-inspect-hidden-data <file>` — inspect metadata, XMP/XML metadata, annotations, embedded files, form usage, and page-size consistency
-- `pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>]` — clear PDF metadata/XMP for submission
+- `pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--remove-annotations] [--remove-embedded-files] [--flatten-forms] [--author <a>]` — clear PDF metadata/XMP and explicitly requested hidden objects
+- `pdf-compact <file> [output_path] [--garbage <0-4>] [--no-deflate] [--no-clean] [--linearize]` — explicitly compact/optimize a PDF; never automatic
+- `pdf-merge <input_file> <input_file> [input_file ...] --output <file>` — stitch PDFs together
+- `pdf-split <file> <output_dir> [--pages <range>] [--prefix <name>]` — split pages into one-page PDFs
+- `pdf-reorder <file> <page_order> [output_path]` — create a PDF in explicit page order, preserving duplicates
+- `pdf-add-text <file> <page> <text> [--output <file>] [--x <pt>] [--y <pt>] [--width <pt>] [--height <pt>] [--font-size <pt>] [--font <name>] [--color <hex>] [--rotation <0|90|180|270>]` — overlay bounded text
+- `pdf-add-image <file> <page> <image_path> [--output <file>] [--x <pt>] [--y <pt>] [--width <pt>] [--height <pt>] [--no-keep-proportion]` — overlay an image
+- `pdf-redact <file> [output_path] (--text <query> | --rect <page,left,top,right,bottom>) [--pages <range>] [--case-sensitive] [--fill <hex>] [--dry-run]` — apply true exact text or rectangle redactions
+- `pdf-redact-block <file> <block_id> [output_path] [--fill <hex>] [--dry-run]` — redact a native block from `pdf-map-page` or `pdf-read-blocks`
 
-Page ranges: `0-3` (pages 0 through 3), `1,3,5` (specific pages), omit for all pages.
+Page ranges are zero-based and inclusive across PDF commands: human-visible page 1 is CLI page `0`; visible pages 1-4 are `0-3`; visible pages 2 and 4 are `1,3`; omit for all pages.
 Default DPI: 150. Use 300 for print quality.
+Compression/compaction rule: do not run `pdf-compact` unless the user explicitly requests PDF compaction/compression.
 
 ---
 
@@ -324,4 +347,4 @@ Default DPI: 150. Use 300 for print quality.
 ---
 
 **Last Updated:** 2026-05-06
-**Version:** 4.4.16
+**Version:** 4.4.19

@@ -7,7 +7,7 @@ from copy import deepcopy
 from typing import Dict, List
 
 
-VERSION = "4.4.16"
+VERSION = "4.4.19"
 CLI_SCHEMA_VERSION = "1.0"
 
 
@@ -37,6 +37,7 @@ COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
         "doc-add-list <file> <items_csv> [--type bullet|number]": "Add bulleted or numbered list (items separated by ;)",
         "doc-add-reference <file> <ref_json>": "Add reference to sidecar .refs.json",
         "doc-build-references <file>": "Build APA 7th References section from sidecar",
+        "doc-citation-audit <file> [--include-sidecar]": "Audit APA-like in-text citations against the DOCX reference list",
         "doc-set-metadata <file> [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>]": "Set document properties",
         "doc-get-metadata <file>": "Read document properties",
         "doc-inspect-hidden-data <file>": "Inspect hidden DOCX metadata, comments, revisions, and custom XML",
@@ -117,10 +118,19 @@ COMMAND_CATEGORIES: Dict[str, Dict[str, str]] = {
     "PDF (.pdf)": {
         "pdf-extract-images <file> <output_dir> [--format png|jpg] [--pages <range>]": "Extract embedded images from PDF (PyMuPDF)",
         "pdf-page-to-image <file> <output_dir> [--pages <range>] [--dpi <n>] [--format png|jpg]": "Render full PDF pages as images",
+        "pdf-map-page <file> <page> <output_image> [--dpi <n>] [--format png|jpg] [--no-labels] [--no-images]": "Render a PDF page with selectable block-id overlays",
         "pdf-read-blocks <file> [--pages <range>] [--no-spans] [--no-images] [--include-empty]": "Read native PDF text blocks/lines/spans with bounding boxes",
         "pdf-search-blocks <file> <query> [--pages <range>] [--case-sensitive] [--no-spans]": "Search native PDF blocks/spans and return exact block/span anchors",
         "pdf-inspect-hidden-data <file>": "Inspect hidden PDF metadata, annotations, embedded files, and page-size consistency",
-        "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>] [--creator <c>] [--producer <p>]": "Sanitize PDF metadata/XMP for submission",
+        "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--remove-annotations] [--remove-embedded-files] [--flatten-forms] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>] [--creator <c>] [--producer <p>]": "Sanitize PDF metadata/XMP and explicitly requested hidden objects for submission",
+        "pdf-compact <file> [output_path] [--garbage <0-4>] [--no-deflate] [--no-clean] [--linearize]": "Explicitly compact/optimize a PDF; never applied by default",
+        "pdf-merge <input_file> <input_file> [input_file ...] --output <file>": "Stitch multiple PDFs into one output PDF",
+        "pdf-split <file> <output_dir> [--pages <range>] [--prefix <name>]": "Split selected PDF pages into one-page PDFs",
+        "pdf-reorder <file> <page_order> [output_path]": "Create a PDF with pages in explicit order, preserving duplicates",
+        "pdf-add-text <file> <page> <text> [--output <file>] [--x <pt>] [--y <pt>] [--width <pt>] [--height <pt>] [--font-size <pt>] [--font <name>] [--color <hex>] [--rotation <0|90|180|270>]": "Overlay bounded text onto a PDF page",
+        "pdf-add-image <file> <page> <image_path> [--output <file>] [--x <pt>] [--y <pt>] [--width <pt>] [--height <pt>] [--no-keep-proportion]": "Overlay an image onto a PDF page",
+        "pdf-redact <file> [output_path] (--text <query> | --rect <page,left,top,right,bottom>) [--pages <range>] [--case-sensitive] [--fill <hex>] [--dry-run]": "Apply true PDF redactions by exact text match or rectangle",
+        "pdf-redact-block <file> <block_id> [output_path] [--fill <hex>] [--dry-run]": "Apply true PDF redaction to a native block id from pdf-map-page/pdf-read-blocks",
     },
     "RDF (Knowledge Graphs)": {
         "rdf-create <file> [--base <uri>] [--format turtle|xml|n3|json-ld] [--prefix <p>=<uri>]": "Create empty RDF graph with prefixes",
@@ -161,6 +171,7 @@ HELP_EXAMPLES: List[str] = [
     "cli-anything-onlyoffice doc-preview /tmp/essay.docx /tmp/doc-preview --pages 1-2",
     "cli-anything-onlyoffice doc-render-map /tmp/essay.docx",
     "cli-anything-onlyoffice doc-word-count /tmp/essay.docx",
+    "cli-anything-onlyoffice doc-citation-audit /tmp/essay.docx --json",
     "# Spreadsheets",
     "cli-anything-onlyoffice xlsx-write /tmp/data.xlsx 'Name,Score' 'Alice,90;Bob,85' --sheet Grades",
     "cli-anything-onlyoffice xlsx-cell-read /tmp/data.xlsx B2 --sheet Grades",
@@ -206,6 +217,7 @@ USAGE_OVERRIDES: Dict[str, str] = {
     "doc-add-reference": 'doc-add-reference <file> <ref_json>  (ref_json: {"author":"...","year":"...","title":"...","source":"...","type":"journal|book|website|report|chapter","doi":"..."})',
     "doc-add-table": "doc-add-table <file> <headers_csv> <data_csv>  (rows separated by ';')",
     "doc-build-references": "doc-build-references <file>  (reads <file>.refs.json, appends APA 7th formatted References section)",
+    "doc-citation-audit": "doc-citation-audit <file> [--include-sidecar]",
     "doc-delete": "doc-delete <file> <paragraph_index>",
     "doc-formatting-info": "doc-formatting-info <file> [--all] [--start <n>] [--limit <n>]",
     "doc-font-audit": "doc-font-audit <file> [--expected-font <name>] [--expected-font-size <pt>] [--rendered] [--pdf <path>]",
@@ -218,7 +230,16 @@ USAGE_OVERRIDES: Dict[str, str] = {
     'doc-set-style': 'doc-set-style <file> <paragraph_index> <style>  (e.g., "Heading 1", "Heading 2", "Normal", "Title")',
     "doc-submission-pack": "doc-submission-pack <file> <output_dir> [--basename <name>] [--expected-page-size <A4|Letter>] [--expected-font <name>] [--expected-font-size <pt>] [--profile auto|generic|apa-references] [--skip-docx-sanitize] [--skip-pdf-sanitize] [--skip-rendered-layout]",
     "doc-to-pdf": "doc-to-pdf <file> [output_path] [--layout-warnings] [--profile auto|generic|apa-references]",
-    "pdf-sanitize": "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>] [--creator <c>] [--producer <p>]",
+    "pdf-add-image": "pdf-add-image <file> <page> <image_path> [--output <file>] [--x <pt>] [--y <pt>] [--width <pt>] [--height <pt>] [--no-keep-proportion]",
+    "pdf-add-text": "pdf-add-text <file> <page> <text> [--output <file>] [--x <pt>] [--y <pt>] [--width <pt>] [--height <pt>] [--font-size <pt>] [--font <name>] [--color <hex>] [--rotation <0|90|180|270>]",
+    "pdf-compact": "pdf-compact <file> [output_path] [--garbage <0-4>] [--no-deflate] [--no-clean] [--linearize]",
+    "pdf-merge": "pdf-merge <input_file> <input_file> [input_file ...] --output <file>",
+    "pdf-map-page": "pdf-map-page <file> <page> <output_image> [--dpi <n>] [--format png|jpg] [--no-labels] [--no-images]",
+    "pdf-redact": "pdf-redact <file> [output_path] (--text <query> | --rect <page,left,top,right,bottom>) [--pages <range>] [--case-sensitive] [--fill <hex>] [--dry-run]",
+    "pdf-redact-block": "pdf-redact-block <file> <block_id> [output_path] [--fill <hex>] [--dry-run]",
+    "pdf-reorder": "pdf-reorder <file> <page_order> [output_path]",
+    "pdf-sanitize": "pdf-sanitize <file> [output_path] [--clear-metadata] [--remove-xml-metadata] [--remove-annotations] [--remove-embedded-files] [--flatten-forms] [--author <a>] [--title <t>] [--subject <s>] [--keywords <k>] [--creator <c>] [--producer <p>]",
+    "pdf-split": "pdf-split <file> <output_dir> [--pages <range>] [--prefix <name>]",
     "pptx-add-textbox": "pptx-add-textbox <file> <slide_index> <text> [--left <in>] [--top <in>] [--width <in>] [--height <in>] [--font-size <pt>] [--font-name <name>] [--bold] [--italic] [--color <hex>] [--align <left|center|right>]",
     "pptx-speaker-notes": "pptx-speaker-notes <file> <slide_index> [notes_text]",
     "pptx-update-text": "pptx-update-text <file> <slide_index> [--title <t>] [--body <b>]",
@@ -337,7 +358,7 @@ CAPABILITY_DETAILS: Dict[str, Dict[str, object]] = {
         "label": "DOCX references",
         "category": "DOCUMENTS (.docx)",
         "requires": ["python_docx"],
-        "commands": ["doc-add-reference", "doc-build-references"],
+        "commands": ["doc-add-reference", "doc-build-references", "doc-citation-audit"],
     },
     "xlsx_create": {
         "label": "XLSX create",

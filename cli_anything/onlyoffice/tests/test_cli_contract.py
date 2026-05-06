@@ -260,6 +260,42 @@ class OnlyOfficeCLIContractTests(unittest.TestCase):
                 "--dpi",
             ),
             (
+                "pdf read unknown",
+                "pdf_read_blocks",
+                ["pdf-read-blocks", pdf_path, "--bogus", "--json"],
+                "--bogus",
+            ),
+            (
+                "pdf read missing",
+                "pdf_read_blocks",
+                ["pdf-read-blocks", pdf_path, "--pages", "--json"],
+                "--pages",
+            ),
+            (
+                "pdf search unknown",
+                "pdf_search_blocks",
+                ["pdf-search-blocks", pdf_path, "Results", "--bogus", "--json"],
+                "--bogus",
+            ),
+            (
+                "pdf search missing",
+                "pdf_search_blocks",
+                ["pdf-search-blocks", pdf_path, "Results", "--pages", "--json"],
+                "--pages",
+            ),
+            (
+                "pdf sanitize unknown",
+                "pdf_sanitize",
+                ["pdf-sanitize", pdf_path, "--bogus", "--json"],
+                "--bogus",
+            ),
+            (
+                "pdf sanitize missing",
+                "pdf_sanitize",
+                ["pdf-sanitize", pdf_path, "--author", "--json"],
+                "--author",
+            ),
+            (
                 "pptx extract unknown",
                 "extract_images_from_pptx",
                 ["pptx-extract-images", pptx_path, output_dir, "--bogus", "--json"],

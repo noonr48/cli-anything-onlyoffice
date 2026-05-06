@@ -1436,6 +1436,76 @@ class OnlyOfficeDocOpsTests(unittest.TestCase):
             refs = json.load(handle)
         self.assertEqual([ref["title"] for ref in refs], ["First source", "Second source"])
 
+    def test_doc_ops_citation_audit_matches_apa_like_citations_and_references(self):
+        path = self._path("citation_audit_pass.docx")
+        doc = Document()
+        doc.add_paragraph(
+            "Smith (2024) framed the issue, and later evidence supported it "
+            "(Jones, 2023; Smith, 2024, p. 12)."
+        )
+        table = doc.add_table(rows=1, cols=1)
+        table.cell(0, 0).text = "Table note also cites Brown and Green (2022)."
+        doc.add_paragraph("References")
+        doc.add_paragraph("Brown, T., & Green, R. (2022). Table evidence. Journal.")
+        doc.add_paragraph("Jones, A. (2023). Other evidence. Journal.")
+        doc.add_paragraph("Smith, J. (2024). Framing evidence. Journal.")
+        doc.save(path)
+        before_hash = self._sha256(path)
+
+        result = self.ops.citation_audit(path)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["overall_status"], "pass")
+        self.assertEqual(result["counts"]["missing_references"], 0)
+        self.assertEqual(result["counts"]["uncited_references"], 0)
+        self.assertEqual(result["counts"]["reference_entries"], 3)
+        self.assertIn(
+            "brown & green|2022",
+            {citation["key"] for citation in result["in_text_citations"]},
+        )
+        self.assertEqual(before_hash, self._sha256(path))
+        self.assertFalse(result["network_verification"])
+
+    def test_doc_ops_citation_audit_flags_missing_uncited_malformed_and_sidecar(self):
+        path = self._path("citation_audit_fail.docx")
+        doc = Document()
+        doc.add_paragraph("The draft cites Smith (2024), Jones (2020), and (Taylor, 2025).")
+        doc.add_paragraph("References")
+        doc.add_paragraph("Smith, J. (2023). Wrong year evidence. Journal.")
+        doc.add_paragraph("Unused, A. (2021). Unused evidence. Journal.")
+        doc.add_paragraph("Malformed reference without a year.")
+        doc.save(path)
+        with open(path + ".refs.json", "w", encoding="utf-8") as handle:
+            json.dump(
+                [
+                    {
+                        "author": "Smith, J.",
+                        "year": "2023",
+                        "title": "Wrong year evidence",
+                    },
+                    {
+                        "author": "Sidecar, S.",
+                        "year": "2026",
+                        "title": "Only in sidecar",
+                    },
+                ],
+                handle,
+            )
+
+        result = self.ops.citation_audit(path, include_sidecar=True)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["overall_status"], "fail")
+        self.assertGreaterEqual(result["counts"]["missing_references"], 3)
+        self.assertGreaterEqual(result["counts"]["uncited_references"], 2)
+        self.assertEqual(result["counts"]["malformed_reference_entries"], 1)
+        self.assertTrue(result["findings"]["mismatched_entries"])
+        self.assertTrue(result["sidecar"]["sidecar_missing_from_docx"])
+        self.assertIn(
+            "reference_sidecar",
+            {check["name"] for check in result["checks"]},
+        )
+
     def test_doc_ops_extract_images_rejects_unsafe_prefix_and_format(self):
         path = self._path("image_extract_safety.docx")
         self.client.create_document(path, "Title", "Body")

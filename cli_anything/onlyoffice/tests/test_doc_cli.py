@@ -445,6 +445,45 @@ class OnlyOfficeDocCLITests(unittest.TestCase):
             rendered_layout=True,
         )
 
+    def test_cli_doc_citation_audit_dispatches_include_sidecar(self):
+        path = self._path("dispatch_citation_audit.docx")
+
+        with mock.patch.object(
+            cli_module.doc_server,
+            "citation_audit",
+            return_value={"success": True, "overall_status": "pass"},
+        ) as citation_audit:
+            payload, exit_code = self._run_cli(
+                [
+                    "doc-citation-audit",
+                    path,
+                    "--include-sidecar",
+                    "--json",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["success"])
+        citation_audit.assert_called_once_with(path, include_sidecar=True)
+
+    def test_cli_doc_citation_audit_rejects_unknown_option(self):
+        path = self._path("dispatch_citation_audit_bad.docx")
+
+        with mock.patch.object(cli_module.doc_server, "citation_audit") as citation_audit:
+            payload, exit_code = self._run_cli(
+                [
+                    "doc-citation-audit",
+                    path,
+                    "--network",
+                    "--json",
+                ]
+            )
+
+        self.assertNotEqual(exit_code, 0)
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error_code"], "usage_error")
+        citation_audit.assert_not_called()
+
     def test_cli_doc_create_respects_docx_availability_guard(self):
         path = self._path("unavailable.docx")
         stdout = io.StringIO()

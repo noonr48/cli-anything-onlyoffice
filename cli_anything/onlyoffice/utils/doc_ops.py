@@ -27,6 +27,8 @@ try:
     from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
 
     DOCX_AVAILABLE = True
 except ImportError:
@@ -2218,6 +2220,580 @@ class DocumentOperations:
                 "references_added": len(refs),
                 "refs_file": refs_path,
                 "backup": backup or None,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _doc_body_text_units(self, doc: Any) -> List[Dict[str, Any]]:
+        units: List[Dict[str, Any]] = []
+        paragraph_index = 0
+        table_index = 0
+        unit_index = 0
+        for child in doc.element.body.iterchildren():
+            if child.tag == qn("w:p"):
+                paragraph = Paragraph(child, doc)
+                units.append(
+                    {
+                        "unit_index": unit_index,
+                        "source": "paragraph",
+                        "paragraph_index": paragraph_index,
+                        "text": paragraph.text,
+                    }
+                )
+                paragraph_index += 1
+                unit_index += 1
+            elif child.tag == qn("w:tbl"):
+                table = Table(child, doc)
+                for row_index, row in enumerate(table.rows):
+                    for cell_index, cell in enumerate(row.cells):
+                        for cell_paragraph_index, paragraph in enumerate(cell.paragraphs):
+                            units.append(
+                                {
+                                    "unit_index": unit_index,
+                                    "source": "table_cell",
+                                    "table_index": table_index,
+                                    "row_index": row_index,
+                                    "cell_index": cell_index,
+                                    "cell_paragraph_index": cell_paragraph_index,
+                                    "text": paragraph.text,
+                                }
+                            )
+                            unit_index += 1
+                table_index += 1
+        return units
+
+    @staticmethod
+    def _is_reference_heading(text: str) -> bool:
+        normalized = re.sub(r"[^a-z ]+", "", str(text or "").strip().lower())
+        return normalized in {"references", "reference list"}
+
+    @staticmethod
+    def _is_reference_stop_heading(text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        return bool(re.match(r"^(appendix|appendices)\b", normalized))
+
+    def _find_reference_section(self, units: List[Dict[str, Any]]) -> Dict[str, Any]:
+        for unit in units:
+            if unit.get("source") == "paragraph" and self._is_reference_heading(unit.get("text", "")):
+                return {
+                    "found": True,
+                    "heading_unit_index": unit["unit_index"],
+                    "heading_paragraph_index": unit.get("paragraph_index"),
+                    "heading_text": self._normalize_text(unit.get("text", "")),
+                }
+        return {
+            "found": False,
+            "heading_unit_index": None,
+            "heading_paragraph_index": None,
+            "heading_text": None,
+        }
+
+    @staticmethod
+    def _author_words(value: str) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"\bet\s+al\.?", "", text, flags=re.IGNORECASE)
+        text = text.replace("&", " & ")
+        text = re.sub(r"\band\b", " & ", text, flags=re.IGNORECASE)
+        text = re.sub(r"^(?:see|see also|e\.g\.|cf\.)\s+", "", text, flags=re.IGNORECASE)
+        text = text.strip(" .,;:")
+        text = re.sub(r"[^A-Za-z0-9&' -]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip().lower()
+        return text
+
+    @classmethod
+    def _citation_author_key(cls, author_text: str) -> str:
+        text = cls._author_words(author_text)
+        if not text:
+            return ""
+        if " & " in text:
+            parts = [part.strip(" .,;:") for part in text.split(" & ") if part.strip()]
+            if len(parts) >= 2:
+                first = parts[0].split(",")[0].strip().split()[-1]
+                second = parts[-1].split(",")[0].strip().split()[-1]
+                if first and second:
+                    return f"{first} & {second}"
+        if "," in text:
+            text = text.split(",", 1)[0].strip()
+        return text
+
+    @classmethod
+    def _reference_author_key(cls, author_text: str) -> str:
+        raw = str(author_text or "").strip().strip(". ")
+        surnames = re.findall(
+            r"([A-Z][A-Za-z'’.-]+)\s*,\s*(?:[A-Z](?:\.|\b)|[A-Z][a-z]+)",
+            raw,
+        )
+        if len(surnames) == 1:
+            return cls._citation_author_key(surnames[0])
+        if len(surnames) == 2:
+            return f"{cls._citation_author_key(surnames[0])} & {cls._citation_author_key(surnames[1])}"
+        if len(surnames) >= 3:
+            return cls._citation_author_key(surnames[0])
+        return cls._citation_author_key(raw)
+
+    @staticmethod
+    def _citation_key(author_key: str, year: str) -> str:
+        return f"{author_key}|{str(year or '').strip().lower()}"
+
+    def _citation_payload(
+        self,
+        *,
+        citation_type: str,
+        author_text: str,
+        year: str,
+        unit: Dict[str, Any],
+        raw_text: str,
+    ) -> Optional[Dict[str, Any]]:
+        author_key = self._citation_author_key(author_text)
+        year_value = str(year or "").strip().lower()
+        if not author_key or not year_value:
+            return None
+        payload = {
+            "type": citation_type,
+            "author_text": self._normalize_text(author_text),
+            "author_key": author_key,
+            "year": year_value,
+            "key": self._citation_key(author_key, year_value),
+            "raw_text": self._normalize_text(raw_text),
+            "unit_index": unit.get("unit_index"),
+            "source": unit.get("source"),
+            "paragraph_index": unit.get("paragraph_index"),
+            "table_index": unit.get("table_index"),
+            "row_index": unit.get("row_index"),
+            "cell_index": unit.get("cell_index"),
+        }
+        return {k: v for k, v in payload.items() if v is not None}
+
+    def _parse_citations_from_units(
+        self,
+        units: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        citations: List[Dict[str, Any]] = []
+        year_pattern = r"(?:\d{4}[a-z]?|n\.d\.)"
+        parenthetical_re = re.compile(
+            rf"\(([^()]{{0,300}}\b{year_pattern}\b[^()]{{0,200}})\)",
+            flags=re.IGNORECASE,
+        )
+        narrative_re = re.compile(
+            rf"\b(?P<author>[A-Z][A-Za-z'’.-]+(?:\s+et al\.|\s+(?:and|&)\s+[A-Z][A-Za-z'’.-]+)?)\s*\((?P<year>{year_pattern})\)",
+            flags=re.IGNORECASE,
+        )
+        year_re = re.compile(rf"\b({year_pattern})\b", flags=re.IGNORECASE)
+        seen = set()
+        for unit in units:
+            text = str(unit.get("text", "") or "")
+            if not self._normalize_text(text):
+                continue
+            for match in parenthetical_re.finditer(text):
+                content = match.group(1)
+                for part in content.split(";"):
+                    year_match = year_re.search(part)
+                    if not year_match:
+                        continue
+                    author_text = part[: year_match.start()].strip(" ,;:")
+                    payload = self._citation_payload(
+                        citation_type="parenthetical",
+                        author_text=author_text,
+                        year=year_match.group(1),
+                        unit=unit,
+                        raw_text=f"({part.strip()})",
+                    )
+                    if not payload:
+                        continue
+                    dedupe = (
+                        payload["key"],
+                        payload.get("unit_index"),
+                        payload["raw_text"],
+                    )
+                    if dedupe not in seen:
+                        seen.add(dedupe)
+                        citations.append(payload)
+            for match in narrative_re.finditer(text):
+                payload = self._citation_payload(
+                    citation_type="narrative",
+                    author_text=match.group("author"),
+                    year=match.group("year"),
+                    unit=unit,
+                    raw_text=match.group(0),
+                )
+                if not payload:
+                    continue
+                dedupe = (
+                    payload["key"],
+                    payload.get("unit_index"),
+                    payload["raw_text"],
+                )
+                if dedupe not in seen:
+                    seen.add(dedupe)
+                    citations.append(payload)
+        return citations
+
+    def _parse_reference_entries(
+        self,
+        units: List[Dict[str, Any]],
+        section: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        if not section.get("found"):
+            return [], []
+        year_re = re.compile(r"\((\d{4}[a-z]?|n\.d\.)\)", flags=re.IGNORECASE)
+        entries: List[Dict[str, Any]] = []
+        malformed: List[Dict[str, Any]] = []
+        current: Optional[Dict[str, Any]] = None
+
+        def finish_current() -> None:
+            nonlocal current
+            if not current:
+                return
+            text = self._normalize_text(current["text"])
+            year_match = year_re.search(text[:250])
+            if not year_match:
+                malformed.append(
+                    {
+                        "text_preview": text[:180],
+                        "unit_indices": current["unit_indices"],
+                        "reason": "No APA-like year in parentheses near the start of the entry.",
+                    }
+                )
+                current = None
+                return
+            author_text = text[: year_match.start()].strip(" .")
+            author_key = self._reference_author_key(author_text)
+            year = year_match.group(1).lower()
+            if not author_key:
+                malformed.append(
+                    {
+                        "text_preview": text[:180],
+                        "unit_indices": current["unit_indices"],
+                        "reason": "Could not parse an author before the reference year.",
+                    }
+                )
+            else:
+                entries.append(
+                    {
+                        "entry_index": len(entries),
+                        "author_text": self._normalize_text(author_text),
+                        "author_key": author_key,
+                        "year": year,
+                        "key": self._citation_key(author_key, year),
+                        "text_preview": text[:240],
+                        "unit_indices": current["unit_indices"],
+                    }
+                )
+            current = None
+
+        heading_index = section.get("heading_unit_index")
+        for unit in units:
+            if heading_index is None or unit.get("unit_index", -1) <= heading_index:
+                continue
+            text = self._normalize_text(unit.get("text", ""))
+            if not text:
+                continue
+            if unit.get("source") == "paragraph" and self._is_reference_stop_heading(text):
+                break
+            starts_entry = bool(year_re.search(text[:250]))
+            if starts_entry:
+                finish_current()
+                current = {"text": text, "unit_indices": [unit.get("unit_index")]}
+            elif current:
+                if str(current.get("text", "")).rstrip().endswith((".", "!", "?", ")")):
+                    finish_current()
+                    malformed.append(
+                        {
+                            "text_preview": text[:180],
+                            "unit_indices": [unit.get("unit_index")],
+                            "reason": "Text in the References section does not start with a parseable author-year entry.",
+                        }
+                    )
+                    continue
+                current["text"] = f"{current['text']} {text}"
+                current["unit_indices"].append(unit.get("unit_index"))
+            else:
+                malformed.append(
+                    {
+                        "text_preview": text[:180],
+                        "unit_indices": [unit.get("unit_index")],
+                        "reason": "Text appears in the References section before a parseable reference entry.",
+                    }
+                )
+        finish_current()
+        return entries, malformed
+
+    def _citation_audit_unsupported_locations(self, file_path: str) -> List[Dict[str, Any]]:
+        unsupported: List[Dict[str, Any]] = []
+        files, _package_preflight, preflight_error = self._read_docx_zip_parts(file_path)
+        if preflight_error:
+            unsupported.append(
+                {
+                    "code": "ooxml_preflight_unavailable",
+                    "message": "DOCX package preflight failed, so hidden citation locations could not be inspected.",
+                    "details": preflight_error,
+                }
+            )
+            return unsupported
+        assert files is not None
+        if "word/footnotes.xml" in files:
+            unsupported.append(
+                {
+                    "code": "footnotes_present",
+                    "message": "Footnotes are present and are not included in citation/reference matching.",
+                }
+            )
+        if "word/endnotes.xml" in files:
+            unsupported.append(
+                {
+                    "code": "endnotes_present",
+                    "message": "Endnotes are present and are not included in citation/reference matching.",
+                }
+            )
+        document_xml = files.get("word/document.xml", b"")
+        if b"txbxContent" in document_xml:
+            unsupported.append(
+                {
+                    "code": "textboxes_present",
+                    "message": "Text boxes are present and may contain citations not mapped by python-docx.",
+                }
+            )
+        if b"fldChar" in document_xml or b"instrText" in document_xml:
+            unsupported.append(
+                {
+                    "code": "field_codes_present",
+                    "message": "Field codes are present; citation-manager fields may need manual verification.",
+                }
+            )
+        return unsupported
+
+    def _sidecar_citation_audit(
+        self,
+        file_path: str,
+        reference_entries: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        refs_path = file_path + ".refs.json"
+        payload = {
+            "included": True,
+            "file": refs_path,
+            "found": os.path.exists(refs_path),
+            "entries": [],
+            "docx_missing_from_sidecar": [],
+            "sidecar_missing_from_docx": [],
+            "warnings": [],
+        }
+        if not payload["found"]:
+            payload["warnings"].append("Reference sidecar was requested but no sidecar file exists.")
+            return payload
+        try:
+            with open(refs_path, "r", encoding="utf-8") as handle:
+                refs = json.load(handle)
+            if not isinstance(refs, list):
+                payload["warnings"].append("Reference sidecar is not a JSON list.")
+                return payload
+            for index, ref in enumerate(refs):
+                author_key = self._reference_author_key(str(ref.get("author", "")))
+                year = str(ref.get("year", "")).strip().lower()
+                entry = {
+                    "entry_index": index,
+                    "author_text": ref.get("author", ""),
+                    "author_key": author_key,
+                    "year": year,
+                    "key": self._citation_key(author_key, year) if author_key and year else "",
+                    "title": ref.get("title", ""),
+                }
+                payload["entries"].append(entry)
+            docx_keys = {entry["key"] for entry in reference_entries}
+            sidecar_keys = {entry["key"] for entry in payload["entries"] if entry["key"]}
+            payload["docx_missing_from_sidecar"] = sorted(docx_keys - sidecar_keys)
+            payload["sidecar_missing_from_docx"] = sorted(sidecar_keys - docx_keys)
+        except Exception as exc:
+            payload["warnings"].append(f"Could not inspect reference sidecar: {exc}")
+        return payload
+
+    def citation_audit(
+        self,
+        file_path: str,
+        *,
+        include_sidecar: bool = False,
+    ) -> Dict[str, Any]:
+        """Audit APA-like in-text citation/reference-list consistency."""
+        if not DOCX_AVAILABLE:
+            return {"success": False, "error": "python-docx not installed"}
+        try:
+            abs_path = str(Path(file_path).expanduser().resolve())
+            if not os.path.exists(abs_path):
+                return {"success": False, "error": f"File not found: {file_path}"}
+            doc = Document(abs_path)
+            units = self._doc_body_text_units(doc)
+            section = self._find_reference_section(units)
+            body_units = [
+                unit
+                for unit in units
+                if not section.get("found")
+                or unit.get("unit_index", -1) < int(section.get("heading_unit_index"))
+            ]
+            citations = self._parse_citations_from_units(body_units)
+            references, malformed_refs = self._parse_reference_entries(units, section)
+            reference_key_map: Dict[str, List[Dict[str, Any]]] = {}
+            for entry in references:
+                reference_key_map.setdefault(entry["key"], []).append(entry)
+            citation_key_map: Dict[str, List[Dict[str, Any]]] = {}
+            for citation in citations:
+                citation_key_map.setdefault(citation["key"], []).append(citation)
+
+            missing_references = [
+                citation for citation in citations if citation["key"] not in reference_key_map
+            ]
+            uncited_references = [
+                entry for entry in references if entry["key"] not in citation_key_map
+            ]
+            ambiguous_matches = [
+                {
+                    "key": key,
+                    "reference_count": len(entries),
+                    "references": entries,
+                }
+                for key, entries in sorted(reference_key_map.items())
+                if len(entries) > 1 and key in citation_key_map
+            ]
+            reference_authors = {}
+            reference_years = {}
+            for entry in references:
+                reference_authors.setdefault(entry["author_key"], set()).add(entry["year"])
+                reference_years.setdefault(entry["year"], set()).add(entry["author_key"])
+            mismatched_entries = []
+            for citation in missing_references:
+                same_author_years = sorted(reference_authors.get(citation["author_key"], set()))
+                same_year_authors = sorted(reference_years.get(citation["year"], set()))
+                if same_author_years or same_year_authors:
+                    mismatched_entries.append(
+                        {
+                            "citation": citation,
+                            "same_author_reference_years": same_author_years,
+                            "same_year_reference_authors": same_year_authors,
+                        }
+                    )
+            unsupported_locations = self._citation_audit_unsupported_locations(abs_path)
+            sidecar = None
+            sidecar_discrepancies = []
+            if include_sidecar:
+                sidecar = self._sidecar_citation_audit(abs_path, references)
+                if sidecar.get("warnings"):
+                    sidecar_discrepancies.extend(sidecar["warnings"])
+                if sidecar.get("docx_missing_from_sidecar"):
+                    sidecar_discrepancies.append(
+                        "DOCX reference-list entries are missing from the sidecar."
+                    )
+                if sidecar.get("sidecar_missing_from_docx"):
+                    sidecar_discrepancies.append(
+                        "Sidecar references are missing from the DOCX reference list."
+                    )
+
+            checks = []
+
+            def add_check(name: str, status: str, message: str, details: Any = None) -> None:
+                check = {"name": name, "status": status, "message": message}
+                if details is not None:
+                    check["details"] = details
+                checks.append(check)
+
+            add_check(
+                "references_section",
+                "pass" if section.get("found") else ("fail" if citations else "warn"),
+                "References heading found." if section.get("found") else "No References heading found.",
+                section,
+            )
+            add_check(
+                "missing_references",
+                "fail" if missing_references else "pass",
+                f"{len(missing_references)} in-text citation(s) lack a matching reference-list entry.",
+                missing_references[:20],
+            )
+            add_check(
+                "uncited_references",
+                "fail" if uncited_references else "pass",
+                f"{len(uncited_references)} reference-list entries are not cited in text.",
+                uncited_references[:20],
+            )
+            add_check(
+                "malformed_reference_entries",
+                "fail" if malformed_refs else "pass",
+                f"{len(malformed_refs)} reference-list entries could not be parsed.",
+                malformed_refs[:20],
+            )
+            add_check(
+                "ambiguous_matches",
+                "warn" if ambiguous_matches else "pass",
+                f"{len(ambiguous_matches)} citation key(s) match multiple reference-list entries.",
+                ambiguous_matches[:20],
+            )
+            add_check(
+                "unsupported_locations",
+                "warn" if unsupported_locations else "pass",
+                f"{len(unsupported_locations)} unsupported DOCX text location warning(s).",
+                unsupported_locations,
+            )
+            if include_sidecar:
+                add_check(
+                    "reference_sidecar",
+                    "warn" if sidecar_discrepancies else "pass",
+                    f"{len(sidecar_discrepancies)} sidecar discrepancy warning(s).",
+                    sidecar,
+                )
+
+            fail_conditions = [
+                bool(citations and not section.get("found")),
+                bool(missing_references),
+                bool(uncited_references),
+                bool(malformed_refs),
+            ]
+            warn_conditions = [
+                not citations and not references,
+                bool(ambiguous_matches),
+                bool(unsupported_locations),
+                bool(sidecar_discrepancies),
+            ]
+            if any(fail_conditions):
+                overall_status = "fail"
+            elif any(warn_conditions):
+                overall_status = "warn"
+            else:
+                overall_status = "pass"
+            findings = {
+                "missing_references": missing_references,
+                "uncited_references": uncited_references,
+                "mismatched_entries": mismatched_entries,
+                "ambiguous_matches": ambiguous_matches,
+                "malformed_reference_entries": malformed_refs,
+                "unsupported_locations": unsupported_locations,
+                "sidecar_discrepancies": sidecar_discrepancies,
+            }
+            return {
+                "success": True,
+                "file": abs_path,
+                "style": "apa-like",
+                "network_verification": False,
+                "overall_status": overall_status,
+                "source_sha256": self._sha256_file(abs_path),
+                "counts": {
+                    "in_text_citations": len(citations),
+                    "unique_citation_keys": len(citation_key_map),
+                    "reference_entries": len(references),
+                    "missing_references": len(missing_references),
+                    "uncited_references": len(uncited_references),
+                    "mismatched_entries": len(mismatched_entries),
+                    "malformed_reference_entries": len(malformed_refs),
+                    "ambiguous_matches": len(ambiguous_matches),
+                },
+                "reference_section": {
+                    **section,
+                    "entry_count": len(references),
+                },
+                "in_text_citations": citations,
+                "reference_entries": references,
+                "findings": findings,
+                "checks": checks,
+                "sidecar": sidecar,
+                "limitations": [
+                    "This is deterministic internal consistency checking, not source, DOI, or claim verification.",
+                    "APA-like parsing is heuristic; complex group authors, citation-manager fields, text boxes, footnotes, and scanned content may require manual review.",
+                ],
             }
         except Exception as e:
             return {"success": False, "error": str(e)}

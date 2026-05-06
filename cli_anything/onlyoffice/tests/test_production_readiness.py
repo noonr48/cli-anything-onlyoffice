@@ -495,6 +495,7 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             "doc-render-audit <file> [--pdf <path>] [--tolerance-points <n>] [--profile auto|generic|apa-references]",
             docs,
         )
+        self.assertIn(command_signature("doc-citation-audit"), docs)
         self.assertIn(
             "xlsx-calc <file> <column> <operation> [--sheet <name>] [--include-formulas] [--strict-formulas]",
             sheet,
@@ -524,6 +525,15 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             pdf,
         )
         self.assertIn(command_signature("pdf-sanitize"), pdf)
+        self.assertIn(command_signature("pdf-compact"), pdf)
+        self.assertIn(command_signature("pdf-merge"), pdf)
+        self.assertIn(command_signature("pdf-split"), pdf)
+        self.assertIn(command_signature("pdf-reorder"), pdf)
+        self.assertIn(command_signature("pdf-add-text"), pdf)
+        self.assertIn(command_signature("pdf-add-image"), pdf)
+        self.assertIn(command_signature("pdf-redact"), pdf)
+        self.assertIn(command_signature("pdf-map-page"), pdf)
+        self.assertIn(command_signature("pdf-redact-block"), pdf)
         self.assertIn("pdf-inspect-hidden-data <file>", pdf)
         rdf = payload["categories"]["RDF (Knowledge Graphs)"]
         self.assertIn(command_signature("rdf-remove"), rdf)
@@ -567,6 +577,10 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
         self.assertEqual(
             payload["capability_metadata"]["xlsx_create"]["requires"],
             ["openpyxl"],
+        )
+        self.assertIn(
+            "doc-citation-audit",
+            payload["capability_metadata"]["docx_references"]["commands"],
         )
 
     def test_cli_doc_usage_error_comes_from_registry(self):
@@ -903,6 +917,9 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
                     path,
                     "--clear-metadata",
                     "--remove-xml-metadata",
+                    "--remove-annotations",
+                    "--remove-embedded-files",
+                    "--flatten-forms",
                     "--author",
                     "benbi",
                     "--json",
@@ -918,6 +935,9 @@ class OnlyOfficeProductionReadinessTests(unittest.TestCase):
             output_path=None,
             clear_metadata=True,
             remove_xml_metadata=True,
+            remove_annotations=True,
+            remove_embedded_files=True,
+            flatten_forms=True,
             author="benbi",
             title=None,
             subject=None,
